@@ -124,40 +124,23 @@ export function TerminalInstance({ ptyId, paneId, onSplit, onClose }: Props) {
         e.preventDefault();
         setDragOver(true);
       }}
-    >
-      {/* xterm.js 渲染容器 */}
-      <div ref={containerRef} className="absolute inset-0" />
-
-      {/* 拖拽放置覆盖层 — 位于 xterm canvas 之上，仅在拖拽时激活 */}
-      {dragOver && (
-        <div
-          className="absolute inset-0 z-10 flex items-center justify-center"
-          style={{ background: 'rgba(200, 128, 90, 0.08)', border: '2px dashed var(--accent)', borderRadius: 'var(--radius-md)' }}
-          onDragOver={(e) => e.preventDefault()}
-          onDragLeave={(e) => {
-            // 仅当离开 wrapper 时才取消
-            if (wrapperRef.current && !wrapperRef.current.contains(e.relatedTarget as Node)) {
-              setDragOver(false);
-            }
-          }}
-          onDrop={(e) => {
-            e.preventDefault();
-            setDragOver(false);
-            const filePath = e.dataTransfer.getData('text/plain');
-            if (filePath) {
-              invoke('write_pty', { ptyId, data: filePath });
-            }
-          }}
-        >
-          <span className="text-[var(--accent)] text-xs px-3 py-1.5 rounded-[var(--radius-md)]"
-            style={{ background: 'var(--bg-overlay)' }}>
-            释放以插入路径
-          </span>
-        </div>
-      )}
-
-      {/* 右键菜单绑定在 wrapper 上 */}
-      <div className="absolute inset-0" style={{ pointerEvents: dragOver ? 'none' : 'auto', zIndex: dragOver ? -1 : 'auto' }}
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+      }}
+      onDragLeave={(e) => {
+        if (wrapperRef.current && !wrapperRef.current.contains(e.relatedTarget as Node)) {
+          setDragOver(false);
+        }
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragOver(false);
+        const filePath = e.dataTransfer.getData('text/plain');
+        if (filePath) {
+          invoke('write_pty', { ptyId, data: filePath });
+        }
+      }}
       onContextMenu={(e) => {
         e.preventDefault();
         if (!paneId || !onSplit) return;
@@ -200,7 +183,22 @@ export function TerminalInstance({ ptyId, paneId, onSplit, onClose }: Props) {
         const dismiss = () => { menu.remove(); document.removeEventListener('click', dismiss); };
         setTimeout(() => document.addEventListener('click', dismiss), 0);
       }}
-      />
+    >
+      {/* xterm.js 渲染容器 */}
+      <div ref={containerRef} className="absolute inset-0" />
+
+      {/* 拖拽视觉提示（纯展示，不拦截事件） */}
+      {dragOver && (
+        <div
+          className="absolute inset-1 z-10 flex items-center justify-center pointer-events-none rounded-[var(--radius-md)]"
+          style={{ background: 'rgba(200, 128, 90, 0.06)', border: '2px dashed var(--accent)' }}
+        >
+          <span className="text-[var(--accent)] text-xs px-3 py-1.5 rounded-[var(--radius-md)]"
+            style={{ background: 'var(--bg-overlay)' }}>
+            释放以插入路径
+          </span>
+        </div>
+      )}
     </div>
   );
 }
