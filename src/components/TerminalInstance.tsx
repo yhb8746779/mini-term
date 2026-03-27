@@ -5,8 +5,10 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore } from '../store';
-import type { PtyOutputPayload } from '../types';
+import type { PtyOutputPayload, PaneStatus } from '../types';
+import { StatusDot } from './StatusDot';
 import { showContextMenu } from '../utils/contextMenu';
+import { getDraggingTabId } from '../utils/dragState';
 import '@xterm/xterm/css/xterm.css';
 
 type DropZone = 'top' | 'bottom' | 'left' | 'right';
@@ -32,12 +34,14 @@ const dropZoneOverlay: Record<DropZone, React.CSSProperties> = {
 interface Props {
   ptyId: number;
   paneId?: string;
+  shellName?: string;
+  status?: PaneStatus;
   onSplit?: (paneId: string, direction: 'horizontal' | 'vertical') => void;
   onClose?: (paneId: string) => void;
   onTabDrop?: (sourceTabId: string, targetPaneId: string, direction: 'horizontal' | 'vertical', position: 'before' | 'after') => void;
 }
 
-export function TerminalInstance({ ptyId, paneId, onSplit, onClose, onTabDrop }: Props) {
+export function TerminalInstance({ ptyId, paneId, shellName, status, onSplit, onClose, onTabDrop }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -153,94 +157,135 @@ export function TerminalInstance({ ptyId, paneId, onSplit, onClose, onTabDrop }:
   const isTabDrag = (e: React.DragEvent) => e.dataTransfer.types.includes('application/tab-id');
 
   return (
-    <div
-      className="w-full h-full relative"
-      onDragEnter={(e) => {
-        e.preventDefault();
-        if (isTabDrag(e)) {
-          const rect = e.currentTarget.getBoundingClientRect();
-          setTabDropZone(getDropZone(rect, e.clientX, e.clientY));
-        } else {
-          setDragOver(true);
-        }
-      }}
-      onDragOver={(e) => {
-        e.preventDefault();
-        if (isTabDrag(e)) {
-          e.dataTransfer.dropEffect = 'move';
-          const rect = e.currentTarget.getBoundingClientRect();
-          setTabDropZone(getDropZone(rect, e.clientX, e.clientY));
-        } else {
-          e.dataTransfer.dropEffect = 'copy';
-        }
-      }}
-      onDragLeave={(e) => {
-        if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+    <div className="w-full h-full flex flex-col">
+      {/* 面板标题栏 */}
+      <div
+        className="flex items-center gap-1.5 px-2 py-[3px] bg-[var(--bg-elevated)] border-b border-[var(--border-subtle)] text-[10px] select-none shrink-0"
+        style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+      >
+        {status && <StatusDot status={status} />}
+        <span className="text-[var(--text-secondary)] font-medium truncate flex-1">
+          {shellName ?? 'Terminal'}
+        </span>
+        {paneId && onSplit && (
+          <>
+            <span
+              className="text-[var(--text-muted)] hover:text-[var(--accent)] cursor-pointer transition-colors px-0.5"
+              title="向右分屏"
+              onClick={() => onSplit(paneId, 'horizontal')}
+            >
+              ┃
+            </span>
+            <span
+              className="text-[var(--text-muted)] hover:text-[var(--accent)] cursor-pointer transition-colors px-0.5"
+              title="向下分屏"
+              onClick={() => onSplit(paneId, 'vertical')}
+            >
+              ━
+            </span>
+          </>
+        )}
+        {paneId && onClose && (
+          <span
+            className="text-[var(--text-muted)] hover:text-[var(--color-error)] cursor-pointer text-[9px] transition-colors pl-1"
+            title="关闭面板"
+            onClick={() => onClose(paneId)}
+          >
+            ✕
+          </span>
+        )}
+      </div>
+
+      {/* 终端内容区 */}
+      <div
+        className="flex-1 relative"
+        onDragEnter={(e) => {
+          e.preventDefault();
+          if (isTabDrag(e)) {
+            const rect = e.currentTarget.getBoundingClientRect();
+            setTabDropZone(getDropZone(rect, e.clientX, e.clientY));
+          } else {
+            setDragOver(true);
+          }
+        }}
+        onDragOver={(e) => {
+          e.preventDefault();
+          if (isTabDrag(e)) {
+            e.dataTransfer.dropEffect = 'move';
+            const rect = e.currentTarget.getBoundingClientRect();
+            setTabDropZone(getDropZone(rect, e.clientX, e.clientY));
+          } else {
+            e.dataTransfer.dropEffect = 'copy';
+          }
+        }}
+        onDragLeave={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+            setDragOver(false);
+            setTabDropZone(null);
+          }
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
           setDragOver(false);
           setTabDropZone(null);
-        }
-      }}
-      onDrop={(e) => {
-        e.preventDefault();
-        setDragOver(false);
-        setTabDropZone(null);
 
-        const tabId = e.dataTransfer.getData('application/tab-id');
-        if (tabId && paneId && onTabDrop) {
-          const rect = e.currentTarget.getBoundingClientRect();
-          const zone = getDropZone(rect, e.clientX, e.clientY);
-          const direction: 'horizontal' | 'vertical' =
-            zone === 'left' || zone === 'right' ? 'horizontal' : 'vertical';
-          const position: 'before' | 'after' =
-            zone === 'left' || zone === 'top' ? 'before' : 'after';
-          onTabDrop(tabId, paneId, direction, position);
-          return;
-        }
+          const tabId = getDraggingTabId();
+          if (tabId && paneId && onTabDrop) {
+            const rect = e.currentTarget.getBoundingClientRect();
+            const zone = getDropZone(rect, e.clientX, e.clientY);
+            const direction: 'horizontal' | 'vertical' =
+              zone === 'left' || zone === 'right' ? 'horizontal' : 'vertical';
+            const position: 'before' | 'after' =
+              zone === 'left' || zone === 'top' ? 'before' : 'after';
+            onTabDrop(tabId, paneId, direction, position);
+            return;
+          }
 
-        const filePath = e.dataTransfer.getData('text/plain');
-        if (filePath) {
-          invoke('write_pty', { ptyId, data: filePath });
-        }
-      }}
-      onContextMenu={(e) => {
-        e.preventDefault();
-        if (!paneId || !onSplit) return;
+          const filePath = e.dataTransfer.getData('text/plain');
+          if (filePath) {
+            invoke('write_pty', { ptyId, data: filePath });
+          }
+        }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          if (!paneId || !onSplit) return;
 
-        showContextMenu(e.clientX, e.clientY, [
-          { label: '向右分屏', onClick: () => onSplit(paneId, 'horizontal') },
-          { label: '向下分屏', onClick: () => onSplit(paneId, 'vertical') },
-          { separator: true },
-          { label: '关闭面板', danger: true, onClick: () => onClose?.(paneId) },
-        ]);
-      }}
-    >
-      {/* xterm.js 渲染容器 */}
-      <div ref={containerRef} className="absolute inset-0" />
+          showContextMenu(e.clientX, e.clientY, [
+            { label: '向右分屏', onClick: () => onSplit(paneId, 'horizontal') },
+            { label: '向下分屏', onClick: () => onSplit(paneId, 'vertical') },
+            { separator: true },
+            { label: '关闭面板', danger: true, onClick: () => onClose?.(paneId) },
+          ]);
+        }}
+      >
+        {/* xterm.js 渲染容器 */}
+        <div ref={containerRef} className="absolute inset-0" />
 
-      {/* 文件拖拽视觉提示 */}
-      {dragOver && (
-        <div
-          className="absolute inset-1 z-10 flex items-center justify-center pointer-events-none rounded-[var(--radius-md)]"
-          style={{ background: 'rgba(200, 128, 90, 0.06)', border: '2px dashed var(--accent)' }}
-        >
-          <span className="text-[var(--accent)] text-xs px-3 py-1.5 rounded-[var(--radius-md)]"
-            style={{ background: 'var(--bg-overlay)' }}>
-            释放以插入路径
-          </span>
-        </div>
-      )}
+        {/* 文件拖拽视觉提示 */}
+        {dragOver && (
+          <div
+            className="absolute inset-1 z-10 flex items-center justify-center pointer-events-none rounded-[var(--radius-md)]"
+            style={{ background: 'rgba(200, 128, 90, 0.06)', border: '2px dashed var(--accent)' }}
+          >
+            <span className="text-[var(--accent)] text-xs px-3 py-1.5 rounded-[var(--radius-md)]"
+              style={{ background: 'var(--bg-overlay)' }}>
+              释放以插入路径
+            </span>
+          </div>
+        )}
 
-      {/* Tab 拖拽分屏方向指示 */}
-      {tabDropZone && (
-        <div
-          className="absolute z-10 pointer-events-none"
-          style={{
-            ...dropZoneOverlay[tabDropZone],
-            background: 'rgba(200, 128, 90, 0.12)',
-            borderRadius: '4px',
-          }}
-        />
-      )}
+        {/* Tab 拖拽分屏方向指示 */}
+        {tabDropZone && (
+          <div
+            className="absolute z-10 pointer-events-none"
+            style={{
+              ...dropZoneOverlay[tabDropZone],
+              background: 'rgba(200, 128, 90, 0.12)',
+              borderRadius: '4px',
+            }}
+          />
+        )}
+      </div>
     </div>
   );
 }

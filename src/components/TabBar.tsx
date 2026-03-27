@@ -1,5 +1,6 @@
 import { useAppStore } from '../store';
 import { StatusDot } from './StatusDot';
+import { setDraggingTabId } from '../utils/dragState';
 import type { TerminalTab } from '../types';
 
 function getTabTitle(tab: TerminalTab): string {
@@ -34,8 +35,12 @@ export function TabBar({ projectId, onNewTab, onCloseTab }: Props) {
             }`}
             draggable
             onDragStart={(e) => {
+              setDraggingTabId(tab.id);
               e.dataTransfer.setData('application/tab-id', tab.id);
               e.dataTransfer.effectAllowed = 'move';
+            }}
+            onDragEnd={() => {
+              setDraggingTabId(null);
             }}
             onClick={() => setActiveTab(projectId, tab.id)}
           >

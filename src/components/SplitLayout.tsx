@@ -21,6 +21,8 @@ export function SplitLayout({ node, onSplit, onClose, onTabDrop }: Props) {
       <TerminalInstance
         ptyId={node.pane.ptyId}
         paneId={node.pane.id}
+        shellName={node.pane.shellName}
+        status={node.pane.status}
         onSplit={onSplit}
         onClose={onClose}
         onTabDrop={onTabDrop}
