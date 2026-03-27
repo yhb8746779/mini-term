@@ -3,6 +3,7 @@ import { Allotment } from 'allotment';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from './store';
 import { TerminalArea } from './components/TerminalArea';
+import { ProjectList } from './components/ProjectList';
 import { useTauriEvent } from './hooks/useTauriEvent';
 import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus } from './types';
 
@@ -56,9 +57,7 @@ export function App() {
         <Allotment>
           {/* 左栏：项目列表 */}
           <Allotment.Pane preferredSize={200} minSize={140} maxSize={350}>
-            <div className="h-full bg-[#12121f] p-2 text-xs text-gray-400">
-              项目列表占位
-            </div>
+            <ProjectList />
           </Allotment.Pane>
 
           {/* 中栏：文件树 */}
