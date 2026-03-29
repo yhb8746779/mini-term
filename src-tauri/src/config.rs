@@ -19,10 +19,44 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SavedPane {
+    pub shell_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum SavedSplitNode {
+    Leaf { pane: SavedPane },
+    Split {
+        direction: String,
+        children: Vec<SavedSplitNode>,
+        sizes: Vec<f64>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedTab {
+    #[serde(default)]
+    pub custom_title: Option<String>,
+    pub split_layout: SavedSplitNode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedProjectLayout {
+    pub tabs: Vec<SavedTab>,
+    pub active_tab_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectConfig {
     pub id: String,
     pub name: String,
     pub path: String,
+    #[serde(default)]
+    pub saved_layout: Option<SavedProjectLayout>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,5 +166,41 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.available_shells.len(), config.available_shells.len());
+    }
+
+    #[test]
+    fn old_config_without_layout_deserializes() {
+        let json = r#"{
+            "projects": [{"id": "1", "name": "test", "path": "/tmp"}],
+            "defaultShell": "cmd",
+            "availableShells": [{"name": "cmd", "command": "cmd"}],
+            "uiFontSize": 13,
+            "terminalFontSize": 14
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.projects.len(), 1);
+        assert!(config.projects[0].saved_layout.is_none());
+    }
+
+    #[test]
+    fn layout_round_trip() {
+        let layout = SavedProjectLayout {
+            tabs: vec![SavedTab {
+                custom_title: Some("test".into()),
+                split_layout: SavedSplitNode::Split {
+                    direction: "horizontal".into(),
+                    children: vec![
+                        SavedSplitNode::Leaf { pane: SavedPane { shell_name: "cmd".into() } },
+                        SavedSplitNode::Leaf { pane: SavedPane { shell_name: "powershell".into() } },
+                    ],
+                    sizes: vec![50.0, 50.0],
+                },
+            }],
+            active_tab_index: 0,
+        };
+        let json = serde_json::to_string(&layout).unwrap();
+        let parsed: SavedProjectLayout = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tabs.len(), 1);
+        assert_eq!(parsed.active_tab_index, 0);
     }
 }
