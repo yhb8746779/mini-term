@@ -1,6 +1,6 @@
 import { useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { useAppStore, genId, collectPtyIds } from '../store';
+import { useAppStore, genId, collectPtyIds, saveLayoutToConfig } from '../store';
 import { TabBar } from './TabBar';
 import { SplitLayout } from './SplitLayout';
 import { showContextMenu } from '../utils/contextMenu';
@@ -84,6 +84,7 @@ export function TerminalArea({ projectId, projectPath }: Props) {
       }
     }
     removeTab(projectId, tabId);
+    saveLayoutToConfig(projectId);
   }, [ps, projectId, removeTab]);
 
   const handleNewTab = useCallback(async (selectedShell?: ShellConfig) => {
@@ -116,6 +117,7 @@ export function TerminalArea({ projectId, projectPath }: Props) {
     };
 
     addTab(projectId, tab);
+    saveLayoutToConfig(projectId);
   }, [projectId, projectPath, config, addTab]);
 
   const handleNewTabClick = useCallback((e: React.MouseEvent) => {
@@ -151,6 +153,7 @@ export function TerminalArea({ projectId, projectPath }: Props) {
 
       const newLayout = insertSplit(activeTab.splitLayout, paneId, direction, newPane);
       updateTabLayout(projectId, activeTab.id, newLayout);
+      saveLayoutToConfig(projectId);
     },
     [ps, activeTab, config, projectId, projectPath, updateTabLayout]
   );
@@ -171,6 +174,7 @@ export function TerminalArea({ projectId, projectPath }: Props) {
       );
       updateTabLayout(projectId, activeTab.id, newLayout);
       removeTab(projectId, sourceTabId);
+      saveLayoutToConfig(projectId);
     },
     [ps, activeTab, projectId, updateTabLayout, removeTab]
   );
@@ -195,10 +199,19 @@ export function TerminalArea({ projectId, projectPath }: Props) {
     const newLayout = removePane(activeTab.splitLayout, paneId);
     if (newLayout) {
       updateTabLayout(projectId, activeTab.id, newLayout);
+      saveLayoutToConfig(projectId);
     } else {
       handleCloseTab(activeTab.id);
     }
   }, [ps, activeTab, projectId, updateTabLayout, handleCloseTab]);
+
+  const handleLayoutChange = useCallback((updatedNode: SplitNode) => {
+    const currentPs = useAppStore.getState().projectStates.get(projectId);
+    const currentActiveTab = currentPs?.tabs.find((t) => t.id === currentPs.activeTabId);
+    if (!currentActiveTab) return;
+    updateTabLayout(projectId, currentActiveTab.id, updatedNode);
+    saveLayoutToConfig(projectId);
+  }, [projectId, updateTabLayout]);
 
   return (
     <div className="flex flex-col h-full bg-[var(--bg-terminal)]">
@@ -211,7 +224,7 @@ export function TerminalArea({ projectId, projectPath }: Props) {
             className="absolute inset-0"
             style={{ display: tab.id === ps.activeTabId ? 'block' : 'none' }}
           >
-            <SplitLayout node={tab.splitLayout} onSplit={handleSplitPane} onClose={handleClosePane} onTabDrop={handleTabDrop} />
+            <SplitLayout node={tab.splitLayout} onSplit={handleSplitPane} onClose={handleClosePane} onTabDrop={handleTabDrop} onLayoutChange={handleLayoutChange} />
           </div>
         ))}
 
