@@ -13,12 +13,33 @@ export interface ProjectConfig {
   id: string;
   name: string;
   path: string;
+  savedLayout?: SavedProjectLayout;
 }
 
 export interface ShellConfig {
   name: string;
   command: string;
   args?: string[];
+}
+
+// === 布局持久化 ===
+
+export interface SavedPane {
+  shellName: string;
+}
+
+export type SavedSplitNode =
+  | { type: 'leaf'; pane: SavedPane }
+  | { type: 'split'; direction: 'horizontal' | 'vertical'; children: SavedSplitNode[]; sizes: number[] };
+
+export interface SavedTab {
+  customTitle?: string;
+  splitLayout: SavedSplitNode;
+}
+
+export interface SavedProjectLayout {
+  tabs: SavedTab[];
+  activeTabIndex: number;
 }
 
 // === 运行时状态 ===
