@@ -115,3 +115,8 @@ error > ai-working > ai-idle > idle
 ## 推荐开发环境
 
 - [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+
+# 社区支持
+学 AI , 上 L 站
+
+[LinuxDO ](https://linux.do/)
