@@ -5,7 +5,7 @@ import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { useAppStore, genId } from '../store';
 import { StatusDot } from './StatusDot';
 import { showContextMenu } from '../utils/contextMenu';
-import type { PaneStatus } from '../types';
+import type { PaneStatus, SplitNode } from '../types';
 
 export function ProjectList() {
   const config = useAppStore((s) => s.config);
@@ -40,15 +40,22 @@ export function ProjectList() {
     [removeProject]
   );
 
-  // 获取项目的 AI 聚合状态
-  const getProjectAiStatus = (projectId: string): PaneStatus | null => {
+  // 获取项目的聚合状态（优先级：ai-idle > ai-working > idle）
+  const getProjectStatus = (projectId: string): PaneStatus => {
     const ps = projectStates.get(projectId);
-    if (!ps) return null;
+    if (!ps || ps.tabs.length === 0) return 'idle';
+
+    const hasPaneWith = (node: SplitNode, target: PaneStatus): boolean => {
+      if (node.type === 'leaf') return node.pane.status === target;
+      return node.children.some((c) => hasPaneWith(c, target));
+    };
+
+    let hasAiWorking = false;
     for (const tab of ps.tabs) {
-      if (tab.status === 'ai-working') return 'ai-working';
-      if (tab.status === 'ai-idle') return 'ai-idle';
+      if (hasPaneWith(tab.splitLayout, 'ai-idle')) return 'ai-idle';
+      if (hasPaneWith(tab.splitLayout, 'ai-working')) hasAiWorking = true;
     }
-    return null;
+    return hasAiWorking ? 'ai-working' : 'idle';
   };
 
   return (
@@ -60,7 +67,7 @@ export function ProjectList() {
       <div className="flex-1 px-1.5 space-y-0.5">
         {config.projects.map((project) => {
           const isActive = project.id === activeProjectId;
-          const aiStatus = getProjectAiStatus(project.id);
+          const projectStatus = getProjectStatus(project.id);
 
           return (
             <div
@@ -91,7 +98,7 @@ export function ProjectList() {
                 <span className="w-0.5 h-4 rounded-full bg-[var(--accent)] flex-shrink-0" />
               )}
               <span className="truncate flex-1">{project.name}</span>
-              {aiStatus && <StatusDot status={aiStatus} />}
+              <StatusDot status={projectStatus} />
               <span
                 className="text-[var(--text-muted)] hover:text-[var(--color-error)] hidden group-hover:inline transition-colors text-sm"
                 onClick={(e) => handleRemoveProject(e, project.id)}
