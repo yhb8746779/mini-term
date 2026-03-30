@@ -1,4 +1,4 @@
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
@@ -14,6 +14,8 @@ export function ProjectList() {
   const setActiveProject = useAppStore((s) => s.setActiveProject);
   const addProject = useAppStore((s) => s.addProject);
   const removeProject = useAppStore((s) => s.removeProject);
+
+  const [confirmTarget, setConfirmTarget] = useState<{ id: string; name: string } | null>(null);
 
   const handleAddProject = useCallback(async () => {
     const selected = await open({ directory: true, multiple: false });
@@ -33,12 +35,19 @@ export function ProjectList() {
   const handleRemoveProject = useCallback(
     (e: React.MouseEvent, id: string) => {
       e.stopPropagation();
-      removeProject(id);
-      const latestConfig = useAppStore.getState().config;
-      invoke('save_config', { config: latestConfig });
+      const project = config.projects.find((p) => p.id === id);
+      if (project) setConfirmTarget({ id, name: project.name });
     },
-    [removeProject]
+    [config.projects]
   );
+
+  const doRemove = useCallback(() => {
+    if (!confirmTarget) return;
+    removeProject(confirmTarget.id);
+    const latestConfig = useAppStore.getState().config;
+    invoke('save_config', { config: latestConfig });
+    setConfirmTarget(null);
+  }, [confirmTarget, removeProject]);
 
   // 获取项目的聚合状态（优先级：ai-idle > ai-working > idle）
   const getProjectStatus = (projectId: string): PaneStatus => {
@@ -118,6 +127,36 @@ export function ProjectList() {
           + 添加项目
         </div>
       </div>
+
+      {/* 删除确认弹窗 */}
+      {confirmTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setConfirmTarget(null)}>
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+          <div
+            className="relative w-[320px] bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-2xl p-5 animate-slide-in"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="text-sm font-medium text-[var(--text-primary)] mb-2">移除项目</div>
+            <div className="text-xs text-[var(--text-secondary)] mb-5">
+              确定要移除项目「<span className="text-[var(--accent)]">{confirmTarget.name}</span>」吗？此操作仅从列表中移除，不会删除文件。
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                className="px-3 py-1.5 text-xs rounded-[var(--radius-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)] transition-colors"
+                onClick={() => setConfirmTarget(null)}
+              >
+                取消
+              </button>
+              <button
+                className="px-3 py-1.5 text-xs rounded-[var(--radius-sm)] bg-[var(--color-error)] text-white hover:opacity-90 transition-opacity"
+                onClick={doRemove}
+              >
+                移除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
