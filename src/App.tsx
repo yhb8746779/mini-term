@@ -100,11 +100,6 @@ export function App() {
           <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => setConfigOpen(true)}>设置</span>
         </div>
         <div className="flex-1" />
-        <div className="flex items-center gap-1.5 text-[var(--text-muted)]" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
-          <span className="w-3 h-3 rounded-full border border-[var(--border-default)] cursor-pointer hover:bg-[var(--color-success)] hover:border-transparent transition-all" />
-          <span className="w-3 h-3 rounded-full border border-[var(--border-default)] cursor-pointer hover:bg-[var(--color-warning)] hover:border-transparent transition-all" />
-          <span className="w-3 h-3 rounded-full border border-[var(--border-default)] cursor-pointer hover:bg-[var(--color-error)] hover:border-transparent transition-all" />
-        </div>
       </div>
 
       <div className="flex-1 overflow-hidden">
