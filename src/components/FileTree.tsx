@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { revealItemInDir, openPath } from '@tauri-apps/plugin-opener';
+import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useAppStore } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
 import { showContextMenu } from '../utils/contextMenu';
@@ -11,6 +12,18 @@ interface TreeNodeProps {
   entry: FileEntry;
   projectRoot: string;
   depth: number;
+}
+
+function getRelativePath(targetPath: string, rootPath: string) {
+  const normalize = (value: string) => value.replace(/[\\/]+/g, '/').replace(/\/$/, '');
+  const normalizedRoot = normalize(rootPath);
+  const normalizedTarget = normalize(targetPath);
+  const sep = rootPath.includes('\\') ? '\\' : '/';
+
+  if (normalizedTarget === normalizedRoot) return '.';
+  if (!normalizedTarget.startsWith(`${normalizedRoot}/`)) return targetPath;
+
+  return normalizedTarget.slice(normalizedRoot.length + 1).replace(/\//g, sep);
 }
 
 function TreeNode({ entry, projectRoot, depth }: TreeNodeProps) {
@@ -53,7 +66,17 @@ function TreeNode({ entry, projectRoot, depth }: TreeNodeProps) {
         onContextMenu={(e) => {
           e.preventDefault();
           e.stopPropagation();
+          const relativePath = getRelativePath(entry.path, projectRoot);
           const items: Parameters<typeof showContextMenu>[2] = [
+            {
+              label: '复制相对路径',
+              onClick: () => writeText(relativePath),
+            },
+            {
+              label: '复制绝对路径',
+              onClick: () => writeText(entry.path),
+            },
+            { separator: true },
             {
               label: '在文件夹中打开',
               onClick: () => revealItemInDir(entry.path),
