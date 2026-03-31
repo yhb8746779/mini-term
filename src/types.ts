@@ -119,3 +119,37 @@ export interface FsChangePayload {
   path: string;
   kind: string;
 }
+
+// === Git 状态 ===
+
+export type GitStatusType = 'modified' | 'added' | 'deleted' | 'renamed' | 'untracked' | 'conflicted';
+
+export interface GitFileStatus {
+  path: string;
+  oldPath?: string;
+  status: GitStatusType;
+  statusLabel: string; // "M", "A", "D", "R", "?", "C"
+}
+
+export interface DiffHunk {
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  lines: DiffLine[];
+}
+
+export interface DiffLine {
+  kind: 'add' | 'delete' | 'context';
+  content: string;
+  oldLineno?: number;
+  newLineno?: number;
+}
+
+export interface GitDiffResult {
+  oldContent: string;
+  newContent: string;
+  hunks: DiffHunk[];
+  isBinary: boolean;
+  tooLarge: boolean;
+}
