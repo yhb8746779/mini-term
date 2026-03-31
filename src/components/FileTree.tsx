@@ -152,9 +152,13 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff }: TreeN
         {(() => {
           const rel = getRelativePath(entry.path, projectRoot).replace(/\\/g, '/');
           const fileStatus = gitStatusMap.get(rel);
+          const GIT_COLORS: Record<string, string> = {
+            M: 'text-amber-400', A: 'text-green-400', D: 'text-red-400',
+            R: 'text-blue-400', '?': 'text-green-500', C: 'text-red-500',
+          };
           if (fileStatus) {
             return (
-              <span className="ml-1 text-xs text-[var(--text-muted)] opacity-60 flex-shrink-0">
+              <span className={`ml-1.5 text-xs font-bold flex-shrink-0 ${GIT_COLORS[fileStatus.statusLabel] ?? 'text-[var(--text-muted)]'}`}>
                 {fileStatus.statusLabel}
               </span>
             );
@@ -175,7 +179,7 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff }: TreeN
             }
             if (bestLabel) {
               return (
-                <span className="ml-1 text-xs text-[var(--text-muted)] opacity-40 flex-shrink-0">
+                <span className={`ml-1.5 text-xs font-bold flex-shrink-0 opacity-70 ${GIT_COLORS[bestLabel] ?? 'text-[var(--text-muted)]'}`}>
                   {bestLabel}
                 </span>
               );
