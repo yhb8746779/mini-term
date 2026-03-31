@@ -114,6 +114,33 @@ pub fn watch_directory(
     Ok(())
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileContentResult {
+    pub content: String,
+    pub is_binary: bool,
+    pub too_large: bool,
+}
+
+const MAX_FILE_VIEW_SIZE: u64 = 1_048_576; // 1MB
+
+#[tauri::command]
+pub fn read_file_content(path: String) -> Result<FileContentResult, String> {
+    let p = Path::new(&path);
+    if !p.is_file() {
+        return Err(format!("不是文件: {}", path));
+    }
+    let metadata = fs::metadata(p).map_err(|e| e.to_string())?;
+    if metadata.len() > MAX_FILE_VIEW_SIZE {
+        return Ok(FileContentResult { content: String::new(), is_binary: false, too_large: true });
+    }
+    let bytes = fs::read(p).map_err(|e| e.to_string())?;
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok(FileContentResult { content: s, is_binary: false, too_large: false }),
+        Err(_) => Ok(FileContentResult { content: String::new(), is_binary: true, too_large: false }),
+    }
+}
+
 #[tauri::command]
 pub fn create_file(path: String) -> Result<(), String> {
     let p = Path::new(&path);

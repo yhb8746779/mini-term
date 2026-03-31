@@ -33,6 +33,7 @@ pub fn run() {
             fs::unwatch_directory,
             fs::create_file,
             fs::create_directory,
+            fs::read_file_content,
             ai_sessions::get_ai_sessions,
             git::get_git_status,
             git::get_git_diff,

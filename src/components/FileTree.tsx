@@ -7,6 +7,7 @@ import { useTauriEvent } from '../hooks/useTauriEvent';
 import { showContextMenu } from '../utils/contextMenu';
 import { showPrompt } from '../utils/prompt';
 import { DiffModal } from './DiffModal';
+import { FileViewerModal } from './FileViewerModal';
 import type { FileEntry, FsChangePayload, GitFileStatus, PtyOutputPayload } from '../types';
 
 interface TreeNodeProps {
@@ -15,6 +16,7 @@ interface TreeNodeProps {
   depth: number;
   gitStatusMap: Map<string, GitFileStatus>;
   onViewDiff: (status: GitFileStatus) => void;
+  onViewFile: (path: string) => void;
 }
 
 function getRelativePath(targetPath: string, rootPath: string) {
@@ -29,7 +31,7 @@ function getRelativePath(targetPath: string, rootPath: string) {
   return normalizedTarget.slice(normalizedRoot.length + 1).replace(/\//g, sep);
 }
 
-function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff }: TreeNodeProps) {
+function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewFile }: TreeNodeProps) {
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<FileEntry[]>([]);
 
@@ -47,6 +49,8 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff }: TreeN
       const fileStatus = gitStatusMap.get(rel);
       if (fileStatus) {
         onViewDiff(fileStatus);
+      } else {
+        onViewFile(entry.path);
       }
       return;
     }
@@ -198,6 +202,7 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff }: TreeN
             depth={depth + 1}
             gitStatusMap={gitStatusMap}
             onViewDiff={onViewDiff}
+            onViewFile={onViewFile}
           />
         ))}
     </div>
@@ -275,6 +280,11 @@ export function FileTree() {
     setDiffTarget(status);
   }, []);
 
+  const [viewFilePath, setViewFilePath] = useState<string | null>(null);
+  const handleViewFile = useCallback((path: string) => {
+    setViewFilePath(path);
+  }, []);
+
   const handleRootContextMenu = useCallback((e: React.MouseEvent) => {
     if (!project) return;
     e.preventDefault();
@@ -323,9 +333,17 @@ export function FileTree() {
             depth={0}
             gitStatusMap={gitStatusMap}
             onViewDiff={handleViewDiff}
+            onViewFile={handleViewFile}
           />
         ))}
       </div>
+      {viewFilePath && (
+        <FileViewerModal
+          open={!!viewFilePath}
+          onClose={() => setViewFilePath(null)}
+          filePath={viewFilePath}
+        />
+      )}
       {diffTarget && (
         <DiffModal
           open={!!diffTarget}

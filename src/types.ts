@@ -153,3 +153,11 @@ export interface GitDiffResult {
   isBinary: boolean;
   tooLarge: boolean;
 }
+
+// === 文件查看 ===
+
+export interface FileContentResult {
+  content: string;
+  isBinary: boolean;
+  tooLarge: boolean;
+}
