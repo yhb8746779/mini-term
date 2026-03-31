@@ -93,7 +93,7 @@ fn status_label(status: &GitStatus) -> &'static str {
         GitStatus::Deleted => "D",
         GitStatus::Renamed => "R",
         GitStatus::Untracked => "?",
-        GitStatus::Conflicted => "!",
+        GitStatus::Conflicted => "C",
     }
 }
 
@@ -333,7 +333,7 @@ fn build_hunks(old_lines: &[&str], new_lines: &[&str]) -> Vec<DiffHunk> {
                         first = false;
                     }
                     lines_out.push(DiffLine {
-                        kind: "insert".to_string(),
+                        kind: "add".to_string(),
                         content: new_lines[*ni].to_string(),
                         old_lineno: None,
                         new_lineno: Some(new_lineno),
@@ -371,7 +371,7 @@ fn full_replace_diff(old_content: &str, new_content: &str) -> Vec<DiffHunk> {
     }
     for (i, l) in new_lines.iter().enumerate() {
         lines_out.push(DiffLine {
-            kind: "insert".to_string(),
+            kind: "add".to_string(),
             content: l.to_string(),
             old_lineno: None,
             new_lineno: Some((i as u32) + 1),
@@ -393,21 +393,21 @@ fn full_replace_diff(old_content: &str, new_content: &str) -> Vec<DiffHunk> {
 
 #[tauri::command]
 pub fn get_git_diff(project_path: String, file_path: String) -> Result<GitDiffResult, String> {
-    let abs_file = Path::new(&file_path);
     let project = Path::new(&project_path);
+    let abs_file = project.join(&file_path);
 
-    let repo = Repository::discover(project).map_err(|e| e.to_string())?;
+    let repo = Repository::discover(&abs_file).map_err(|e| e.to_string())?;
     let workdir = repo
         .workdir()
         .ok_or("bare repository not supported")?;
 
     // Relative path inside repo
-    let rel_path = diff_paths(abs_file, workdir)
+    let rel_path = diff_paths(&abs_file, workdir)
         .ok_or("file is outside repository working directory")?;
     let rel_str = rel_path.to_string_lossy().replace('\\', "/");
 
     // Read new (working tree) content
-    let new_bytes = std::fs::read(abs_file).map_err(|e| e.to_string())?;
+    let new_bytes = std::fs::read(&abs_file).map_err(|e| e.to_string())?;
 
     // Large file protection (> 1 MB)
     if new_bytes.len() > 1_048_576 {
