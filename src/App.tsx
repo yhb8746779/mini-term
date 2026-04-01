@@ -5,6 +5,7 @@ import { useAppStore, restoreLayout, flushLayoutToConfig, initExpandedDirs, flus
 import { TerminalArea } from './components/TerminalArea';
 import { ProjectList } from './components/ProjectList';
 import { FileTree } from './components/FileTree';
+import { GitHistory } from './components/GitHistory';
 import { SettingsModal } from './components/SettingsModal';
 import { useTauriEvent } from './hooks/useTauriEvent';
 import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus } from './types';
@@ -94,6 +95,17 @@ export function App() {
     }, 500);
   }, [setConfig]);
 
+  const saveMidTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const saveMiddleColumnSizes = useCallback((sizes: number[]) => {
+    clearTimeout(saveMidTimer.current);
+    saveMidTimer.current = setTimeout(() => {
+      const cfg = useAppStore.getState().config;
+      const newConfig = { ...cfg, middleColumnSizes: sizes };
+      setConfig(newConfig);
+      invoke('save_config', { config: newConfig });
+    }, 500);
+  }, [setConfig]);
+
   return (
     <div className="flex flex-col h-full">
       <div className="flex items-center gap-4 px-4 py-2 bg-[var(--bg-elevated)] border-b border-[var(--border-subtle)] text-xs select-none"
@@ -118,7 +130,18 @@ export function App() {
           </Allotment.Pane>
 
           <Allotment.Pane minSize={180}>
-            <FileTree key={activeProjectId} />
+            <Allotment
+              vertical
+              defaultSizes={config.middleColumnSizes ?? [300, 200]}
+              onChange={saveMiddleColumnSizes}
+            >
+              <Allotment.Pane minSize={150}>
+                <FileTree key={activeProjectId} />
+              </Allotment.Pane>
+              <Allotment.Pane minSize={100}>
+                <GitHistory key={activeProjectId} />
+              </Allotment.Pane>
+            </Allotment>
           </Allotment.Pane>
 
           <Allotment.Pane>

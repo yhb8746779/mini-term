@@ -38,6 +38,9 @@ pub fn run() {
             git::get_git_status,
             git::get_git_diff,
             git::discover_git_repos,
+            git::get_git_log,
+            git::get_commit_files,
+            git::get_commit_file_diff,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

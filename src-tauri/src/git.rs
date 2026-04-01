@@ -162,6 +162,24 @@ pub struct GitRepoInfo {
     pub path: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommitInfo {
+    pub hash: String,
+    pub short_hash: String,
+    pub message: String,
+    pub author: String,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitFileInfo {
+    pub path: String,
+    pub status: String,
+    pub old_path: Option<String>,
+}
+
 /// Scan project_path for git repositories.
 fn find_repos(project_path: &Path) -> Vec<(String, PathBuf, Repository)> {
     let mut repos = Vec::new();
@@ -233,8 +251,196 @@ pub fn discover_git_repos(project_path: String) -> Result<Vec<GitRepoInfo>, Stri
         .collect())
 }
 
+#[tauri::command]
+pub fn get_git_log(
+    repo_path: String,
+    before_commit: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<GitCommitInfo>, String> {
+    let path = Path::new(&repo_path);
+    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let limit = limit.unwrap_or(30);
+
+    let mut revwalk = repo.revwalk().map_err(|e| e.to_string())?;
+    revwalk.set_sorting(git2::Sort::TIME).map_err(|e| e.to_string())?;
+
+    if let Some(ref hash) = before_commit {
+        let oid = git2::Oid::from_str(hash).map_err(|e| e.to_string())?;
+        let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
+        for parent_id in commit.parent_ids() {
+            revwalk.push(parent_id).map_err(|e| e.to_string())?;
+        }
+    } else {
+        revwalk.push_head().map_err(|e| e.to_string())?;
+    }
+
+    let mut result = Vec::with_capacity(limit);
+    for oid_result in revwalk {
+        if result.len() >= limit {
+            break;
+        }
+        let oid = oid_result.map_err(|e| e.to_string())?;
+        let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
+        let hash = oid.to_string();
+        let short_hash = hash[..7.min(hash.len())].to_string();
+        let message = commit.summary().unwrap_or("").to_string();
+        let author = commit.author().name().unwrap_or("unknown").to_string();
+        let timestamp = commit.time().seconds();
+        result.push(GitCommitInfo {
+            hash,
+            short_hash,
+            message,
+            author,
+            timestamp,
+        });
+    }
+
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn get_commit_files(
+    repo_path: String,
+    commit_hash: String,
+) -> Result<Vec<CommitFileInfo>, String> {
+    let repo = Repository::open(Path::new(&repo_path)).map_err(|e| e.to_string())?;
+    let oid = git2::Oid::from_str(&commit_hash).map_err(|e| e.to_string())?;
+    let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
+    let tree = commit.tree().map_err(|e| e.to_string())?;
+
+    let parent_tree = if commit.parent_count() > 0 {
+        Some(commit.parent(0).map_err(|e| e.to_string())?.tree().map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+
+    let diff = repo
+        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
+        .map_err(|e| e.to_string())?;
+
+    let mut files = Vec::new();
+    for delta in diff.deltas() {
+        let status = match delta.status() {
+            git2::Delta::Added => "added",
+            git2::Delta::Deleted => "deleted",
+            git2::Delta::Modified => "modified",
+            git2::Delta::Renamed => "renamed",
+            _ => "modified",
+        };
+        let path = delta
+            .new_file()
+            .path()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let old_path = if delta.status() == git2::Delta::Renamed {
+            delta.old_file().path().map(|p| p.to_string_lossy().to_string())
+        } else {
+            None
+        };
+        files.push(CommitFileInfo {
+            path,
+            status: status.to_string(),
+            old_path,
+        });
+    }
+    Ok(files)
+}
+
+#[tauri::command]
+pub fn get_commit_file_diff(
+    repo_path: String,
+    commit_hash: String,
+    file_path: String,
+    old_file_path: Option<String>,
+) -> Result<GitDiffResult, String> {
+    let repo = Repository::open(Path::new(&repo_path)).map_err(|e| e.to_string())?;
+    let oid = git2::Oid::from_str(&commit_hash).map_err(|e| e.to_string())?;
+    let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
+    let tree = commit.tree().map_err(|e| e.to_string())?;
+
+    let parent_tree = if commit.parent_count() > 0 {
+        Some(commit.parent(0).map_err(|e| e.to_string())?.tree().map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+
+    let new_content = match tree.get_path(Path::new(&file_path)) {
+        Ok(entry) => {
+            let obj = entry.to_object(&repo).map_err(|e| e.to_string())?;
+            let blob = obj.as_blob().ok_or("not a blob")?;
+            if blob.is_binary() {
+                return Ok(GitDiffResult {
+                    old_content: String::new(),
+                    new_content: String::new(),
+                    hunks: Vec::new(),
+                    is_binary: true,
+                    too_large: false,
+                });
+            }
+            if blob.content().len() > 1_048_576 {
+                return Ok(GitDiffResult {
+                    old_content: String::new(),
+                    new_content: String::new(),
+                    hunks: Vec::new(),
+                    is_binary: false,
+                    too_large: true,
+                });
+            }
+            std::str::from_utf8(blob.content())
+                .map_err(|_| "binary".to_string())?
+                .to_string()
+        }
+        Err(_) => String::new(),
+    };
+
+    let old_lookup_path = old_file_path.as_deref().unwrap_or(&file_path);
+    let old_content = if let Some(ref pt) = parent_tree {
+        match pt.get_path(Path::new(old_lookup_path)) {
+            Ok(entry) => {
+                let obj = entry.to_object(&repo).map_err(|e| e.to_string())?;
+                let blob = obj.as_blob().ok_or("not a blob")?;
+                if blob.is_binary() {
+                    return Ok(GitDiffResult {
+                        old_content: String::new(),
+                        new_content: String::new(),
+                        hunks: Vec::new(),
+                        is_binary: true,
+                        too_large: false,
+                    });
+                }
+                std::str::from_utf8(blob.content())
+                    .map_err(|_| "binary".to_string())?
+                    .to_string()
+            }
+            Err(_) => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
+    let old_lines: Vec<&str> = old_content.lines().collect();
+    let new_lines: Vec<&str> = new_content.lines().collect();
+
+    let ol = old_lines.len() as u64;
+    let nl = new_lines.len() as u64;
+
+    let hunks = if ol * nl > 10_000_000 {
+        full_replace_diff(&old_content, &new_content)
+    } else {
+        build_hunks(&old_lines, &new_lines)
+    };
+
+    Ok(GitDiffResult {
+        old_content,
+        new_content,
+        hunks,
+        is_binary: false,
+        too_large: false,
+    })
+}
+
 // ---------------------------------------------------------------------------
-// Task 3: get_git_diff implementation
+// get_git_diff implementation
 // ---------------------------------------------------------------------------
 
 fn get_head_content(repo: &Repository, rel_path: &str) -> Result<Option<String>, String> {

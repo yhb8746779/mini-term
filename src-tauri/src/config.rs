@@ -47,6 +47,8 @@ pub struct AppConfig {
     pub terminal_font_size: f64,
     #[serde(default)]
     pub layout_sizes: Option<Vec<f64>>,
+    #[serde(default)]
+    pub middle_column_sizes: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +118,7 @@ impl Default for AppConfig {
             ui_font_size: default_ui_font_size(),
             terminal_font_size: default_terminal_font_size(),
             layout_sizes: None,
+            middle_column_sizes: None,
         }
     }
 }

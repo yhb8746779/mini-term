@@ -1,0 +1,208 @@
+import { useState, useEffect, useCallback } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { InlineView, SideBySideView } from './DiffModal';
+import type { CommitFileInfo, GitDiffResult } from '../types';
+
+interface CommitDiffModalProps {
+  open: boolean;
+  onClose: () => void;
+  repoPath: string;
+  commitHash: string;
+  commitMessage: string;
+  files: CommitFileInfo[];
+}
+
+type ViewMode = 'side-by-side' | 'inline';
+
+const STATUS_LABELS: Record<string, { text: string; color: string }> = {
+  added: { text: 'A', color: 'text-green-400' },
+  modified: { text: 'M', color: 'text-amber-400' },
+  deleted: { text: 'D', color: 'text-red-400' },
+  renamed: { text: 'R', color: 'text-blue-400' },
+};
+
+export function CommitDiffModal({
+  open,
+  onClose,
+  repoPath,
+  commitHash,
+  commitMessage,
+  files,
+}: CommitDiffModalProps) {
+  const [viewMode, setViewMode] = useState<ViewMode>('side-by-side');
+  const [selectedFile, setSelectedFile] = useState<string>(files[0]?.path ?? '');
+  const [diffResult, setDiffResult] = useState<GitDiffResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const loadDiff = useCallback(
+    async (filePath: string) => {
+      if (!filePath) return;
+      setLoading(true);
+      setError('');
+      setDiffResult(null);
+      const fileInfo = files.find((f) => f.path === filePath);
+      try {
+        const result = await invoke<GitDiffResult>('get_commit_file_diff', {
+          repoPath,
+          commitHash,
+          filePath,
+          oldFilePath: fileInfo?.oldPath ?? null,
+        });
+        setDiffResult(result);
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [repoPath, commitHash, files],
+  );
+
+  useEffect(() => {
+    if (open && selectedFile) {
+      loadDiff(selectedFile);
+    }
+  }, [open, selectedFile, loadDiff]);
+
+  useEffect(() => {
+    if (open && files.length > 0 && !files.find((f) => f.path === selectedFile)) {
+      setSelectedFile(files[0].path);
+    }
+  }, [open, files, selectedFile]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  const shortHash = commitHash.slice(0, 7);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={onClose}>
+      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+      <div
+        className="relative flex overflow-hidden bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-2xl animate-slide-in"
+        style={{ width: '92vw', height: '85vh' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* 左侧文件列表 */}
+        <div className="w-56 flex-shrink-0 border-r border-[var(--border-subtle)] flex flex-col bg-[var(--bg-elevated)]">
+          <div className="px-3 py-3 border-b border-[var(--border-subtle)]">
+            <div className="text-sm font-medium text-[var(--accent)] truncate">
+              {commitMessage}
+            </div>
+            <div className="text-xs text-[var(--text-muted)] mt-1 font-mono">{shortHash}</div>
+          </div>
+          <div className="flex-1 overflow-y-auto">
+            {files.map((file) => {
+              const label = STATUS_LABELS[file.status] ?? { text: '?', color: 'text-[var(--text-muted)]' };
+              const fileName = file.path.split('/').pop() ?? file.path;
+              const isSelected = file.path === selectedFile;
+              return (
+                <div
+                  key={file.path}
+                  className={`flex items-center gap-2 px-3 py-1.5 cursor-pointer text-sm transition-colors ${
+                    isSelected
+                      ? 'bg-[var(--accent-subtle)] text-[var(--accent)]'
+                      : 'text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
+                  }`}
+                  onClick={() => setSelectedFile(file.path)}
+                  title={file.path}
+                >
+                  <span className={`text-xs font-bold flex-shrink-0 ${label.color}`}>
+                    {label.text}
+                  </span>
+                  <span className="truncate">{fileName}</span>
+                </div>
+              );
+            })}
+          </div>
+          <div className="px-3 py-2 border-t border-[var(--border-subtle)] text-xs text-[var(--text-muted)]">
+            {files.length} 个文件变更
+          </div>
+        </div>
+
+        {/* 右侧 diff 区域 */}
+        <div className="flex-1 flex flex-col">
+          <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border-subtle)] flex-shrink-0">
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-[var(--text-primary)] truncate max-w-[400px]">
+                {selectedFile}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="flex rounded-[var(--radius-sm)] border border-[var(--border-default)] overflow-hidden">
+                <button
+                  className={`px-3 py-1 text-sm transition-colors ${
+                    viewMode === 'side-by-side'
+                      ? 'bg-[var(--accent-subtle)] text-[var(--accent)]'
+                      : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                  }`}
+                  onClick={() => setViewMode('side-by-side')}
+                >
+                  并排
+                </button>
+                <button
+                  className={`px-3 py-1 text-sm transition-colors ${
+                    viewMode === 'inline'
+                      ? 'bg-[var(--accent-subtle)] text-[var(--accent)]'
+                      : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                  }`}
+                  onClick={() => setViewMode('inline')}
+                >
+                  内联
+                </button>
+              </div>
+              <button
+                className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-lg leading-none ml-2"
+                onClick={onClose}
+              >
+                &#10005;
+              </button>
+            </div>
+          </div>
+
+          <div className="flex-1 overflow-auto bg-[var(--bg-base)]">
+            {loading && (
+              <div className="flex items-center justify-center h-full text-[var(--text-muted)]">
+                加载中...
+              </div>
+            )}
+            {error && (
+              <div className="flex items-center justify-center h-full text-[var(--color-error)]">
+                {error}
+              </div>
+            )}
+            {diffResult && diffResult.isBinary && (
+              <div className="flex items-center justify-center h-full text-[var(--text-muted)]">
+                二进制文件，不支持 diff 预览
+              </div>
+            )}
+            {diffResult && diffResult.tooLarge && (
+              <div className="flex items-center justify-center h-full text-[var(--text-muted)]">
+                文件过大（&gt;1MB），不支持 diff 预览
+              </div>
+            )}
+            {diffResult && !diffResult.isBinary && !diffResult.tooLarge && (
+              viewMode === 'side-by-side'
+                ? <SideBySideView hunks={diffResult.hunks} />
+                : <InlineView hunks={diffResult.hunks} />
+            )}
+            {!loading && !error && !diffResult && files.length === 0 && (
+              <div className="flex items-center justify-center h-full text-[var(--text-muted)]">
+                该提交无文件变更
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

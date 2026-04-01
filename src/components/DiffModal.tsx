@@ -13,7 +13,7 @@ type ViewMode = 'side-by-side' | 'inline';
 
 // ─── InlineView ───
 
-function InlineView({ hunks }: { hunks: GitDiffResult['hunks'] }) {
+export function InlineView({ hunks }: { hunks: GitDiffResult['hunks'] }) {
   return (
     <div className="font-mono text-sm leading-6">
       {hunks.map((hunk, hi) => (
@@ -53,7 +53,7 @@ function InlineView({ hunks }: { hunks: GitDiffResult['hunks'] }) {
 
 // ─── SideBySideView ───
 
-function SideBySideView({ hunks }: { hunks: GitDiffResult['hunks'] }) {
+export function SideBySideView({ hunks }: { hunks: GitDiffResult['hunks'] }) {
   const rows: { left?: DiffLine; right?: DiffLine }[] = [];
 
   for (const hunk of hunks) {

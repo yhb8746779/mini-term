@@ -20,6 +20,7 @@ export interface AppConfig {
   uiFontSize: number;
   terminalFontSize: number;
   layoutSizes?: number[];
+  middleColumnSizes?: number[];
 }
 
 export interface ProjectConfig {
@@ -165,4 +166,25 @@ export interface FileContentResult {
   content: string;
   isBinary: boolean;
   tooLarge: boolean;
+}
+
+// === Git 历史 ===
+
+export interface GitRepoInfo {
+  name: string;
+  path: string;
+}
+
+export interface GitCommitInfo {
+  hash: string;
+  shortHash: string;
+  message: string;
+  author: string;
+  timestamp: number;
+}
+
+export interface CommitFileInfo {
+  path: string;
+  status: 'added' | 'modified' | 'deleted' | 'renamed';
+  oldPath?: string;
 }
