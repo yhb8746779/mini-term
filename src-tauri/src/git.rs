@@ -1,7 +1,7 @@
 use git2::{Repository, Status, StatusOptions};
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -155,28 +155,43 @@ fn collect_repo_status(
     Ok(result)
 }
 
-#[tauri::command]
-pub fn get_git_status(project_path: String) -> Result<Vec<GitFileStatus>, String> {
-    let path = Path::new(&project_path);
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRepoInfo {
+    pub name: String,
+    pub path: String,
+}
 
-    // Try to discover a repo at or above project_path
-    if let Ok(repo) = Repository::discover(path) {
-        return collect_repo_status(&repo, Some(path));
+/// Scan project_path for git repositories.
+fn find_repos(project_path: &Path) -> Vec<(String, PathBuf, Repository)> {
+    let mut repos = Vec::new();
+
+    // 1) 项目路径自身是否为仓库（使用 discover 保持向上搜索能力）
+    if let Ok(repo) = Repository::discover(project_path) {
+        if let Some(workdir) = repo.workdir() {
+            let repo_root = workdir.to_path_buf();
+            let name = repo_root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "root".to_string());
+            repos.push((name, repo_root, repo));
+            return repos;
+        }
     }
 
-    // Fall back: scan one level of subdirectories
-    let mut all = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(path) {
+    // 2) 扫描一级子目录（使用 open 避免向上搜索）
+    if let Ok(entries) = std::fs::read_dir(project_path) {
         for entry in entries.flatten() {
             let sub = entry.path();
             if sub.is_dir() {
-                if let Ok(repo) = Repository::discover(&sub) {
-                    // Only use if the workdir is exactly this subdirectory (avoid climbing up)
+                if let Ok(repo) = Repository::open(&sub) {
                     if let Some(workdir) = repo.workdir() {
                         if workdir.canonicalize().ok() == sub.canonicalize().ok() {
-                            if let Ok(mut files) = collect_repo_status(&repo, Some(path)) {
-                                all.append(&mut files);
-                            }
+                            let name = sub
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            repos.push((name, sub, repo));
                         }
                     }
                 }
@@ -184,7 +199,38 @@ pub fn get_git_status(project_path: String) -> Result<Vec<GitFileStatus>, String
         }
     }
 
+    repos
+}
+
+#[tauri::command]
+pub fn get_git_status(project_path: String) -> Result<Vec<GitFileStatus>, String> {
+    let path = Path::new(&project_path);
+    let repos = find_repos(path);
+
+    if repos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut all = Vec::new();
+    for (_, _, repo) in &repos {
+        if let Ok(mut files) = collect_repo_status(repo, Some(path)) {
+            all.append(&mut files);
+        }
+    }
     Ok(all)
+}
+
+#[tauri::command]
+pub fn discover_git_repos(project_path: String) -> Result<Vec<GitRepoInfo>, String> {
+    let path = Path::new(&project_path);
+    let repos = find_repos(path);
+    Ok(repos
+        .into_iter()
+        .map(|(name, abs_path, _)| GitRepoInfo {
+            name,
+            path: abs_path.to_string_lossy().to_string(),
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------

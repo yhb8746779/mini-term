@@ -37,6 +37,7 @@ pub fn run() {
             ai_sessions::get_ai_sessions,
             git::get_git_status,
             git::get_git_diff,
+            git::discover_git_repos,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
