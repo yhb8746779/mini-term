@@ -37,6 +37,17 @@ const NON_INTERACTIVE_FLAGS: &[&str] = &[
     "-p", "--print",
 ];
 
+/// AI 会话中的显式退出命令
+const AI_EXIT_COMMANDS: &[&str] = &[
+    "/exit", "exit",       // Claude Code & Codex 通用
+    "/quit", "quit",       // Claude Code & Codex 通用
+    ":quit",               // Codex 交互式退出
+    "/logout",             // Codex 退出
+];
+
+/// 连续两次 Ctrl+C 退出的时间窗口
+const DOUBLE_CTRLC_WINDOW: Duration = Duration::from_millis(1000);
+
 #[derive(Clone)]
 pub struct PtyManager {
     instances: Arc<Mutex<HashMap<u32, PtyInstance>>>,
@@ -44,6 +55,7 @@ pub struct PtyManager {
     last_output: Arc<Mutex<HashMap<u32, Instant>>>,
     ai_sessions: Arc<Mutex<HashSet<u32>>>,
     input_buffers: Arc<Mutex<HashMap<u32, String>>>,
+    last_ctrlc: Arc<Mutex<HashMap<u32, Instant>>>,
 }
 
 impl PtyManager {
@@ -54,6 +66,7 @@ impl PtyManager {
             last_output: Arc::new(Mutex::new(HashMap::new())),
             ai_sessions: Arc::new(Mutex::new(HashSet::new())),
             input_buffers: Arc::new(Mutex::new(HashMap::new())),
+            last_ctrlc: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -73,7 +86,8 @@ impl PtyManager {
     /// 追踪用户输入，检测 AI 命令（claude/codex）的执行与退出
     ///
     /// 进入 AI 会话：在 shell 中输入 claude/codex + Enter
-    /// 退出 AI 会话：Ctrl+C、Ctrl+D、或输入 /exit、exit
+    /// 退出 AI 会话：Ctrl+D（EOF）、或输入退出命令（/exit /quit exit quit :quit /logout）
+    /// 注意：Ctrl+C 在 AI 会话中是取消当前任务，不是退出会话
     pub fn track_input(&self, pty_id: u32, data: &str) {
         let in_ai = self.is_ai_session(pty_id);
         let mut enter_ai = false;
@@ -83,16 +97,32 @@ impl PtyManager {
             let buf = buffers.entry(pty_id).or_default();
             for ch in data.chars() {
                 match ch {
-                    '\x03' | '\x04' if in_ai => {
-                        // Ctrl+C / Ctrl+D → 退出 AI 会话
+                    '\x03' if in_ai => {
+                        // Ctrl+C: 单次取消当前任务，连续两次退出 AI 会话
+                        let mut last = self.last_ctrlc.lock().unwrap();
+                        let now = Instant::now();
+                        if let Some(prev) = last.get(&pty_id) {
+                            if now.duration_since(*prev) < DOUBLE_CTRLC_WINDOW {
+                                exit_ai = true;
+                                last.remove(&pty_id);
+                            } else {
+                                last.insert(pty_id, now);
+                            }
+                        } else {
+                            last.insert(pty_id, now);
+                        }
+                        buf.clear();
+                    }
+                    '\x04' if in_ai => {
+                        // Ctrl+D (EOF) → 退出 AI 会话
                         exit_ai = true;
                         buf.clear();
                     }
                     '\r' | '\n' => {
                         let cmd = buf.trim().to_lowercase();
                         if in_ai {
-                            // AI 会话中：仅识别显式退出命令
-                            if cmd == "/exit" || cmd == "exit" {
+                            // AI 会话中：识别显式退出命令
+                            if AI_EXIT_COMMANDS.iter().any(|&c| cmd == c) {
                                 exit_ai = true;
                             }
                         } else if !cmd.is_empty() {
@@ -272,6 +302,7 @@ pub fn kill_pty(state: tauri::State<'_, PtyManager>, pty_id: u32) -> Result<(), 
     state.last_output.lock().unwrap().remove(&pty_id);
     state.ai_sessions.lock().unwrap().remove(&pty_id);
     state.input_buffers.lock().unwrap().remove(&pty_id);
+    state.last_ctrlc.lock().unwrap().remove(&pty_id);
     Ok(())
 }
 
@@ -311,9 +342,22 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_exits_ai_session() {
+    fn single_ctrl_c_does_not_exit_ai_session() {
         let mgr = PtyManager::new();
         mgr.track_input(1, "claude\r");
+        assert!(mgr.is_ai_session(1));
+        // 单次 Ctrl+C 是取消当前任务，不退出
+        mgr.track_input(1, "\x03");
+        assert!(mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn double_ctrl_c_exits_ai_session() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "claude\r");
+        assert!(mgr.is_ai_session(1));
+        // 连续两次 Ctrl+C 退出 AI 会话
+        mgr.track_input(1, "\x03");
         assert!(mgr.is_ai_session(1));
         mgr.track_input(1, "\x03");
         assert!(!mgr.is_ai_session(1));
@@ -343,6 +387,42 @@ mod tests {
         mgr.track_input(1, "claude\r");
         assert!(mgr.is_ai_session(1));
         mgr.track_input(1, "exit\r");
+        assert!(!mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn slash_quit_exits_ai_session() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "claude\r");
+        assert!(mgr.is_ai_session(1));
+        mgr.track_input(1, "/quit\r");
+        assert!(!mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn quit_exits_ai_session() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "codex\r");
+        assert!(mgr.is_ai_session(1));
+        mgr.track_input(1, "quit\r");
+        assert!(!mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn colon_quit_exits_codex_session() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "codex\r");
+        assert!(mgr.is_ai_session(1));
+        mgr.track_input(1, ":quit\r");
+        assert!(!mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn slash_logout_exits_codex_session() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "codex\r");
+        assert!(mgr.is_ai_session(1));
+        mgr.track_input(1, "/logout\r");
         assert!(!mgr.is_ai_session(1));
     }
 
