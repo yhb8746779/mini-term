@@ -3,9 +3,26 @@ use std::fs;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
+// 注意：variant 顺序不可调换！untagged 按声明顺序尝试匹配
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProjectTreeItem {
+    ProjectId(String),
+    Group(ProjectGroup),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectGroup {
+    pub id: String,
+    pub name: String,
+    pub collapsed: bool,
+    pub children: Vec<ProjectTreeItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OldProjectGroup {
     pub id: String,
     pub name: String,
     pub collapsed: bool,
@@ -16,9 +33,11 @@ pub struct ProjectGroup {
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     pub projects: Vec<ProjectConfig>,
-    #[serde(default)]
-    pub project_groups: Option<Vec<ProjectGroup>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_tree: Option<Vec<ProjectTreeItem>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_groups: Option<Vec<OldProjectGroup>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_ordering: Option<Vec<String>>,
     pub default_shell: String,
     pub available_shells: Vec<ShellConfig>,
@@ -89,6 +108,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             projects: vec![],
+            project_tree: None,
             project_groups: None,
             project_ordering: None,
             default_shell: default_shell_name(),
@@ -150,12 +170,45 @@ fn config_path(app: &AppHandle) -> PathBuf {
     dir.join("config.json")
 }
 
+fn migrate_config(mut config: AppConfig) -> AppConfig {
+    if config.project_tree.is_some() {
+        config.project_groups = None;
+        config.project_ordering = None;
+        return config;
+    }
+    let groups = match config.project_groups.take() {
+        Some(g) if !g.is_empty() => g,
+        _ => return config,
+    };
+    let ordering = config.project_ordering.take().unwrap_or_default();
+    let group_map: std::collections::HashMap<String, &OldProjectGroup> =
+        groups.iter().map(|g| (g.id.clone(), g)).collect();
+
+    let mut tree: Vec<ProjectTreeItem> = Vec::new();
+    for item_id in &ordering {
+        if let Some(old_group) = group_map.get(item_id) {
+            tree.push(ProjectTreeItem::Group(ProjectGroup {
+                id: old_group.id.clone(),
+                name: old_group.name.clone(),
+                collapsed: old_group.collapsed,
+                children: old_group.project_ids.iter()
+                    .map(|pid| ProjectTreeItem::ProjectId(pid.clone()))
+                    .collect(),
+            }));
+        } else {
+            tree.push(ProjectTreeItem::ProjectId(item_id.clone()));
+        }
+    }
+    config.project_tree = Some(tree);
+    config
+}
+
 #[tauri::command]
 pub fn load_config(app: AppHandle) -> AppConfig {
     let path = config_path(&app);
     match fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => AppConfig::default(),
+        Ok(content) => migrate_config(serde_json::from_str(&content).unwrap_or_default()),
+        Err(_) => migrate_config(AppConfig::default()),
     }
 }
 
@@ -209,6 +262,7 @@ mod tests {
             "terminalFontSize": 14
         }"#;
         let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(config.project_tree.is_none());
         assert!(config.project_groups.is_none());
         assert!(config.project_ordering.is_none());
     }
@@ -233,5 +287,52 @@ mod tests {
         let parsed: SavedProjectLayout = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tabs.len(), 1);
         assert_eq!(parsed.active_tab_index, 0);
+    }
+
+    #[test]
+    fn migrate_old_groups_to_tree() {
+        let json = r#"{
+            "projects": [
+                {"id": "p1", "name": "proj1", "path": "/tmp/1"},
+                {"id": "p2", "name": "proj2", "path": "/tmp/2"}
+            ],
+            "projectGroups": [{"id": "g1", "name": "Group1", "collapsed": false, "projectIds": ["p1"]}],
+            "projectOrdering": ["g1", "p2"],
+            "defaultShell": "cmd",
+            "availableShells": [{"name": "cmd", "command": "cmd"}],
+            "uiFontSize": 13,
+            "terminalFontSize": 14
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        let config = migrate_config(config);
+        assert!(config.project_tree.is_some());
+        assert!(config.project_groups.is_none());
+        assert!(config.project_ordering.is_none());
+        let tree = config.project_tree.unwrap();
+        assert_eq!(tree.len(), 2);
+    }
+
+    #[test]
+    fn nested_tree_round_trip() {
+        let tree = vec![
+            ProjectTreeItem::ProjectId("p1".into()),
+            ProjectTreeItem::Group(ProjectGroup {
+                id: "g1".into(),
+                name: "Group1".into(),
+                collapsed: false,
+                children: vec![
+                    ProjectTreeItem::ProjectId("p2".into()),
+                    ProjectTreeItem::Group(ProjectGroup {
+                        id: "g2".into(),
+                        name: "Sub".into(),
+                        collapsed: true,
+                        children: vec![ProjectTreeItem::ProjectId("p3".into())],
+                    }),
+                ],
+            }),
+        ];
+        let json = serde_json::to_string(&tree).unwrap();
+        let parsed: Vec<ProjectTreeItem> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 2);
     }
 }
