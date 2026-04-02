@@ -86,7 +86,7 @@ export function ProjectList() {
     const ps = projectStates.get(projectId);
     if (!ps || ps.tabs.length === 0) return 'idle';
     const hasPaneWith = (node: SplitNode, target: PaneStatus): boolean => {
-      if (node.type === 'leaf') return node.pane.status === target;
+      if (node.type === 'leaf') return node.panes.some((p) => p.status === target);
       return node.children.some((c) => hasPaneWith(c, target));
     };
     let hasAiWorking = false;

@@ -174,6 +174,14 @@ pub fn create_pty(
     }
     cmd.cwd(&cwd);
 
+    // Advertise terminal capabilities so TUI apps (Claude Code, etc.)
+    // enable colors and advanced cursor rendering.
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    // Ensure UTF-8 locale for proper CJK/emoji rendering
+    cmd.env("LANG", "en_US.UTF-8");
+    cmd.env("LC_ALL", "en_US.UTF-8");
+
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
 
     let pty_id = {
