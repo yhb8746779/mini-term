@@ -32,6 +32,7 @@ windows = { version = "0.58", features = [
   "Win32_System_Threading",
 ] }
 tauri-plugin-clipboard-manager = "2.3.2"
+tauri-plugin-window-state = "2"
 dirs = "6"
 git2 = "0.19"
 pathdiff = "0.2"

@@ -4264,7 +4264,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-app"
-version = "0.1.0"
+version = "0.1.8"
 dependencies = [
  "dirs",
  "git2",
@@ -4279,6 +4279,7 @@ dependencies = [
  "tauri-plugin-clipboard-manager",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "tauri-plugin-window-state",
  "windows 0.58.0",
 ]
 
@@ -4437,6 +4438,21 @@ dependencies = [
  "url",
  "windows 0.61.3",
  "zbus",
+]
+
+[[package]]
+name = "tauri-plugin-window-state"
+version = "2.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73736611e14142408d15353e21e3cca2f12a3cfb523ad0ce85999b6d2ef1a704"
+dependencies = [
+ "bitflags 2.11.0",
+ "log",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -14,6 +14,7 @@ import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus } from './types';
 
 export function App() {
+  const [configLoaded, setConfigLoaded] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
   const [currentVersion, setCurrentVersion] = useState('');
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
@@ -52,6 +53,8 @@ export function App() {
           .filter((p) => p.savedLayout && p.savedLayout.tabs.length > 0)
           .map((p) => restoreLayout(p.id, p.savedLayout!, p.path, cfg))
       ).catch(console.error);
+
+      setConfigLoaded(true);
     });
   }, []);
 
@@ -149,7 +152,7 @@ export function App() {
       </div>
 
       <div className="flex-1 overflow-hidden">
-        <Allotment
+        {configLoaded ? <Allotment
           defaultSizes={config.layoutSizes ?? [200, 280, 1000]}
           onChange={saveLayoutSizes}
         >
@@ -190,7 +193,7 @@ export function App() {
               )}
             </div>
           </Allotment.Pane>
-        </Allotment>
+        </Allotment> : null}
       </div>
       <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} />
     </div>

@@ -122,7 +122,7 @@ async function restoreSplitNode(
     type: 'split',
     direction: saved.direction,
     children,
-    sizes: children.map(() => 100 / children.length),
+    sizes: children.length === saved.sizes.length ? [...saved.sizes] : children.map(() => 100 / children.length),
   };
 }
 
