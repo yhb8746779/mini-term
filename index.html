@@ -11,6 +11,14 @@
   </head>
 
   <body>
+    <script>
+      (function(){
+        var t = localStorage.getItem('mini-term-theme');
+        if (t === 'light' || t === 'dark') {
+          document.documentElement.dataset.theme = t;
+        }
+      })();
+    </script>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
