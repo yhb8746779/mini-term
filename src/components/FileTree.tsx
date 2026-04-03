@@ -88,7 +88,7 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
     <div>
       <div
         className={`flex items-center gap-1 py-[3px] cursor-pointer hover:bg-[var(--border-subtle)] rounded-[var(--radius-sm)] text-base transition-colors duration-100 ${
-          entry.isDir ? 'text-[var(--color-folder)]' : 'text-[var(--color-file)]'
+          entry.ignored ? 'text-[var(--text-muted)] opacity-50' : entry.isDir ? 'text-[var(--color-folder)]' : 'text-[var(--color-file)]'
         }`}
         style={{ paddingLeft: `${depth * 16 + 8}px` }}
         onClick={handleToggle}

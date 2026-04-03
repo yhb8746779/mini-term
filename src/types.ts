@@ -102,6 +102,7 @@ export interface FileEntry {
   name: string;
   path: string;
   isDir: boolean;
+  ignored?: boolean;
   children?: FileEntry[];
 }
 

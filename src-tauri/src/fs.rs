@@ -13,6 +13,7 @@ pub struct FileEntry {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
+    pub ignored: bool,
 }
 
 fn build_gitignore(project_root: &Path) -> Option<Gitignore> {
@@ -26,6 +27,7 @@ fn build_gitignore(project_root: &Path) -> Option<Gitignore> {
 
 const ALWAYS_IGNORE: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "__pycache__", ".superpowers"];
 
+#[cfg(test)]
 fn should_ignore(name: &str, full_path: &Path, is_dir: bool, gitignore: &Option<Gitignore>) -> bool {
     if is_dir && ALWAYS_IGNORE.contains(&name) {
         return true;
@@ -50,18 +52,27 @@ pub fn list_directory(project_root: String, path: String) -> Result<Vec<FileEntr
             let name = entry.file_name().to_string_lossy().to_string();
             let is_dir = entry.file_type().ok()?.is_dir();
             let full_path = entry.path();
-            if should_ignore(&name, &full_path, is_dir, &gitignore) {
+            // ALWAYS_IGNORE 目录仍然完全隐藏
+            if is_dir && ALWAYS_IGNORE.contains(&name.as_str()) {
                 return None;
             }
+            let ignored = if let Some(gi) = &gitignore {
+                gi.matched(&full_path, is_dir).is_ignore()
+            } else {
+                false
+            };
             Some(FileEntry {
                 name,
                 path: full_path.to_string_lossy().to_string(),
                 is_dir,
+                ignored,
             })
         })
         .collect();
     entries.sort_by(|a, b| {
-        b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        b.is_dir.cmp(&a.is_dir)
+            .then_with(|| a.ignored.cmp(&b.ignored))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(entries)
 }
