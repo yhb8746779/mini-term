@@ -13,7 +13,7 @@ interface Props {
   onClose: () => void;
 }
 
-type SettingsPage = 'terminal' | 'system' | 'about';
+type SettingsPage = 'terminal' | 'system' | 'shortcuts' | 'about';
 
 // ─── ShellRow（终端设置子组件）───
 
@@ -508,11 +508,54 @@ function AboutSettings() {
   );
 }
 
+// ─── ShortcutsSettings（快捷键页）───
+
+const SHORTCUT_GROUPS: { title: string; items: { keys: string; desc: string }[] }[] = [
+  {
+    title: '终端操作',
+    items: [
+      { keys: 'Ctrl + Shift + C', desc: '复制终端选中文本' },
+      { keys: 'Ctrl + Shift + V', desc: '粘贴到终端' },
+    ],
+  },
+];
+
+function ShortcutsSettings() {
+  return (
+    <div className="space-y-6">
+      {SHORTCUT_GROUPS.map((group) => (
+        <div key={group.title}>
+          <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
+            {group.title}
+          </div>
+          <div className="space-y-1">
+            {group.items.map((item) => (
+              <div
+                key={item.keys}
+                className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]"
+              >
+                <span className="text-base text-[var(--text-primary)]">{item.desc}</span>
+                <kbd className="px-2 py-0.5 rounded-[var(--radius-sm)] bg-[var(--bg-elevated)] border border-[var(--border-default)] text-sm font-mono text-[var(--text-secondary)]">
+                  {item.keys}
+                </kbd>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+      <div className="pt-3 text-sm text-[var(--text-muted)]">
+        终端内快捷键仅在终端获得焦点时生效
+      </div>
+    </div>
+  );
+}
+
 // ─── SettingsModal（主弹窗）───
 
 const MENU_ITEMS: { key: SettingsPage; label: string }[] = [
   { key: 'terminal', label: '终端设置' },
   { key: 'system', label: '系统设置' },
+  { key: 'shortcuts', label: '快捷键' },
   { key: 'about', label: '关于' },
 ];
 
@@ -569,6 +612,7 @@ export function SettingsModal({ open, onClose }: Props) {
           <div className="flex-1 overflow-y-auto px-5 py-4">
             {activePage === 'terminal' && <TerminalSettings />}
             {activePage === 'system' && <SystemSettings />}
+            {activePage === 'shortcuts' && <ShortcutsSettings />}
             {activePage === 'about' && <AboutSettings />}
           </div>
         </div>
