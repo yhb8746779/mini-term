@@ -286,6 +286,7 @@ interface AppStore {
   setActiveProject: (id: string) => void;
   addProject: (project: ProjectConfig) => void;
   removeProject: (id: string) => void;
+  renameProject: (id: string, name: string) => void;
 
   // Tab
   addTab: (projectId: string, tab: TerminalTab) => void;
@@ -360,6 +361,16 @@ export const useAppStore = create<AppStore>((set) => ({
           : state.activeProjectId;
       return { config: newConfig, projectStates: newStates, activeProjectId: newActive };
     }),
+
+  renameProject: (id, name) =>
+    set((state) => ({
+      config: {
+        ...state.config,
+        projects: state.config.projects.map((p) =>
+          p.id === id ? { ...p, name } : p
+        ),
+      },
+    })),
 
   addTab: (projectId, tab) =>
     set((state) => {

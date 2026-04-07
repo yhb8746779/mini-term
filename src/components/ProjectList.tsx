@@ -51,8 +51,10 @@ export function ProjectList() {
   const [confirmTarget, setConfirmTarget] = useState<{ id: string; name: string } | null>(null);
   const [dropIndicator, setDropIndicator] = useState<DropIndicator | null>(null);
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
+  const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState('');
   const editInputRef = useRef<HTMLInputElement>(null);
+  const editProjectInputRef = useRef<HTMLInputElement>(null);
 
   const orderedItems = getOrderedTree(config);
   const allGroups = collectAllGroups(config.projectTree ?? []);
@@ -104,6 +106,24 @@ export function ProjectList() {
     createGroup(name.trim());
     saveConfig();
   }, [createGroup]);
+
+  const renameProject = useAppStore((s) => s.renameProject);
+
+  // 开始重命名项目
+  const startRenameProject = useCallback((projectId: string, currentName: string) => {
+    setEditingProjectId(projectId);
+    setEditingName(currentName);
+    setTimeout(() => editProjectInputRef.current?.select(), 0);
+  }, []);
+
+  // 提交项目重命名
+  const commitProjectRename = useCallback(() => {
+    if (editingProjectId && editingName.trim()) {
+      renameProject(editingProjectId, editingName.trim());
+      saveConfig();
+    }
+    setEditingProjectId(null);
+  }, [editingProjectId, editingName, renameProject]);
 
   // 开始重命名分组
   const startRenameGroup = useCallback((groupId: string, currentName: string) => {
@@ -271,6 +291,7 @@ export function ProjectList() {
           e.preventDefault();
           e.stopPropagation();
           const menuItems: Parameters<typeof showContextMenu>[2] = [
+            { label: '重命名', onClick: () => startRenameProject(project.id, project.name) },
             { label: '在文件夹中打开', onClick: () => revealItemInDir(project.path) },
             { label: '复制绝对路径', onClick: () => navigator.clipboard.writeText(project.path) },
           ];
@@ -300,7 +321,23 @@ export function ProjectList() {
         {isActive && (
           <span className="w-0.5 h-4 rounded-full bg-[var(--accent)] flex-shrink-0" />
         )}
-        <span className="truncate flex-1">{project.name}</span>
+        {editingProjectId === project.id ? (
+          <input
+            ref={editProjectInputRef}
+            className="truncate flex-1 bg-transparent border-b border-[var(--accent)] outline-none text-base text-[var(--text-primary)] px-0 py-0"
+            value={editingName}
+            onChange={(e) => setEditingName(e.target.value)}
+            onBlur={commitProjectRename}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') commitProjectRename();
+              if (e.key === 'Escape') setEditingProjectId(null);
+            }}
+            onClick={(e) => e.stopPropagation()}
+            autoFocus
+          />
+        ) : (
+          <span className="truncate flex-1">{project.name}</span>
+        )}
         <StatusDot status={projectStatus} />
         <span
           className="text-[var(--text-muted)] hover:text-[var(--color-error)] hidden group-hover:inline transition-colors text-sm"
