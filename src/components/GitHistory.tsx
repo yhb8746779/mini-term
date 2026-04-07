@@ -91,6 +91,7 @@ export function GitHistory() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const repoStatesRef = useRef(repoStates);
   repoStatesRef.current = repoStates;
+  const autoExpandedForRef = useRef<string | null>(null);
 
   const loadRepos = useCallback(() => {
     if (!project) return;
@@ -253,6 +254,24 @@ export function GitHistory() {
       [debouncedRefresh],
     ),
   );
+
+  // 仅一个仓库时自动展开
+  useEffect(() => {
+    if (!project || repos.length !== 1) return;
+    if (autoExpandedForRef.current === project.path) return;
+    autoExpandedForRef.current = project.path;
+
+    const repoPath = repos[0].path;
+    const tree = buildRepoTree(repos, project.path);
+    const keys = new Set<string>();
+    const collect = (nodes: RepoTreeNode[]) => {
+      for (const n of nodes) { keys.add(n.key); collect(n.children); }
+    };
+    collect(tree);
+    setExpandedRepos(keys);
+    loadCommits(repoPath);
+    loadBranches(repoPath);
+  }, [repos, project?.path, loadCommits, loadBranches]);
 
   const repoTree = project ? buildRepoTree(repos, project.path) : [];
 
