@@ -4,7 +4,7 @@ import { useAppStore, genId } from '../store';
 import { TerminalInstance } from './TerminalInstance';
 import { StatusDot } from './StatusDot';
 import { showContextMenu } from '../utils/contextMenu';
-import { showConfirm } from '../utils/prompt';
+import { showConfirm, showPrompt } from '../utils/prompt';
 import { disposeTerminal } from '../utils/terminalCache';
 import type { SplitNode, PaneState, ShellConfig } from '../types';
 
@@ -67,7 +67,7 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
     const pane = node.panes.find((p) => p.id === paneId);
     if (!pane) return;
 
-    const confirmed = await showConfirm('关闭终端', `确定要关闭终端「${pane.shellName}」吗？`);
+    const confirmed = await showConfirm('关闭终端', `确定要关闭终端「${pane.customTitle || pane.shellName}」吗？`);
     if (!confirmed) return;
 
     await invoke('kill_pty', { ptyId: pane.ptyId });
@@ -89,6 +89,19 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
       activePaneId: newActive,
     });
   }, [node, onClosePane, onUpdateNode]);
+
+  const handleRenameTab = useCallback(async (paneId: string) => {
+    const pane = node.panes.find((p) => p.id === paneId);
+    if (!pane) return;
+    const newTitle = await showPrompt('重命名终端', pane.customTitle || pane.shellName);
+    if (newTitle === null) return;
+    onUpdateNode({
+      ...node,
+      panes: node.panes.map((p) =>
+        p.id === paneId ? { ...p, customTitle: newTitle.trim() || undefined } : p
+      ),
+    });
+  }, [node, onUpdateNode]);
 
   const handleSetActive = useCallback((paneId: string) => {
     if (paneId !== node.activePaneId) {
@@ -129,12 +142,19 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
                   : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--border-subtle)]'
               }`}
               onClick={() => handleSetActive(pane.id)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                showContextMenu(e.clientX, e.clientY, [
+                  { label: '重命名', onClick: () => handleRenameTab(pane.id) },
+                ]);
+              }}
             >
               {isActive && (
                 <span className="absolute bottom-0 left-2 right-2 h-[2px] rounded-full bg-[var(--accent)]" />
               )}
               <StatusDot status={pane.status} />
-              <span className="font-medium">{pane.shellName}</span>
+              <span className="font-medium">{pane.customTitle || pane.shellName}</span>
               <span
                 className="ml-0.5 text-[var(--text-muted)] hover:text-[var(--color-error)] text-[12px] transition-colors"
                 onClick={(e) => {

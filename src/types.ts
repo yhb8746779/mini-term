@@ -83,6 +83,7 @@ export type SplitNode =
 export interface PaneState {
   id: string;
   shellName: string;
+  customTitle?: string;
   status: PaneStatus;
   ptyId: number;
 }
