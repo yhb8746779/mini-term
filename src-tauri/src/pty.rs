@@ -259,13 +259,52 @@ pub fn create_pty(
             }
 
             if !pending.is_empty() {
-                let data = String::from_utf8_lossy(&pending).into_owned();
-                let _ = app_flush.emit("pty-output", PtyOutputPayload {
-                    pty_id: pty_id_for_reader, data,
-                });
-                pending.clear();
-                if let Ok(mut map) = last_output.lock() {
-                    map.insert(pty_id_for_reader, Instant::now());
+                // 找到最后一个完整 UTF-8 字符的边界，避免截断多字节字符
+                let valid_len = {
+                    let mut i = pending.len();
+                    // 从末尾向前扫描，找到可能不完整的 UTF-8 序列起始位置
+                    while i > 0 {
+                        i -= 1;
+                        let byte = pending[i];
+                        if byte < 0x80 {
+                            // ASCII 字符，本身就是完整的
+                            i = pending.len();
+                            break;
+                        } else if byte >= 0xC0 {
+                            // 多字节序列的起始字节，检查序列是否完整
+                            let expected_len = if byte >= 0xF0 { 4 }
+                                else if byte >= 0xE0 { 3 }
+                                else { 2 };
+                            let remaining = pending.len() - i;
+                            if remaining >= expected_len {
+                                // 序列完整
+                                i = pending.len();
+                            }
+                            // 否则 i 就是不完整序列的起始位置
+                            break;
+                        }
+                        // 0x80..0xBF 是延续字节，继续向前找起始字节
+                    }
+                    i
+                };
+
+                if valid_len > 0 {
+                    let data = String::from_utf8_lossy(&pending[..valid_len]).into_owned();
+                    let _ = app_flush.emit("pty-output", PtyOutputPayload {
+                        pty_id: pty_id_for_reader, data,
+                    });
+                    if let Ok(mut map) = last_output.lock() {
+                        map.insert(pty_id_for_reader, Instant::now());
+                    }
+                }
+
+                // 保留不完整的 UTF-8 字节到下次刷新
+                if valid_len < pending.len() {
+                    let leftover = pending[valid_len..].to_vec();
+                    pending.clear();
+                    pending.extend(leftover);
+                } else {
+                    pending.clear();
                 }
             }
         }
