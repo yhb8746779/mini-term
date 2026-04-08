@@ -804,3 +804,35 @@ pub fn get_git_diff(project_path: String, file_path: String) -> Result<GitDiffRe
         too_large: false,
     })
 }
+
+#[tauri::command]
+pub async fn git_pull(repo_path: String) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .arg("pull")
+        .current_dir(&repo_path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("Failed to execute git pull: {}", e))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn git_push(repo_path: String) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .arg("push")
+        .current_dir(&repo_path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("Failed to execute git push: {}", e))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}

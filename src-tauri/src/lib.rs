@@ -44,6 +44,8 @@ pub fn run() {
             git::get_repo_branches,
             git::get_commit_files,
             git::get_commit_file_diff,
+            git::git_pull,
+            git::git_push,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
