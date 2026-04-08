@@ -58,7 +58,7 @@ export function showConfirm(title: string, message: string): Promise<boolean> {
  * 自定义 prompt 弹窗，替代 window.prompt
  * 返回 Promise<string | null>，取消返回 null
  */
-export function showPrompt(title: string, placeholder?: string): Promise<string | null> {
+export function showPrompt(title: string, placeholder?: string, defaultValue?: string): Promise<string | null> {
   return new Promise((resolve) => {
     // 遮罩层
     const overlay = document.createElement('div');
@@ -79,6 +79,9 @@ export function showPrompt(title: string, placeholder?: string): Promise<string 
     input.className = 'prompt-input';
     input.placeholder = placeholder ?? '';
     input.spellcheck = false;
+    if (defaultValue) {
+      input.value = defaultValue;
+    }
     dialog.appendChild(input);
 
     // 按钮区

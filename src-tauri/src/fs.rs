@@ -177,6 +177,21 @@ pub fn unwatch_directory(state: tauri::State<'_, FsWatcherManager>, path: String
     Ok(())
 }
 
+#[tauri::command]
+pub fn rename_entry(old_path: String, new_name: String) -> Result<String, String> {
+    let p = Path::new(&old_path);
+    if !p.exists() {
+        return Err(format!("路径不存在: {}", old_path));
+    }
+    let parent = p.parent().ok_or("无法获取父目录")?;
+    let new_path = parent.join(&new_name);
+    if new_path.exists() {
+        return Err(format!("目标已存在: {}", new_path.display()));
+    }
+    fs::rename(p, &new_path).map_err(|e| e.to_string())?;
+    Ok(new_path.to_string_lossy().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -117,6 +117,20 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
               onClick: () => openPath(entry.path),
             });
           }
+          items.push({ separator: true });
+          items.push({
+            label: '重命名',
+            onClick: async () => {
+              const newName = await showPrompt('重命名', '请输入新名称', entry.name);
+              if (!newName?.trim() || newName.trim() === entry.name) return;
+              try {
+                await invoke('rename_entry', { oldPath: entry.path, newName: newName.trim() });
+                loadChildren();
+              } catch (err) {
+                console.error('重命名失败:', err);
+              }
+            },
+          });
           if (entry.isDir) {
             items.push({ separator: true });
             items.push({
