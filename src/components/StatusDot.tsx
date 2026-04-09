@@ -3,7 +3,7 @@ import type { PaneStatus } from '../types';
 const STATUS_STYLES: Record<PaneStatus, { bg: string; shadow: string }> = {
   idle: { bg: 'var(--text-muted)', shadow: 'none' },
   'ai-idle': { bg: 'var(--color-success)', shadow: 'none' },
-  'ai-working': { bg: '#f5c518', shadow: '0 0 6px #f5c518' },
+  'ai-working': { bg: 'var(--color-ai-working)', shadow: '0 0 6px var(--color-ai-working)' },
   error: { bg: 'var(--color-error)', shadow: 'none' },
 };
 

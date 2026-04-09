@@ -33,6 +33,7 @@
   --color-warning: #d4a84a;
   --color-error: #d4605a;
   --color-ai: #b08cd4;
+  --color-ai-working: #f5c518;
   --color-info: #6896c8;
   --diff-add-bg: rgba(60,180,60,0.12);
   --diff-del-bg: rgba(220,60,60,0.12);
@@ -71,6 +72,7 @@
   --color-warning: #b08620;
   --color-error: #c0392b;
   --color-ai: #8a5cb8;
+  --color-ai-working: #c4521a;
   --color-info: #2860a0;
 
   --diff-add-bg: rgba(40,140,40,0.10);
