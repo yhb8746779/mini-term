@@ -408,7 +408,11 @@ pub fn create_pty(
                         const OSE_CAP: usize = 16 * 1024;
                         if entry.len() > OSE_CAP {
                             let excess = entry.len() - OSE_CAP;
-                            *entry = entry[excess..].to_string();
+                            // 找到 >= excess 的第一个合法 UTF-8 字符边界，避免切在多字节字符中间
+                            let boundary = (excess..=entry.len())
+                                .find(|&i| entry.is_char_boundary(i))
+                                .unwrap_or(entry.len());
+                            entry.drain(..boundary);
                         }
                     }
 
