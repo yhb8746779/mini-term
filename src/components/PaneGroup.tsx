@@ -67,7 +67,14 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
     const pane = node.panes.find((p) => p.id === paneId);
     if (!pane) return;
 
-    const confirmed = await showConfirm('关闭终端', `确定要关闭终端「${pane.customTitle || pane.shellName}」吗？`);
+    const label = pane.customTitle || pane.shellName;
+    const hasAi = pane.status === 'ai-working' || pane.status === 'ai-idle';
+    const title = hasAi ? '关闭 AI 对话' : '关闭终端';
+    const message = hasAi
+      ? `终端「${label}」正在运行 AI 对话，关闭后对话将被终止，确定继续吗？`
+      : `确定要关闭终端「${label}」吗？`;
+
+    const confirmed = await showConfirm(title, message);
     if (!confirmed) return;
 
     await invoke('kill_pty', { ptyId: pane.ptyId });
@@ -110,7 +117,15 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
   }, [node, onUpdateNode]);
 
   const handleClosePaneGroup = useCallback(async () => {
-    const confirmed = await showConfirm('关闭终端', '确定要关闭该区域内所有终端吗？');
+    const aiCount = node.panes.filter(
+      (p) => p.status === 'ai-working' || p.status === 'ai-idle'
+    ).length;
+    const title = aiCount > 0 ? '关闭 AI 对话' : '关闭终端';
+    const message = aiCount > 0
+      ? `该区域内有 ${aiCount} 个终端正在运行 AI 对话，关闭后对话将被终止，确定继续吗？`
+      : '确定要关闭该区域内所有终端吗？';
+
+    const confirmed = await showConfirm(title, message);
     if (!confirmed) return;
 
     for (const pane of node.panes) {

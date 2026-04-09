@@ -48,6 +48,56 @@ const AI_EXIT_COMMANDS: &[&str] = &[
 /// 连续两次 Ctrl+C 退出的时间窗口
 const DOUBLE_CTRLC_WINDOW: Duration = Duration::from_millis(1000);
 
+/// 按下 Enter 后扫描输出以检测 AI 命令 echo 的时间窗口
+const AI_ENTER_SCAN_WINDOW: Duration = Duration::from_millis(2000);
+
+/// 去除 ANSI 转义序列，返回纯文本
+fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek() {
+                Some(&'[') => {
+                    chars.next(); // consume '['
+                    // CSI sequence: skip until final byte (0x40–0x7E)
+                    for c2 in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c2) { break; }
+                    }
+                }
+                Some(&'O') => { chars.next(); chars.next(); } // SS3: ESC O <final>
+                _ => { chars.next(); } // other two-char escape
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// 检查 PTY 输出中是否包含 AI 命令被 echo（例如 "PS C:\> claude" 或单独的 "claude"）
+fn output_contains_ai_command(output: &str) -> bool {
+    let stripped = strip_ansi_codes(output);
+    for line in stripped.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        // 检查首词和末词（首词捕获纯命令行，末词捕获 "prompt> claude" 格式）
+        let first = line.split_whitespace().next().unwrap_or("").to_lowercase();
+        let last  = line.split_whitespace().last().unwrap_or("").to_lowercase();
+        for word in [&first, &last] {
+            for &ai in AI_COMMANDS {
+                if *word == ai
+                    || word.ends_with(&format!("/{ai}"))
+                    || word.ends_with(&format!("\\{ai}"))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[derive(Clone)]
 pub struct PtyManager {
     instances: Arc<Mutex<HashMap<u32, PtyInstance>>>,
@@ -56,6 +106,7 @@ pub struct PtyManager {
     ai_sessions: Arc<Mutex<HashSet<u32>>>,
     input_buffers: Arc<Mutex<HashMap<u32, String>>>,
     last_ctrlc: Arc<Mutex<HashMap<u32, Instant>>>,
+    last_enter: Arc<Mutex<HashMap<u32, Instant>>>,
 }
 
 impl PtyManager {
@@ -67,6 +118,7 @@ impl PtyManager {
             ai_sessions: Arc::new(Mutex::new(HashSet::new())),
             input_buffers: Arc::new(Mutex::new(HashMap::new())),
             last_ctrlc: Arc::new(Mutex::new(HashMap::new())),
+            last_enter: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -95,8 +147,25 @@ impl PtyManager {
         {
             let mut buffers = self.input_buffers.lock().unwrap();
             let buf = buffers.entry(pty_id).or_default();
+            // 本地 ANSI 转义序列状态（xterm.js 每次发送完整转义序列）
+            let mut skip_ansi = false; // 已遇 ESC，等待 [ 或 O
+            let mut skip_csi  = false; // 在 CSI/SS3 序列中
             for ch in data.chars() {
+                if skip_ansi {
+                    skip_ansi = false;
+                    if ch == '[' || ch == 'O' { skip_csi = true; }
+                    continue;
+                }
+                if skip_csi {
+                    if ('@'..='~').contains(&ch) { skip_csi = false; }
+                    continue;
+                }
                 match ch {
+                    '\x1b' => {
+                        // 导航键/编辑键：清空缓冲区，防止 "[A" 等污染
+                        buf.clear();
+                        skip_ansi = true;
+                    }
                     '\x03' if in_ai => {
                         // Ctrl+C: 单次取消当前任务，连续两次退出 AI 会话
                         let mut last = self.last_ctrlc.lock().unwrap();
@@ -119,6 +188,8 @@ impl PtyManager {
                         buf.clear();
                     }
                     '\r' | '\n' => {
+                        // 记录 Enter 时间，供输出扫描用
+                        self.last_enter.lock().unwrap().insert(pty_id, Instant::now());
                         let cmd = buf.trim().to_lowercase();
                         if in_ai {
                             // AI 会话中：识别显式退出命令
@@ -217,6 +288,8 @@ pub fn create_pty(
 
     let app_flush = app.clone();
     let last_output = state.last_output.clone();
+    let ai_sessions_flush = state.ai_sessions.clone();
+    let last_enter_flush = state.last_enter.clone();
     thread::spawn(move || {
         let mut pending = Vec::new();
 
@@ -290,6 +363,24 @@ pub fn create_pty(
 
                 if valid_len > 0 {
                     let data = String::from_utf8_lossy(&pending[..valid_len]).into_owned();
+
+                    // 基于输出扫描检测 AI 会话（补偿上箭头历史调用 / PSReadLine 补全）：
+                    // 若在 Enter 后 2 秒内收到包含 AI 命令 echo 的输出，自动标记为 AI 会话
+                    {
+                        let recently_entered = last_enter_flush.lock().unwrap()
+                            .get(&pty_id_for_reader)
+                            .map(|t| t.elapsed() < AI_ENTER_SCAN_WINDOW)
+                            .unwrap_or(false);
+                        if recently_entered {
+                            let mut sessions = ai_sessions_flush.lock().unwrap();
+                            if !sessions.contains(&pty_id_for_reader)
+                                && output_contains_ai_command(&data)
+                            {
+                                sessions.insert(pty_id_for_reader);
+                            }
+                        }
+                    }
+
                     let _ = app_flush.emit("pty-output", PtyOutputPayload {
                         pty_id: pty_id_for_reader, data,
                     });
@@ -345,11 +436,35 @@ pub fn resize_pty(state: tauri::State<'_, PtyManager>, pty_id: u32, cols: u16, r
 
 #[tauri::command]
 pub fn kill_pty(state: tauri::State<'_, PtyManager>, pty_id: u32) -> Result<(), String> {
-    state.instances.lock().unwrap().remove(&pty_id);
+    // Remove metadata maps immediately so subsequent lookups return nothing.
+    let instance = state.instances.lock().unwrap().remove(&pty_id);
     state.last_output.lock().unwrap().remove(&pty_id);
     state.ai_sessions.lock().unwrap().remove(&pty_id);
     state.input_buffers.lock().unwrap().remove(&pty_id);
     state.last_ctrlc.lock().unwrap().remove(&pty_id);
+    state.last_enter.lock().unwrap().remove(&pty_id);
+
+    // Drop the PTY instance on a background thread.
+    //
+    // On Windows, dropping `master` triggers `ClosePseudoConsole()`, which is
+    // synchronous and blocks until every process in the console session exits.
+    // When a long-running AI process (claude/codex) is still alive, this call
+    // never returns on the calling thread, freezing the whole app ("未响应").
+    //
+    // Fix: kill the shell process first (stops new output), then drop on a
+    // background thread so the UI stays responsive regardless of how long
+    // cleanup takes.
+    if let Some(mut inst) = instance {
+        thread::spawn(move || {
+            // Kill the shell (e.g., pwsh). This signals the ConPTY server that
+            // the primary process is gone, allowing ClosePseudoConsole to return
+            // once in-flight output is drained.
+            let _ = inst.child.kill();
+            // Now drop writer → master → child in background.
+            drop(inst);
+        });
+    }
+
     Ok(())
 }
 

@@ -155,6 +155,7 @@ fn default_shells() -> Vec<ShellConfig> {
     vec![
         ShellConfig { name: "cmd".into(), command: "cmd".into(), args: None },
         ShellConfig { name: "powershell".into(), command: "powershell".into(), args: None },
+        ShellConfig { name: "pwsh".into(), command: "pwsh".into(), args: None },
     ]
 }
 
