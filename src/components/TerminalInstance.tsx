@@ -54,6 +54,8 @@ export function TerminalInstance({ ptyId }: Props) {
       rafId = requestAnimationFrame(() => {
         if (container.clientWidth > 0 && container.clientHeight > 0) {
           fitAddon.fit();
+          // 同步通知 PTY 新尺寸，使 PSReadLine 等 shell 在 Allotment 布局稳定后重绘 prompt
+          invoke('resize_pty', { ptyId, cols: term.cols, rows: term.rows });
         }
       });
     });
