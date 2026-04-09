@@ -84,19 +84,27 @@ export function ProjectList() {
     setConfirmTarget(null);
   }, [confirmTarget, removeProject]);
 
-  const getProjectStatus = (projectId: string): PaneStatus => {
+  // 返回项目内各非 idle 状态的分组汇总（按优先级降序）
+  const getProjectStatusSummary = (projectId: string): { status: PaneStatus; count: number }[] => {
     const ps = projectStates.get(projectId);
-    if (!ps || ps.tabs.length === 0) return 'idle';
-    const hasPaneWith = (node: SplitNode, target: PaneStatus): boolean => {
-      if (node.type === 'leaf') return node.panes.some((p) => p.status === target);
-      return node.children.some((c) => hasPaneWith(c, target));
+    if (!ps || ps.tabs.length === 0) return [];
+
+    const collectStatuses = (node: SplitNode): PaneStatus[] => {
+      if (node.type === 'leaf') return node.panes.map((p) => p.status);
+      return node.children.flatMap(collectStatuses);
     };
-    let hasAiWorking = false;
+
+    const counts: Partial<Record<PaneStatus, number>> = {};
     for (const tab of ps.tabs) {
-      if (hasPaneWith(tab.splitLayout, 'ai-idle')) return 'ai-idle';
-      if (hasPaneWith(tab.splitLayout, 'ai-working')) hasAiWorking = true;
+      for (const s of collectStatuses(tab.splitLayout)) {
+        if (s !== 'idle') counts[s] = (counts[s] ?? 0) + 1;
+      }
     }
-    return hasAiWorking ? 'ai-working' : 'idle';
+
+    const ORDER: PaneStatus[] = ['error', 'ai-generating', 'ai-working', 'ai-idle'];
+    return ORDER
+      .filter((s) => (counts[s] ?? 0) > 0)
+      .map((s) => ({ status: s, count: counts[s]! }));
   };
 
   // 创建分组
@@ -269,7 +277,7 @@ export function ProjectList() {
 
   const renderProjectItem = (project: ProjectConfig, depth: number, parentGroupId?: string) => {
     const isActive = project.id === activeProjectId;
-    const projectStatus = getProjectStatus(project.id);
+    const statusSummary = getProjectStatusSummary(project.id);
 
     return (
       <div
@@ -338,7 +346,21 @@ export function ProjectList() {
         ) : (
           <span className="truncate flex-1">{project.name}</span>
         )}
-        <StatusDot status={projectStatus} />
+        {/* 多终端状态汇总：每种非 idle 状态一个点 + 数量（>1 时显示） */}
+        <div className="flex items-center gap-0.5 flex-shrink-0">
+          {statusSummary.length === 0 ? (
+            <StatusDot status="idle" />
+          ) : (
+            statusSummary.map(({ status, count }) => (
+              <div key={status} className="flex items-center gap-[2px]">
+                <StatusDot status={status} />
+                {count > 1 && (
+                  <span className="text-[9px] leading-none text-[var(--text-muted)]">{count}</span>
+                )}
+              </div>
+            ))
+          )}
+        </div>
         <span
           className="text-[var(--text-muted)] hover:text-[var(--color-error)] hidden group-hover:inline transition-colors text-sm"
           onClick={(e) => handleRemoveProject(e, project.id)}

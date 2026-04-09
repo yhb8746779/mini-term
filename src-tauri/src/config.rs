@@ -321,8 +321,8 @@ mod tests {
                 split_layout: SavedSplitNode::Split {
                     direction: "horizontal".into(),
                     children: vec![
-                        SavedSplitNode::Leaf { pane: SavedPane { shell_name: "cmd".into() } },
-                        SavedSplitNode::Leaf { pane: SavedPane { shell_name: "powershell".into() } },
+                        SavedSplitNode::Leaf { pane: None, panes: vec![SavedPane { shell_name: "cmd".into() }] },
+                        SavedSplitNode::Leaf { pane: None, panes: vec![SavedPane { shell_name: "powershell".into() }] },
                     ],
                     sizes: vec![50.0, 50.0],
                 },

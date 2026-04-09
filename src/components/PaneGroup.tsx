@@ -68,7 +68,7 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
     if (!pane) return;
 
     const label = pane.customTitle || pane.shellName;
-    const hasAi = pane.status === 'ai-working' || pane.status === 'ai-idle';
+    const hasAi = pane.status === 'ai-working' || pane.status === 'ai-idle' || pane.status === 'ai-generating';
     const title = hasAi ? '关闭 AI 对话' : '关闭终端';
     const message = hasAi
       ? `终端「${label}」正在运行 AI 对话，关闭后对话将被终止，确定继续吗？`
@@ -118,7 +118,7 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
 
   const handleClosePaneGroup = useCallback(async () => {
     const aiCount = node.panes.filter(
-      (p) => p.status === 'ai-working' || p.status === 'ai-idle'
+      (p) => p.status === 'ai-working' || p.status === 'ai-idle' || p.status === 'ai-generating'
     ).length;
     const title = aiCount > 0 ? '关闭 AI 对话' : '关闭终端';
     const message = aiCount > 0

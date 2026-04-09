@@ -11,8 +11,8 @@ pub struct PtyStatusChangePayload {
     pub status: String,
 }
 
-/// AI 输出活跃超时阈值
-const AI_ACTIVE_TIMEOUT: Duration = Duration::from_secs(3);
+/// AI 正在输出文本的判断阈值：距上次输出不超过此时间视为"生成中"
+const AI_GENERATING_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
     thread::spawn(move || {
@@ -23,10 +23,12 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
 
             for pty_id in &pty_ids {
                 let status = if pty_manager.is_ai_session(*pty_id) {
-                    if pty_manager.has_recent_output(*pty_id, AI_ACTIVE_TIMEOUT) {
-                        "ai-working"
+                    if pty_manager.has_recent_output(*pty_id, AI_GENERATING_TIMEOUT) {
+                        // AI 正在输出文本 → 紫色慢闪
+                        "ai-generating"
                     } else {
-                        "ai-idle"
+                        // AI 等待用户操作/授权 → 黄色快闪
+                        "ai-working"
                     }
                 } else {
                     "idle"

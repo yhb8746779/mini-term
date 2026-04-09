@@ -27,13 +27,26 @@ export function TerminalInstance({ ptyId }: Props) {
 
     container.appendChild(wrapper);
 
+    // 双层 rAF：让 Allotment 完成布局计算后再测量容器尺寸，避免在过渡尺寸时 fit() 得到错误的 cols
     requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (container.clientWidth > 0 && container.clientHeight > 0) {
+          fitAddon.fit();
+          invoke('resize_pty', { ptyId, cols: term.cols, rows: term.rows });
+          term.refresh(0, term.rows - 1);
+        }
+      });
+    });
+
+    // 200ms 兜底：Allotment 嵌套布局（外层三栏 + 内层分屏）需要多帧才能稳定，
+    // 双层 rAF 仅约 32ms，不足以覆盖所有情况（尤其是应用重启后恢复布局时）。
+    // 200ms 后强制 fit + PTY resize，确保已保存会话的终端宽度正确。
+    const fallbackId = window.setTimeout(() => {
       if (container.clientWidth > 0 && container.clientHeight > 0) {
         fitAddon.fit();
         invoke('resize_pty', { ptyId, cols: term.cols, rows: term.rows });
-        term.refresh(0, term.rows - 1);
       }
-    });
+    }, 200);
 
     let rafId: number;
     const observer = new ResizeObserver(() => {
@@ -54,6 +67,7 @@ export function TerminalInstance({ ptyId }: Props) {
     visibilityObserver.observe(container);
 
     return () => {
+      window.clearTimeout(fallbackId);
       cancelAnimationFrame(rafId);
       observer.disconnect();
       visibilityObserver.disconnect();

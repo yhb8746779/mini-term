@@ -145,6 +145,24 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     return true;
   });
 
+  // 右键：有选中文本 → 复制；无选中 → 粘贴（与 Windows Terminal 行为一致）
+  wrapper.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const sel = term.getSelection();
+    if (sel) {
+      writeText(sel);
+      term.clearSelection();
+    } else {
+      readText().then((text) => {
+        if (text) {
+          invoke('write_pty', { ptyId, data: text });
+          term.focus();
+        }
+      });
+    }
+  });
+
   // 用户输入 → PTY
   const onDataDisp = term.onData((data) => {
     term.scrollToBottom();

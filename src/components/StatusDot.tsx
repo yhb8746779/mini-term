@@ -3,15 +3,21 @@ import type { PaneStatus } from '../types';
 const STATUS_STYLES: Record<PaneStatus, { bg: string; shadow: string }> = {
   idle: { bg: 'var(--text-muted)', shadow: 'none' },
   'ai-idle': { bg: 'var(--color-success)', shadow: 'none' },
+  'ai-generating': { bg: 'var(--color-ai)', shadow: '0 0 6px var(--color-ai)' },
   'ai-working': { bg: '#f5c518', shadow: '0 0 6px #f5c518' },
   error: { bg: 'var(--color-error)', shadow: 'none' },
 };
 
 const BLINK_STATUSES: PaneStatus[] = ['ai-working'];
+const SLOW_BLINK_STATUSES: PaneStatus[] = ['ai-generating'];
 
 export function StatusDot({ status, size = 'sm' }: { status: PaneStatus; size?: 'sm' | 'md' }) {
   const style = STATUS_STYLES[status];
-  const anim = BLINK_STATUSES.includes(status) ? 'animate-blink' : '';
+  const anim = BLINK_STATUSES.includes(status)
+    ? 'animate-blink'
+    : SLOW_BLINK_STATUSES.includes(status)
+    ? 'animate-blink-slow'
+    : '';
   const dim = size === 'sm' ? 'w-1.5 h-1.5' : 'w-2 h-2';
 
   return (

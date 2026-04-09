@@ -30,7 +30,8 @@ export const genId = () => `id-${Date.now()}-${++idCounter}`;
 
 // 计算 Tab 聚合状态
 const STATUS_PRIORITY: Record<PaneStatus, number> = {
-  error: 3,
+  error: 4,
+  'ai-generating': 3,
   'ai-working': 2,
   'ai-idle': 1,
   idle: 0,

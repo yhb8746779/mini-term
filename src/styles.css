@@ -169,6 +169,10 @@ html, body, #root {
   animation: alertBlink 0.8s ease-in-out infinite;
 }
 
+.animate-blink-slow {
+  animation: alertBlink 2s ease-in-out infinite;
+}
+
 .animate-slide-in {
   animation: slideIn 0.12s ease-out;
 }

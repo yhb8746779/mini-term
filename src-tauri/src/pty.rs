@@ -48,9 +48,6 @@ const AI_EXIT_COMMANDS: &[&str] = &[
 /// 连续两次 Ctrl+C 退出的时间窗口
 const DOUBLE_CTRLC_WINDOW: Duration = Duration::from_millis(1000);
 
-/// 按下 Enter 后扫描输出以检测 AI 命令 echo 的时间窗口
-const AI_ENTER_SCAN_WINDOW: Duration = Duration::from_millis(2000);
-
 /// 去除 ANSI 转义序列，返回纯文本
 fn strip_ansi_codes(s: &str) -> String {
     let mut result = String::new();
@@ -76,22 +73,31 @@ fn strip_ansi_codes(s: &str) -> String {
 }
 
 /// 检查 PTY 输出中是否包含 AI 命令被 echo（例如 "PS C:\> claude" 或单独的 "claude"）
+/// 同时过滤非交互式标志（-v/--version/-h/--help 等），避免误识别
 fn output_contains_ai_command(output: &str) -> bool {
     let stripped = strip_ansi_codes(output);
     for line in stripped.lines() {
         let line = line.trim();
         if line.is_empty() { continue; }
-        // 检查首词和末词（首词捕获纯命令行，末词捕获 "prompt> claude" 格式）
-        let first = line.split_whitespace().next().unwrap_or("").to_lowercase();
-        let last  = line.split_whitespace().last().unwrap_or("").to_lowercase();
-        for word in [&first, &last] {
-            for &ai in AI_COMMANDS {
-                if *word == ai
-                    || word.ends_with(&format!("/{ai}"))
-                    || word.ends_with(&format!("\\{ai}"))
-                {
-                    return true;
-                }
+        // 取提示符（> 或 $）后的命令部分（处理 PowerShell "PS C:\> cmd" 和
+        // bash "user@host:~$ cmd" 格式）；若无提示符则检查整行。
+        let cmd_part = line.rfind(|c| c == '>' || c == '$')
+            .map(|pos| &line[pos + 1..])
+            .unwrap_or(line)
+            .trim();
+        let mut words = cmd_part.split_whitespace();
+        let first = words.next().unwrap_or("").to_lowercase();
+        let is_ai = AI_COMMANDS.iter().any(|&ai| {
+            first == ai
+                || first.ends_with(&format!("/{ai}"))
+                || first.ends_with(&format!("\\{ai}"))
+        });
+        if is_ai {
+            let has_non_interactive = words.any(|w| {
+                NON_INTERACTIVE_FLAGS.iter().any(|&f| w == f)
+            });
+            if !has_non_interactive {
+                return true;
             }
         }
     }
@@ -107,6 +113,9 @@ pub struct PtyManager {
     input_buffers: Arc<Mutex<HashMap<u32, String>>>,
     last_ctrlc: Arc<Mutex<HashMap<u32, Instant>>>,
     last_enter: Arc<Mutex<HashMap<u32, Instant>>>,
+    /// PTY 自上次 Enter 以来输出的所有字符（上限 16KB）
+    /// 用于检测 PSReadLine inline prediction（右箭头接受后 Enter）
+    output_since_enter: Arc<Mutex<HashMap<u32, String>>>,
 }
 
 impl PtyManager {
@@ -119,6 +128,7 @@ impl PtyManager {
             input_buffers: Arc::new(Mutex::new(HashMap::new())),
             last_ctrlc: Arc::new(Mutex::new(HashMap::new())),
             last_enter: Arc::new(Mutex::new(HashMap::new())),
+            output_since_enter: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -144,6 +154,7 @@ impl PtyManager {
         let in_ai = self.is_ai_session(pty_id);
         let mut enter_ai = false;
         let mut exit_ai = false;
+        let mut entered = false;
         {
             let mut buffers = self.input_buffers.lock().unwrap();
             let buf = buffers.entry(pty_id).or_default();
@@ -188,7 +199,7 @@ impl PtyManager {
                         buf.clear();
                     }
                     '\r' | '\n' => {
-                        // 记录 Enter 时间，供输出扫描用
+                        entered = true;
                         self.last_enter.lock().unwrap().insert(pty_id, Instant::now());
                         let cmd = buf.trim().to_lowercase();
                         if in_ai {
@@ -197,7 +208,7 @@ impl PtyManager {
                                 exit_ai = true;
                             }
                         } else if !cmd.is_empty() {
-                            // 非 AI 会话：检测 AI 命令启动
+                            // 非 AI 会话：检测 AI 命令启动（直接键入路径）
                             let mut words = cmd.split_whitespace();
                             let first_word = words.next().unwrap_or("");
                             let is_ai_cmd = AI_COMMANDS.iter().any(|&ai| {
@@ -219,10 +230,34 @@ impl PtyManager {
                 }
             }
         }
+
+        // PSReadLine inline prediction 补偿：当用户按右箭头接受预测文本后再 Enter 时，
+        // input_buffers 中的 buf 因 ESC 序列清空而为空，直接输入检测无法命中。
+        // 此时扫描 output_since_enter（PTY 在 Enter 前渲染到屏幕的内容）来识别 AI 命令。
+        if entered && !in_ai && !enter_ai {
+            let ose = self.output_since_enter.lock().unwrap();
+            if let Some(ose_data) = ose.get(&pty_id) {
+                if output_contains_ai_command(ose_data) {
+                    enter_ai = true;
+                }
+            }
+        }
+        // Enter 后重置 output_since_enter，为下一条命令重新积累
+        if entered {
+            self.output_since_enter.lock().unwrap().insert(pty_id, String::new());
+        }
+
         if enter_ai || exit_ai {
             let mut sessions = self.ai_sessions.lock().unwrap();
             if enter_ai { sessions.insert(pty_id); } else { sessions.remove(&pty_id); }
         }
+    }
+
+    /// 仅供单元测试使用：向 output_since_enter 注入模拟 PTY 输出
+    #[cfg(test)]
+    fn inject_pty_output(&self, pty_id: u32, data: &str) {
+        let mut ose = self.output_since_enter.lock().unwrap();
+        ose.entry(pty_id).or_default().push_str(data);
     }
 }
 
@@ -288,8 +323,7 @@ pub fn create_pty(
 
     let app_flush = app.clone();
     let last_output = state.last_output.clone();
-    let ai_sessions_flush = state.ai_sessions.clone();
-    let last_enter_flush = state.last_enter.clone();
+    let output_since_enter_flush = state.output_since_enter.clone();
     thread::spawn(move || {
         let mut pending = Vec::new();
 
@@ -364,20 +398,17 @@ pub fn create_pty(
                 if valid_len > 0 {
                     let data = String::from_utf8_lossy(&pending[..valid_len]).into_owned();
 
-                    // 基于输出扫描检测 AI 会话（补偿上箭头历史调用 / PSReadLine 补全）：
-                    // 若在 Enter 后 2 秒内收到包含 AI 命令 echo 的输出，自动标记为 AI 会话
+                    // 将本批输出追加到 output_since_enter，供 track_input 在 Enter 时检测
+                    // PSReadLine inline prediction（右箭头接受）会在 Enter 前渲染命令文本
                     {
-                        let recently_entered = last_enter_flush.lock().unwrap()
-                            .get(&pty_id_for_reader)
-                            .map(|t| t.elapsed() < AI_ENTER_SCAN_WINDOW)
-                            .unwrap_or(false);
-                        if recently_entered {
-                            let mut sessions = ai_sessions_flush.lock().unwrap();
-                            if !sessions.contains(&pty_id_for_reader)
-                                && output_contains_ai_command(&data)
-                            {
-                                sessions.insert(pty_id_for_reader);
-                            }
+                        let mut ose = output_since_enter_flush.lock().unwrap();
+                        let entry = ose.entry(pty_id_for_reader).or_default();
+                        entry.push_str(&data);
+                        // 上限 16KB，超出时丢弃最旧的部分
+                        const OSE_CAP: usize = 16 * 1024;
+                        if entry.len() > OSE_CAP {
+                            let excess = entry.len() - OSE_CAP;
+                            *entry = entry[excess..].to_string();
                         }
                     }
 
@@ -443,6 +474,7 @@ pub fn kill_pty(state: tauri::State<'_, PtyManager>, pty_id: u32) -> Result<(), 
     state.input_buffers.lock().unwrap().remove(&pty_id);
     state.last_ctrlc.lock().unwrap().remove(&pty_id);
     state.last_enter.lock().unwrap().remove(&pty_id);
+    state.output_since_enter.lock().unwrap().remove(&pty_id);
 
     // Drop the PTY instance on a background thread.
     //
@@ -471,6 +503,40 @@ pub fn kill_pty(state: tauri::State<'_, PtyManager>, pty_id: u32) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── output_contains_ai_command ───────────────────────────────────────
+
+    #[test]
+    fn echo_plain_claude_detected() {
+        assert!(output_contains_ai_command("claude"));
+    }
+
+    #[test]
+    fn echo_powershell_prompt_claude_with_args_detected() {
+        // 用 Up 箭头从历史调用 "claude --model sonnet" 后 Enter，
+        // shell echo 格式为 "PS C:\workspace> claude --model sonnet"
+        assert!(output_contains_ai_command(
+            "PS C:\\workspace\\self\\mini-term> claude --model sonnet"
+        ));
+    }
+
+    #[test]
+    fn echo_powershell_prompt_plain_claude_detected() {
+        assert!(output_contains_ai_command("PS C:\\Users\\foo> claude"));
+    }
+
+    #[test]
+    fn echo_bash_prompt_claude_detected() {
+        assert!(output_contains_ai_command("user@host:~$ claude --model opus"));
+    }
+
+    #[test]
+    fn echo_last_word_sonnet_not_false_positive() {
+        // 不能只因为某行最后一个词是 "sonnet" 就触发
+        assert!(!output_contains_ai_command("npm install sonnet"));
+    }
+
+    // ── track_input / AI session detection ─────────────────────────────
 
     #[test]
     fn detect_claude_command() {
@@ -660,5 +726,60 @@ mod tests {
             mgr.track_input(1, &ch.to_string());
         }
         assert!(mgr.is_ai_session(1));
+    }
+
+    // ── output_since_enter / PSReadLine inline prediction ───────────────
+
+    #[test]
+    fn psreadline_right_arrow_accept_detected() {
+        // 模拟：用户按右箭头接受 PSReadLine 预测 "claude --model sonnet"，
+        // 此时 output_since_enter 中有渲染文本，但 input_buffers 为空（ESC 序列清空了）
+        let mgr = PtyManager::new();
+        // 注入 PTY 渲染的提示行（PSReadLine 将接受后的命令渲染到终端）
+        mgr.inject_pty_output(1, "PS C:\\workspace> claude --model sonnet");
+        // 只发送 Enter（buf 为空，直接输入检测无法命中）
+        mgr.track_input(1, "\r");
+        assert!(mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn psreadline_version_flag_not_detected() {
+        // PSReadLine 渲染了 "claude -v" —— 非交互，不应触发 AI 会话
+        let mgr = PtyManager::new();
+        mgr.inject_pty_output(1, "PS C:\\workspace> claude -v");
+        mgr.track_input(1, "\r");
+        assert!(!mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn output_since_enter_resets_after_enter() {
+        // 第一次 Enter 后 output_since_enter 应重置；
+        // 第二次 Enter 时如果没有新的 AI 输出，不应误触发
+        let mgr = PtyManager::new();
+        mgr.inject_pty_output(1, "PS C:\\workspace> claude");
+        mgr.track_input(1, "\r");
+        assert!(mgr.is_ai_session(1));
+
+        // 退出 AI 会话
+        mgr.track_input(1, "/exit\r");
+        assert!(!mgr.is_ai_session(1));
+
+        // 此时 output_since_enter 已清空；再 Enter 不应触发
+        mgr.track_input(1, "\r");
+        assert!(!mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn output_contains_ai_command_version_flag_false() {
+        assert!(!output_contains_ai_command("PS C:\\> claude -v"));
+        assert!(!output_contains_ai_command("PS C:\\> claude --version"));
+        assert!(!output_contains_ai_command("PS C:\\> claude -h"));
+        assert!(!output_contains_ai_command("PS C:\\> claude --help"));
+    }
+
+    #[test]
+    fn output_contains_ai_command_plain_claude_true() {
+        assert!(output_contains_ai_command("PS C:\\> claude"));
+        assert!(output_contains_ai_command("PS C:\\workspace> claude --model sonnet"));
     }
 }
