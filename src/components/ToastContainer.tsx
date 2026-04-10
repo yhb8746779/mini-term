@@ -1,18 +1,9 @@
-import { useEffect } from 'react';
 import { useAppStore } from '../store';
 
 export function ToastContainer() {
   const notifications = useAppStore((s) => s.notifications);
   const dismissNotification = useAppStore((s) => s.dismissNotification);
   const setActiveProject = useAppStore((s) => s.setActiveProject);
-
-  // 每个 notification 5s 后自动消失
-  useEffect(() => {
-    const timers = notifications.map((n) =>
-      setTimeout(() => dismissNotification(n.id), 5000)
-    );
-    return () => timers.forEach(clearTimeout);
-  }, [notifications, dismissNotification]);
 
   // 最多同时渲染 5 个，超出排队
   const visible = notifications.slice(0, 5);

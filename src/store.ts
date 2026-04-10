@@ -547,13 +547,19 @@ export const useAppStore = create<AppStore>((set) => ({
       return { projectStates: newStates };
     }),
 
-  pushNotification: (n) =>
+  pushNotification: (n) => {
+    const id = genId();
     set((state) => ({
       notifications: [
         ...state.notifications,
-        { ...n, id: genId(), timestamp: Date.now() },
+        { ...n, id, timestamp: Date.now() },
       ],
-    })),
+    }));
+    // 5s 自动消失：在 store 内部管理定时器，避免组件 useEffect 重置问题
+    setTimeout(() => {
+      useAppStore.getState().dismissNotification(id);
+    }, 5000);
+  },
 
   dismissNotification: (id) =>
     set((state) => ({
