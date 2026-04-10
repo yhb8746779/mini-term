@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.2.10-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.2.11-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -65,6 +65,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **嵌套分组** — 最多 3 级项目分组，拖拽排序，折叠 / 展开
 - **文件树** — 集成目录浏览器，`.gitignore` 过滤，`notify` 文件监听实时刷新
 - **文件操作** — 文件树内新建文件 / 文件夹、重命名、查看内容（二进制与超大文件友好提示）
+- **VS Code 快捷打开** — 文件树右上角按钮一键用配置的 VS Code 可执行文件打开当前项目，路径可在「设置 → 系统设置 → 外部编辑器」自定义
 
 ### Git 集成
 
