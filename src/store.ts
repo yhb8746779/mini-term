@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window';
 import type {
   AppConfig,
   ProjectConfig,
@@ -70,6 +71,18 @@ function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus): S
 export function collectPtyIds(node: SplitNode): number[] {
   if (node.type === 'leaf') return node.panes.map((p) => p.ptyId);
   return node.children.flatMap(collectPtyIds);
+}
+
+// 查找 ptyId 所属的 pane（按 SplitNode 树深搜）
+function findPaneByPty(node: SplitNode, ptyId: number): PaneState | null {
+  if (node.type === 'leaf') {
+    return node.panes.find((p) => p.ptyId === ptyId) ?? null;
+  }
+  for (const child of node.children) {
+    const found = findPaneByPty(child, ptyId);
+    if (found) return found;
+  }
+  return null;
 }
 
 // 序列化 SplitNode 树（剥离运行时数据）
@@ -342,7 +355,15 @@ export const useAppStore = create<AppStore>((set) => ({
   projectStates: new Map(),
   notifications: [],
 
-  setActiveProject: (id) => set({ activeProjectId: id }),
+  setActiveProject: (id) =>
+    set((state) => {
+      const newStates = new Map(state.projectStates);
+      const ps = newStates.get(id);
+      if (ps?.needsAttention) {
+        newStates.set(id, { ...ps, needsAttention: false });
+      }
+      return { activeProjectId: id, projectStates: newStates };
+    }),
 
   addProject: (project) =>
     set((state) => {
@@ -381,7 +402,12 @@ export const useAppStore = create<AppStore>((set) => ({
         state.activeProjectId === id
           ? newConfig.projects[0]?.id ?? null
           : state.activeProjectId;
-      return { config: newConfig, projectStates: newStates, activeProjectId: newActive };
+      return {
+        config: newConfig,
+        projectStates: newStates,
+        activeProjectId: newActive,
+        notifications: state.notifications.filter((n) => n.projectId !== id),
+      };
     }),
 
   renameProject: (id, name) =>
@@ -444,16 +470,23 @@ export const useAppStore = create<AppStore>((set) => ({
 
   updatePaneStatusByPty: (ptyId, status) =>
     set((state) => {
-      // 快速检查：是否有任何 pane 包含此 ptyId
-      let found = false;
-      for (const ps of state.projectStates.values()) {
-        if (found) break;
+      // 1. 找到 pane 所属项目并捕获 oldStatus
+      let oldStatus: PaneStatus | null = null;
+      let owningProjectId: string | null = null;
+      for (const [pid, ps] of state.projectStates) {
         for (const tab of ps.tabs) {
-          if (collectPtyIds(tab.splitLayout).includes(ptyId)) { found = true; break; }
+          const found = findPaneByPty(tab.splitLayout, ptyId);
+          if (found) {
+            oldStatus = found.status;
+            owningProjectId = pid;
+            break;
+          }
         }
+        if (owningProjectId) break;
       }
-      if (!found) return state;
+      if (!owningProjectId || oldStatus === null) return state;
 
+      // 2. 更新各项目 tabs 中匹配 ptyId 的 pane status
       const newStates = new Map(state.projectStates);
       let changed = false;
       for (const [pid, ps] of newStates) {
@@ -469,7 +502,49 @@ export const useAppStore = create<AppStore>((set) => ({
           changed = true;
         }
       }
-      return changed ? { projectStates: newStates } : state;
+      if (!changed) return state;
+
+      // 3. 检测 transition：ai-working → ai-idle
+      const isCompletion = oldStatus === 'ai-working' && status === 'ai-idle';
+      if (isCompletion) {
+        // 3a. 任务栏闪烁 — 不区分激活项目（Tauri API 自带 focus 检测）
+        if (state.config.aiCompletionTaskbarFlash) {
+          queueMicrotask(() => {
+            getCurrentWindow()
+              .requestUserAttention(UserAttentionType.Informational)
+              .catch(() => {});
+          });
+        }
+
+        // 3b. Tag + Toast — 仅非激活项目
+        if (owningProjectId !== state.activeProjectId) {
+          const ps = newStates.get(owningProjectId);
+          if (ps && !ps.needsAttention) {
+            // 设置 needsAttention（防重：已为 true 时不重复）
+            newStates.set(owningProjectId, { ...ps, needsAttention: true });
+
+            // 推 toast（同项目当前没有未消失的 toast 才推）
+            if (state.config.aiCompletionPopup) {
+              const project = state.config.projects.find((p) => p.id === owningProjectId);
+              const hasExisting = state.notifications.some(
+                (n) => n.projectId === owningProjectId
+              );
+              if (project && !hasExisting) {
+                const projectName = project.name;
+                const targetPid = owningProjectId;
+                queueMicrotask(() =>
+                  useAppStore.getState().pushNotification({
+                    projectId: targetPid,
+                    projectName,
+                  })
+                );
+              }
+            }
+          }
+        }
+      }
+
+      return { projectStates: newStates };
     }),
 
   pushNotification: (n) =>
