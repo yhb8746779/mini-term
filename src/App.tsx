@@ -11,6 +11,7 @@ import { ProjectList } from './components/ProjectList';
 import { FileTree } from './components/FileTree';
 import { GitHistory } from './components/GitHistory';
 import { SettingsModal } from './components/SettingsModal';
+import { ToastContainer } from './components/ToastContainer';
 import { useTauriEvent } from './hooks/useTauriEvent';
 import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
@@ -212,6 +213,7 @@ export function App() {
         </Allotment> : null}
       </div>
       <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} />
+      <ToastContainer />
     </div>
   );
 }
