@@ -174,6 +174,14 @@ const DOUBLE_CTRLC_WINDOW: Duration = Duration::from_millis(1000);
 /// 按下 Enter 后扫描输出以检测 AI 命令 echo 的时间窗口
 const AI_ENTER_SCAN_WINDOW: Duration = Duration::from_millis(2000);
 
+/// PTY resize 后的 TUI 重绘冷却窗口
+///
+/// 窗口内的 PTY 输出不刷新 last_output 时间戳。用于屏蔽 Claude/Codex 等 TUI
+/// 应用在收到 ConPTY resize 信号后重绘 Alternate Screen Buffer 产生的伪输出,
+/// 避免 process_monitor 把这些重绘误判为 AI 活跃,导致 ai-working 状态闪烁以及
+/// 误触发 ai-working → ai-idle 的"任务完成"通知。
+const RESIZE_COOLDOWN: Duration = Duration::from_millis(800);
+
 /// 去除 ANSI 转义序列，返回纯文本
 fn strip_ansi_codes(s: &str) -> String {
     let mut result = String::new();
@@ -239,6 +247,8 @@ pub struct PtyManager {
     input_states: Arc<Mutex<HashMap<u32, InputState>>>,
     last_ctrlc: Arc<Mutex<HashMap<u32, Instant>>>,
     last_enter: Arc<Mutex<HashMap<u32, Instant>>>,
+    /// resize 冷却窗口结束时间:在此之前 PTY 输出不刷新 last_output
+    resize_cooldown_until: Arc<Mutex<HashMap<u32, Instant>>>,
 }
 
 impl PtyManager {
@@ -251,6 +261,7 @@ impl PtyManager {
             input_states: Arc::new(Mutex::new(HashMap::new())),
             last_ctrlc: Arc::new(Mutex::new(HashMap::new())),
             last_enter: Arc::new(Mutex::new(HashMap::new())),
+            resize_cooldown_until: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -429,6 +440,7 @@ pub fn create_pty(
     let last_output = state.last_output.clone();
     let ai_sessions_flush = state.ai_sessions.clone();
     let last_enter_flush = state.last_enter.clone();
+    let resize_cooldown_flush = state.resize_cooldown_until.clone();
     thread::spawn(move || {
         let mut pending = Vec::new();
 
@@ -541,8 +553,21 @@ pub fn create_pty(
                             data,
                         },
                     );
-                    if let Ok(mut map) = last_output.lock() {
-                        map.insert(pty_id_for_reader, Instant::now());
+
+                    // 冷却窗口内(刚 resize 过)的输出不刷新 last_output。
+                    // Claude/Codex 等 TUI 应用在 ConPTY resize 信号后会重绘
+                    // Alternate Screen Buffer,这些重绘数据不能被 process_monitor
+                    // 当作 AI 活跃信号,否则会触发 ai-working 状态闪烁和假完成通知。
+                    let in_resize_cooldown = resize_cooldown_flush
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&pty_id_for_reader).copied())
+                        .map_or(false, |until| Instant::now() < until);
+
+                    if !in_resize_cooldown {
+                        if let Ok(mut map) = last_output.lock() {
+                            map.insert(pty_id_for_reader, Instant::now());
+                        }
                     }
                 }
 
@@ -599,17 +624,29 @@ pub fn resize_pty(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let instances = state.instances.lock().unwrap();
-    let instance = instances.get(&pty_id).ok_or("PTY not found")?;
-    instance
-        .master
-        .resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| e.to_string())
+    {
+        let instances = state.instances.lock().unwrap();
+        let instance = instances.get(&pty_id).ok_or("PTY not found")?;
+        instance
+            .master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| e.to_string())?;
+    }
+
+    // 开启冷却窗口:之后 RESIZE_COOLDOWN 内的 PTY 输出(主要是 TUI 重绘)
+    // 不会刷新 last_output,从而避免被 process_monitor 误判为 AI 活跃。
+    state
+        .resize_cooldown_until
+        .lock()
+        .unwrap()
+        .insert(pty_id, Instant::now() + RESIZE_COOLDOWN);
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -621,6 +658,7 @@ pub fn kill_pty(state: tauri::State<'_, PtyManager>, pty_id: u32) -> Result<(), 
     state.input_states.lock().unwrap().remove(&pty_id);
     state.last_ctrlc.lock().unwrap().remove(&pty_id);
     state.last_enter.lock().unwrap().remove(&pty_id);
+    state.resize_cooldown_until.lock().unwrap().remove(&pty_id);
 
     // Drop the PTY instance on a background thread.
     //
