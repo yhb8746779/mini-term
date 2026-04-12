@@ -116,12 +116,16 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
 
-  // Unicode 11 addon：修正 CJK / Emoji 双宽字符的列宽计算，避免中文乱码
-  const unicode11 = new Unicode11Addon();
-  term.loadAddon(unicode11);
-  term.unicode.activeVersion = '11';
-
   term.open(wrapper);
+
+  // Unicode 11 addon：修正 CJK / Emoji 双宽字符的列宽计算，避免中文乱码
+  try {
+    const unicode11 = new Unicode11Addon();
+    term.loadAddon(unicode11);
+    term.unicode.activeVersion = '11';
+  } catch {
+    // Unicode 11 不支持
+  }
 
   // WebGL 渲染，降级时回退到 Canvas
   try {

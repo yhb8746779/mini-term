@@ -145,6 +145,19 @@ html, body, #root {
   background: var(--accent-muted) !important;
 }
 
+
+/* ===== xterm stability ===== */
+.xterm {
+  height: 100%;
+}
+
+.xterm .xterm-viewport {
+  overflow-y: scroll !important;
+  overflow-x: hidden !important;
+  scrollbar-gutter: stable both-edges;
+}
+
+
 /* ===== Animations ===== */
 @keyframes subtleGlow {
   0%, 100% { opacity: 1; }

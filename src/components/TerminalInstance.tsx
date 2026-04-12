@@ -9,6 +9,9 @@ interface Props {
   ptyId: number;
 }
 
+const INITIAL_PTY_RESIZE_DELAY = 320;
+const INITIAL_PTY_RESIZE_MIN_COLS = 40;
+
 export function TerminalInstance({ ptyId }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [fileDrag, setFileDrag] = useState(false);
@@ -24,46 +27,40 @@ export function TerminalInstance({ ptyId }: Props) {
     if (!container) return;
 
     const { term, fitAddon, wrapper } = getOrCreateTerminal(ptyId);
+    const mountAt = performance.now();
+
+    const syncTerminalSize = (forcePtyResize = false) => {
+      if (container.clientWidth <= 0 || container.clientHeight <= 0) return;
+      fitAddon.fit();
+      term.refresh(0, Math.max(term.rows - 1, 0));
+
+      const startupWindow = performance.now() - mountAt < INITIAL_PTY_RESIZE_DELAY;
+      const shouldDelayPtyResize = !forcePtyResize && startupWindow && term.cols < INITIAL_PTY_RESIZE_MIN_COLS;
+      if (!shouldDelayPtyResize) {
+        invoke('resize_pty', { ptyId, cols: term.cols, rows: term.rows });
+      }
+    };
 
     container.appendChild(wrapper);
 
     // 双层 rAF：让 Allotment 完成布局计算后再测量容器尺寸，避免在过渡尺寸时 fit() 得到错误的 cols
     requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        if (container.clientWidth > 0 && container.clientHeight > 0) {
-          fitAddon.fit();
-          invoke('resize_pty', { ptyId, cols: term.cols, rows: term.rows });
-          term.refresh(0, term.rows - 1);
-        }
-      });
+      requestAnimationFrame(() => syncTerminalSize());
     });
 
-    // 200ms 兜底：Allotment 嵌套布局（外层三栏 + 内层分屏）需要多帧才能稳定，
-    // 双层 rAF 仅约 32ms，不足以覆盖所有情况（尤其是应用重启后恢复布局时）。
-    // 200ms 后强制 fit + PTY resize，确保已保存会话的终端宽度正确。
-    const fallbackId = window.setTimeout(() => {
-      if (container.clientWidth > 0 && container.clientHeight > 0) {
-        fitAddon.fit();
-        invoke('resize_pty', { ptyId, cols: term.cols, rows: term.rows });
-      }
-    }, 200);
+    // 启动期兜底：避免 PTY 在布局尚未稳定时先被缩到很窄，导致 PowerShell banner/prompt 被硬换行。
+    const fallbackId = window.setTimeout(() => syncTerminalSize(true), INITIAL_PTY_RESIZE_DELAY);
 
     let rafId: number;
     const observer = new ResizeObserver(() => {
       cancelAnimationFrame(rafId);
-      rafId = requestAnimationFrame(() => {
-        if (container.clientWidth > 0 && container.clientHeight > 0) {
-          fitAddon.fit();
-          // 同步通知 PTY 新尺寸，使 PSReadLine 等 shell 在 Allotment 布局稳定后重绘 prompt
-          invoke('resize_pty', { ptyId, cols: term.cols, rows: term.rows });
-        }
-      });
+      rafId = requestAnimationFrame(() => syncTerminalSize());
     });
     observer.observe(container);
 
     const visibilityObserver = new IntersectionObserver((entries) => {
       if (entries.some((e) => e.isIntersecting)) {
-        requestAnimationFrame(() => fitAddon.fit());
+        requestAnimationFrame(() => syncTerminalSize(true));
       }
     });
     visibilityObserver.observe(container);
@@ -82,6 +79,8 @@ export function TerminalInstance({ ptyId }: Props) {
     if (cached && terminalFontSize) {
       cached.term.options.fontSize = terminalFontSize;
       cached.fitAddon.fit();
+      cached.term.refresh(0, Math.max(cached.term.rows - 1, 0));
+      invoke('resize_pty', { ptyId, cols: cached.term.cols, rows: cached.term.rows });
     }
   }, [terminalFontSize, ptyId]);
 

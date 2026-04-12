@@ -48,6 +48,10 @@ const AI_EXIT_COMMANDS: &[&str] = &[
 /// 连续两次 Ctrl+C 退出的时间窗口
 const DOUBLE_CTRLC_WINDOW: Duration = Duration::from_millis(1000);
 
+/// PSReadLine 接受 inline prediction 后，shell echo 可能在 Enter 之后才到达 PTY。
+/// 在这个短窗口内继续观察输出，避免“右箭头补全 + 回车”漏判 AI 会话。
+const PREDICTION_ECHO_GRACE: Duration = Duration::from_millis(300);
+
 /// 去除 ANSI 转义序列，返回纯文本
 fn strip_ansi_codes(s: &str) -> String {
     let mut result = String::new();
@@ -75,7 +79,7 @@ fn strip_ansi_codes(s: &str) -> String {
 /// 检查 PTY 输出中是否包含 AI 命令被 echo（例如 "PS C:\> claude" 或单独的 "claude"）
 /// 同时过滤非交互式标志（-v/--version/-h/--help 等），避免误识别
 fn output_contains_ai_command(output: &str) -> bool {
-    let stripped = strip_ansi_codes(output);
+    let stripped = strip_ansi_codes(output).replace('\r', "\n");
     for line in stripped.lines() {
         let line = line.trim();
         if line.is_empty() { continue; }
@@ -143,6 +147,33 @@ impl PtyManager {
 
     pub fn is_ai_session(&self, pty_id: u32) -> bool {
         self.ai_sessions.lock().unwrap().contains(&pty_id)
+    }
+
+    fn append_output_since_enter(&self, pty_id: u32, data: &str) -> String {
+        let mut ose = self.output_since_enter.lock().unwrap();
+        let entry = ose.entry(pty_id).or_default();
+        entry.push_str(data);
+        const OSE_CAP: usize = 16 * 1024;
+        if entry.len() > OSE_CAP {
+            let excess = entry.len() - OSE_CAP;
+            let boundary = (excess..=entry.len())
+                .find(|&i| entry.is_char_boundary(i))
+                .unwrap_or(entry.len());
+            entry.drain(..boundary);
+        }
+        entry.clone()
+    }
+
+    fn try_enter_ai_from_recent_output(&self, pty_id: u32, output: &str) {
+        if self.is_ai_session(pty_id) {
+            return;
+        }
+        let entered_recently = self.last_enter.lock().unwrap()
+            .get(&pty_id)
+            .map_or(false, |t| t.elapsed() <= PREDICTION_ECHO_GRACE);
+        if entered_recently && output_contains_ai_command(output) {
+            self.ai_sessions.lock().unwrap().insert(pty_id);
+        }
     }
 
     /// 追踪用户输入，检测 AI 命令（claude/codex）的执行与退出
@@ -256,8 +287,8 @@ impl PtyManager {
     /// 仅供单元测试使用：向 output_since_enter 注入模拟 PTY 输出
     #[cfg(test)]
     fn inject_pty_output(&self, pty_id: u32, data: &str) {
-        let mut ose = self.output_since_enter.lock().unwrap();
-        ose.entry(pty_id).or_default().push_str(data);
+        let output = self.append_output_since_enter(pty_id, data);
+        self.try_enter_ai_from_recent_output(pty_id, &output);
     }
 }
 
@@ -271,7 +302,8 @@ pub fn create_pty(
 ) -> Result<u32, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        // 先以较宽的初始尺寸启动 shell，避免 UI 首屏布局未稳定时 banner/prompt 被硬换行。
+        .openpty(PtySize { rows: 40, cols: 200, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| e.to_string())?;
 
     let mut cmd = CommandBuilder::new(&shell);
@@ -323,7 +355,7 @@ pub fn create_pty(
 
     let app_flush = app.clone();
     let last_output = state.last_output.clone();
-    let output_since_enter_flush = state.output_since_enter.clone();
+    let pty_state_for_output = state.inner().clone();
     thread::spawn(move || {
         let mut pending = Vec::new();
 
@@ -400,21 +432,10 @@ pub fn create_pty(
 
                     // 将本批输出追加到 output_since_enter，供 track_input 在 Enter 时检测
                     // PSReadLine inline prediction（右箭头接受）会在 Enter 前渲染命令文本
-                    {
-                        let mut ose = output_since_enter_flush.lock().unwrap();
-                        let entry = ose.entry(pty_id_for_reader).or_default();
-                        entry.push_str(&data);
-                        // 上限 16KB，超出时丢弃最旧的部分
-                        const OSE_CAP: usize = 16 * 1024;
-                        if entry.len() > OSE_CAP {
-                            let excess = entry.len() - OSE_CAP;
-                            // 找到 >= excess 的第一个合法 UTF-8 字符边界，避免切在多字节字符中间
-                            let boundary = (excess..=entry.len())
-                                .find(|&i| entry.is_char_boundary(i))
-                                .unwrap_or(entry.len());
-                            entry.drain(..boundary);
-                        }
-                    }
+                    let recent_output = pty_state_for_output
+                        .append_output_since_enter(pty_id_for_reader, &data);
+                    pty_state_for_output
+                        .try_enter_ai_from_recent_output(pty_id_for_reader, &recent_output);
 
                     let _ = app_flush.emit("pty-output", PtyOutputPayload {
                         pty_id: pty_id_for_reader, data,
@@ -747,6 +768,14 @@ mod tests {
     }
 
     #[test]
+    fn psreadline_echo_arrives_after_enter_still_detected() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "\r");
+        mgr.inject_pty_output(1, "PS C:\\workspace> claude --model sonnet");
+        assert!(mgr.is_ai_session(1));
+    }
+
+    #[test]
     fn psreadline_version_flag_not_detected() {
         // PSReadLine 渲染了 "claude -v" —— 非交互，不应触发 AI 会话
         let mgr = PtyManager::new();
@@ -785,5 +814,10 @@ mod tests {
     fn output_contains_ai_command_plain_claude_true() {
         assert!(output_contains_ai_command("PS C:\\> claude"));
         assert!(output_contains_ai_command("PS C:\\workspace> claude --model sonnet"));
+    }
+
+    #[test]
+    fn output_contains_ai_command_with_carriage_return_true() {
+        assert!(output_contains_ai_command("PS C:\\workspace> cl\rPS C:\\workspace> claude --model sonnet"));
     }
 }
