@@ -5,10 +5,45 @@ let currentResolved: ResolvedTheme = 'dark';
 let cleanupFn: (() => void) | null = null;
 
 const STORAGE_KEY = 'mini-term-theme';
+const COLOR_SCHEME_QUERY = '(prefers-color-scheme: light)';
+
+type LegacyMediaQueryList = MediaQueryList & {
+  addListener?: (listener: (event: MediaQueryListEvent) => void) => void;
+  removeListener?: (listener: (event: MediaQueryListEvent) => void) => void;
+};
+
+function getColorSchemeQuery(): LegacyMediaQueryList | null {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+    return null;
+  }
+  return window.matchMedia(COLOR_SCHEME_QUERY) as LegacyMediaQueryList;
+}
+
+function listenColorSchemeChange(
+  mql: LegacyMediaQueryList,
+  handler: (event: MediaQueryListEvent) => void,
+): () => void {
+  if (typeof mql.addEventListener === 'function') {
+    mql.addEventListener('change', handler);
+    return () => {
+      mql.removeEventListener?.('change', handler);
+    };
+  }
+
+  if (typeof mql.addListener === 'function') {
+    mql.addListener(handler);
+    return () => {
+      mql.removeListener?.(handler);
+    };
+  }
+
+  return () => {};
+}
 
 function resolveTheme(mode: ThemeMode): ResolvedTheme {
   if (mode === 'auto') {
-    return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    const mql = getColorSchemeQuery();
+    return mql?.matches ? 'light' : 'dark';
   }
   return mode;
 }
@@ -32,12 +67,12 @@ export function applyTheme(mode: ThemeMode): void {
   applyToDOM(resolveTheme(mode));
 
   if (mode === 'auto') {
-    const mql = window.matchMedia('(prefers-color-scheme: light)');
+    const mql = getColorSchemeQuery();
+    if (!mql) return;
     const handler = (e: MediaQueryListEvent) => {
       applyToDOM(e.matches ? 'light' : 'dark');
       window.dispatchEvent(new CustomEvent('theme-changed', { detail: getResolvedTheme() }));
     };
-    mql.addEventListener('change', handler);
-    cleanupFn = () => mql.removeEventListener('change', handler);
+    cleanupFn = listenColorSchemeChange(mql, handler);
   }
 }

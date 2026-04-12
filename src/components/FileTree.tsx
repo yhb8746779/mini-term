@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { message } from '@tauri-apps/plugin-dialog';
 import { revealItemInDir, openPath } from '@tauri-apps/plugin-opener';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useAppStore, isExpanded, toggleExpandedDir } from '../store';
@@ -247,6 +248,28 @@ export function FileTree() {
   const config = useAppStore((s) => s.config);
   const project = config.projects.find((p) => p.id === activeProjectId);
 
+  const handleOpenInVscode = useCallback(async () => {
+    if (!project) return;
+    // 前端做一次快速预检查(避免无意义的 invoke),后端会权威地再读一次 config
+    if (!(config.vscodePath ?? '').trim()) {
+      await message(
+        '请先在『设置 → 系统设置 → 外部编辑器』中配置 VS Code 可执行文件路径。',
+        { title: '未配置 VS Code 路径', kind: 'warning' },
+      );
+      return;
+    }
+    try {
+      await invoke('open_in_vscode', { path: project.path });
+    } catch (err) {
+      const detail = typeof err === 'string' ? err : String(err);
+      console.error('打开 VS Code 失败:', err);
+      await message(detail, {
+        title: '打开 VS Code 失败',
+        kind: 'error',
+      });
+    }
+  }, [project, config.vscodePath]);
+
   const [rootEntries, setRootEntries] = useState<FileEntry[]>([]);
   const [gitStatusMap, setGitStatusMap] = useState<Map<string, GitFileStatus>>(new Map());
   const [diffTarget, setDiffTarget] = useState<GitFileStatus | null>(null);
@@ -354,8 +377,32 @@ export function FileTree() {
 
   return (
     <div className="h-full bg-[var(--bg-surface)] flex flex-col overflow-y-auto border-l border-[var(--border-subtle)]">
-      <div className="px-3 pt-3 pb-1.5 text-sm text-[var(--text-muted)] uppercase tracking-[0.12em] font-medium">
-        Files — {project.name}
+      <div className="px-3 pt-3 pb-1.5 flex items-center justify-between gap-2">
+        <span className="text-sm text-[var(--text-muted)] uppercase tracking-[0.12em] font-medium truncate">
+          Files — {project.name}
+        </span>
+        <button
+          type="button"
+          onClick={handleOpenInVscode}
+          title="使用 VS Code 打开该文件夹"
+          className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors flex-shrink-0 leading-none"
+        >
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M10 2h4v4" />
+            <path d="M14 2L7 9" />
+            <path d="M12 9v4a1 1 0 01-1 1H3a1 1 0 01-1-1V5a1 1 0 011-1h4" />
+          </svg>
+        </button>
       </div>
       <div className="flex-1 px-1" onContextMenu={handleRootContextMenu}>
         {rootEntries.map((entry) => (

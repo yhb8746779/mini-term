@@ -18,6 +18,7 @@ import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useAppStore } from '../store';
 import type { PtyOutputPayload } from '../types';
 import { getResolvedTheme } from './themeManager';
+import { createPtyWriteQueue } from './ptyWriteQueue';
 
 export interface CachedTerminal {
   term: Terminal;
@@ -87,6 +88,9 @@ export function getTerminalTheme(terminalFollowTheme: boolean): typeof DARK_TERM
 }
 
 const cache = new Map<number, CachedEntry>();
+const enqueuePtyWrite = createPtyWriteQueue((ptyId, data) =>
+  invoke('write_pty', { ptyId, data })
+);
 
 export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   const existing = cache.get(ptyId);
@@ -116,6 +120,12 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
 
+  // 拦截 CSI 3J (ED3 - Erase Saved Lines)：保留 scrollback 缓冲区。
+  // codex/claude 等 TUI 应用在主缓冲区周期性发送此序列清空滚动历史，
+  // 导致用户向上滚动时看不到之前的对话内容。返回 true 让 xterm.js
+  // 跳过默认（清空 scrollback）行为；其余 Ps 值（0/1/2）走默认逻辑。
+  term.parser.registerCsiHandler({ final: 'J' }, (params) => params[0] === 3);
+
   term.open(wrapper);
 
   // Unicode 11 addon：修正 CJK / Emoji 双宽字符的列宽计算，避免中文乱码
@@ -144,15 +154,12 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     if (e.type !== 'keydown') return true;
     if (e.ctrlKey && e.shiftKey && e.code === 'KeyC') {
       e.preventDefault();
-      const sel = term.getSelection();
-      if (sel) writeText(sel);
+      void copyTerminalSelection(ptyId);
       return false;
     }
     if (e.ctrlKey && e.shiftKey && e.code === 'KeyV') {
       e.preventDefault();
-      readText().then((text) => {
-        if (text) invoke('write_pty', { ptyId, data: text });
-      });
+      void pasteToTerminal(ptyId);
       return false;
     }
     return true;
@@ -179,7 +186,7 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   // 用户输入 → PTY
   const onDataDisp = term.onData((data) => {
     term.scrollToBottom();
-    invoke('write_pty', { ptyId, data });
+    void enqueuePtyWrite(ptyId, data);
   });
 
   // 终端 resize → 同步到 PTY
@@ -231,4 +238,24 @@ export function updateAllTerminalThemes(terminalFollowTheme: boolean): void {
   for (const entry of cache.values()) {
     entry.term.options.theme = theme;
   }
+}
+
+export function writePtyInput(ptyId: number, data: string): Promise<void> {
+  return enqueuePtyWrite(ptyId, data);
+}
+
+/** 复制当前终端选中文本到系统剪贴板。无选中则不操作。返回是否有内容被复制。 */
+export async function copyTerminalSelection(ptyId: number): Promise<boolean> {
+  const cached = cache.get(ptyId);
+  if (!cached) return false;
+  const sel = cached.term.getSelection();
+  if (!sel) return false;
+  await writeText(sel);
+  return true;
+}
+
+/** 读取系统剪贴板并写入终端 PTY。 */
+export async function pasteToTerminal(ptyId: number): Promise<void> {
+  const text = await readText();
+  if (text) await enqueuePtyWrite(ptyId, text);
 }

@@ -23,6 +23,9 @@ export interface AppConfig {
   middleColumnSizes?: number[];
   theme: 'auto' | 'light' | 'dark';
   terminalFollowTheme: boolean;
+  aiCompletionPopup: boolean;
+  aiCompletionTaskbarFlash: boolean;
+  vscodePath?: string;
 }
 
 export interface ProjectConfig {
@@ -67,6 +70,14 @@ export interface ProjectState {
   id: string;
   tabs: TerminalTab[];
   activeTabId: string;
+  needsAttention?: boolean;
+}
+
+export interface AiCompletionNotification {
+  id: string;
+  projectId: string;
+  projectName: string;
+  timestamp: number;
 }
 
 export interface TerminalTab {

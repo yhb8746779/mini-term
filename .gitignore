@@ -25,6 +25,7 @@ dist-ssr
 
 # Brainstorm / temp files
 .superpowers
+.tmp-tests/*.js
 
 # Claude local settings
 .claude/settings.local.json

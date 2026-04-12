@@ -1,5 +1,6 @@
 mod ai_sessions;
 mod config;
+mod editor;
 mod fs;
 mod git;
 mod process_monitor;
@@ -46,6 +47,7 @@ pub fn run() {
             git::get_commit_file_diff,
             git::git_pull,
             git::git_push,
+            editor::open_in_vscode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

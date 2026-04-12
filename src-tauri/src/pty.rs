@@ -49,8 +49,12 @@ const AI_EXIT_COMMANDS: &[&str] = &[
 const DOUBLE_CTRLC_WINDOW: Duration = Duration::from_millis(1000);
 
 /// PSReadLine 接受 inline prediction 后，shell echo 可能在 Enter 之后才到达 PTY。
-/// 在这个短窗口内继续观察输出，避免“右箭头补全 + 回车”漏判 AI 会话。
+/// 在这个短窗口内继续观察输出，避免”右箭头补全 + 回车”漏判 AI 会话。
 const PREDICTION_ECHO_GRACE: Duration = Duration::from_millis(300);
+
+/// TUI 应用（Claude/Codex）在收到 ConPTY resize 信号后会重绘 Alternate Screen Buffer。
+/// 在此冷却窗口内的 PTY 输出不刷新 last_output，避免误判为 AI 活跃。
+const RESIZE_COOLDOWN: Duration = Duration::from_millis(800);
 
 /// 去除 ANSI 转义序列，返回纯文本
 fn strip_ansi_codes(s: &str) -> String {
@@ -120,6 +124,9 @@ pub struct PtyManager {
     /// PTY 自上次 Enter 以来输出的所有字符（上限 16KB）
     /// 用于检测 PSReadLine inline prediction（右箭头接受后 Enter）
     output_since_enter: Arc<Mutex<HashMap<u32, String>>>,
+    /// resize 冷却窗口结束时间：在此之前 PTY 输出不刷新 last_output，
+    /// 避免 TUI 应用 resize 重绘被误判为 AI 活跃。
+    resize_cooldown_until: Arc<Mutex<HashMap<u32, Instant>>>,
 }
 
 impl PtyManager {
@@ -133,6 +140,7 @@ impl PtyManager {
             last_ctrlc: Arc::new(Mutex::new(HashMap::new())),
             last_enter: Arc::new(Mutex::new(HashMap::new())),
             output_since_enter: Arc::new(Mutex::new(HashMap::new())),
+            resize_cooldown_until: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -440,8 +448,20 @@ pub fn create_pty(
                     let _ = app_flush.emit("pty-output", PtyOutputPayload {
                         pty_id: pty_id_for_reader, data,
                     });
-                    if let Ok(mut map) = last_output.lock() {
-                        map.insert(pty_id_for_reader, Instant::now());
+
+                    // 冷却窗口内（刚 resize 过）的输出不刷新 last_output。
+                    // Claude/Codex 等 TUI 在 ConPTY resize 后会全屏重绘，
+                    // 这些重绘数据不应被 process_monitor 当作 AI 活跃信号。
+                    let in_cooldown = pty_state_for_output
+                        .resize_cooldown_until
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&pty_id_for_reader).copied())
+                        .map_or(false, |until| Instant::now() < until);
+                    if !in_cooldown {
+                        if let Ok(mut map) = last_output.lock() {
+                            map.insert(pty_id_for_reader, Instant::now());
+                        }
                     }
                 }
 
@@ -483,11 +503,20 @@ pub fn write_pty(state: tauri::State<'_, PtyManager>, pty_id: u32, data: String)
 
 #[tauri::command]
 pub fn resize_pty(state: tauri::State<'_, PtyManager>, pty_id: u32, cols: u16, rows: u16) -> Result<(), String> {
-    let instances = state.instances.lock().unwrap();
-    let instance = instances.get(&pty_id).ok_or("PTY not found")?;
-    instance.master
-        .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-        .map_err(|e| e.to_string())
+    {
+        let instances = state.instances.lock().unwrap();
+        let instance = instances.get(&pty_id).ok_or("PTY not found")?;
+        instance.master
+            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .map_err(|e| e.to_string())?;
+    }
+    // 开启冷却窗口：之后 RESIZE_COOLDOWN 内的 PTY 输出（主要是 TUI 重绘）
+    // 不会刷新 last_output，从而避免被 process_monitor 误判为 AI 活跃。
+    state.resize_cooldown_until
+        .lock()
+        .unwrap()
+        .insert(pty_id, Instant::now() + RESIZE_COOLDOWN);
+    Ok(())
 }
 
 #[tauri::command]
@@ -500,6 +529,7 @@ pub fn kill_pty(state: tauri::State<'_, PtyManager>, pty_id: u32) -> Result<(), 
     state.last_ctrlc.lock().unwrap().remove(&pty_id);
     state.last_enter.lock().unwrap().remove(&pty_id);
     state.output_since_enter.lock().unwrap().remove(&pty_id);
+    state.resize_cooldown_until.lock().unwrap().remove(&pty_id);
 
     // Drop the PTY instance on a background thread.
     //

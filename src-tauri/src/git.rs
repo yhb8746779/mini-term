@@ -805,34 +805,60 @@ pub fn get_git_diff(project_path: String, file_path: String) -> Result<GitDiffRe
     })
 }
 
-#[tauri::command]
-pub async fn git_pull(repo_path: String) -> Result<String, String> {
-    let output = std::process::Command::new("git")
-        .arg("pull")
-        .current_dir(&repo_path)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("Failed to execute git pull: {}", e))?;
+/// git pull / git push 的共享执行器:
+/// - 校验 `repo_path` 是目录并且包含 `.git`(避免在任意目录上跑 git)
+/// - 在独立线程里 spawn git 进程,通过 mpsc 回传 output
+/// - `recv_timeout` 到达上限后立即返回超时错误(子进程会被 drop,
+///   虽然不保证立刻 kill,但主线程不再被阻塞)
+fn run_git_network_command(repo_path: &str, op: &'static str) -> Result<String, String> {
+    const GIT_NET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    let repo = Path::new(repo_path);
+    if !repo.is_dir() {
+        return Err(format!("不是有效目录:{}", repo_path));
+    }
+    if !repo.join(".git").exists() {
+        return Err(format!("不是 git 仓库(缺少 .git):{}", repo_path));
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let repo_path_owned = repo_path.to_string();
+    std::thread::spawn(move || {
+        let result = std::process::Command::new("git")
+            .arg(op)
+            .current_dir(&repo_path_owned)
+            .stdin(std::process::Stdio::null())
+            .output();
+        // 忽略发送失败:主线程超时后接收端已被 drop
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(GIT_NET_TIMEOUT) {
+        Ok(Ok(output)) => {
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).to_string())
+            }
+        }
+        Ok(Err(e)) => Err(format!("启动 git {} 失败:{}", op, e)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "git {} 超时({}s),可能在等待凭证或网络故障。请确认已配置凭证管理器或 SSH key",
+            op,
+            GIT_NET_TIMEOUT.as_secs()
+        )),
+        Err(e) => Err(format!("git {} 通信错误:{}", op, e)),
     }
 }
 
+// 两个 command 故意是 sync fn:内部 `recv_timeout(30s)` 是阻塞调用,
+// sync command 在 Tauri 的 blocking 池运行,不会占用 async runtime 的 worker。
 #[tauri::command]
-pub async fn git_push(repo_path: String) -> Result<String, String> {
-    let output = std::process::Command::new("git")
-        .arg("push")
-        .current_dir(&repo_path)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("Failed to execute git push: {}", e))?;
+pub fn git_pull(repo_path: String) -> Result<String, String> {
+    run_git_network_command(&repo_path, "pull")
+}
 
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
-    }
+#[tauri::command]
+pub fn git_push(repo_path: String) -> Result<String, String> {
+    run_git_network_command(&repo_path, "push")
 }

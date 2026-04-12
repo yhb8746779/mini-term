@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { useAppStore, genId } from '../store';
 import { StatusDot } from './StatusDot';
+import { DoneTag } from './DoneTag';
 import { SessionList } from './SessionList';
 import { showContextMenu } from '../utils/contextMenu';
 import { showPrompt } from '../utils/prompt';
@@ -278,6 +279,8 @@ export function ProjectList() {
   const renderProjectItem = (project: ProjectConfig, depth: number, parentGroupId?: string) => {
     const isActive = project.id === activeProjectId;
     const statusSummary = getProjectStatusSummary(project.id);
+    const projectPs = projectStates.get(project.id);
+    const showDoneTag = !!projectPs?.needsAttention && !isActive;
 
     return (
       <div
@@ -346,21 +349,23 @@ export function ProjectList() {
         ) : (
           <span className="truncate flex-1">{project.name}</span>
         )}
-        {/* 多终端状态汇总：每种非 idle 状态一个点 + 数量（>1 时显示） */}
-        <div className="flex items-center gap-0.5 flex-shrink-0">
-          {statusSummary.length === 0 ? (
-            <StatusDot status="idle" />
-          ) : (
-            statusSummary.map(({ status, count }) => (
-              <div key={status} className="flex items-center gap-[2px]">
-                <StatusDot status={status} />
-                {count > 1 && (
-                  <span className="text-[9px] leading-none text-[var(--text-muted)]">{count}</span>
-                )}
-              </div>
-            ))
-          )}
-        </div>
+        {/* AI 完成提醒优先显示；否则多终端状态汇总（每种非 idle 状态一个点 + 数量） */}
+        {showDoneTag ? <DoneTag /> : (
+          <div className="flex items-center gap-0.5 flex-shrink-0">
+            {statusSummary.length === 0 ? (
+              <StatusDot status="idle" />
+            ) : (
+              statusSummary.map(({ status, count }) => (
+                <div key={status} className="flex items-center gap-[2px]">
+                  <StatusDot status={status} />
+                  {count > 1 && (
+                    <span className="text-[9px] leading-none text-[var(--text-muted)]">{count}</span>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+        )}
         <span
           className="text-[var(--text-muted)] hover:text-[var(--color-error)] hidden group-hover:inline transition-colors text-sm"
           onClick={(e) => handleRemoveProject(e, project.id)}
