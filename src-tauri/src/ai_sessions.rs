@@ -3,6 +3,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+/// 每个项目最多返回的会话数（避免拥有海量历史的项目卡死应用）
+const MAX_SESSIONS_PER_PROJECT: usize = 50;
+
+/// Codex 全局扫描文件上限（避免海量 session 目录遍历时间过长）
+const MAX_CODEX_FILES_SCANNED: usize = 1000;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,19 +56,25 @@ fn get_claude_sessions(project_path: &str) -> Vec<AiSession> {
         return vec![];
     }
 
-    let mut sessions = Vec::new();
-
     let entries = match fs::read_dir(&sessions_dir) {
         Ok(e) => e,
         Err(_) => return vec![],
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
+    // 按修改时间排序，只读最近 MAX_SESSIONS_PER_PROJECT 个文件，避免海量历史卡死
+    let mut files: Vec<(SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("jsonl") { return None; }
+            let mtime = p.metadata().ok()?.modified().ok()?;
+            Some((mtime, p))
+        })
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0)); // 最新在前
 
+    let mut sessions = Vec::new();
+    for (_, path) in files.into_iter().take(MAX_SESSIONS_PER_PROJECT) {
         let id = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -167,7 +180,8 @@ fn get_codex_sessions(project_path: &str) -> Vec<AiSession> {
     let mut sessions = Vec::new();
     let normalized_project = normalize_path(project_path);
 
-    walk_codex_sessions(&sessions_dir, &normalized_project, &thread_names, &mut sessions);
+    let mut scanned = 0usize;
+    walk_codex_sessions(&sessions_dir, &normalized_project, &thread_names, &mut sessions, &mut scanned);
 
     sessions
 }
@@ -198,22 +212,32 @@ fn load_codex_thread_names(codex_dir: &Path) -> HashMap<String, String> {
 }
 
 /// 递归遍历 sessions/<year>/<month>/<day>/ 目录
+/// scanned: 已扫描文件计数，超过 MAX_CODEX_FILES_SCANNED 时提前终止
 fn walk_codex_sessions(
     dir: &Path,
     normalized_project: &str,
     thread_names: &HashMap<String, String>,
     sessions: &mut Vec<AiSession>,
+    scanned: &mut usize,
 ) {
+    if *scanned >= MAX_CODEX_FILES_SCANNED || sessions.len() >= MAX_SESSIONS_PER_PROJECT {
+        return;
+    }
+
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
     };
 
     for entry in entries.flatten() {
+        if *scanned >= MAX_CODEX_FILES_SCANNED || sessions.len() >= MAX_SESSIONS_PER_PROJECT {
+            break;
+        }
         let path = entry.path();
         if path.is_dir() {
-            walk_codex_sessions(&path, normalized_project, thread_names, sessions);
+            walk_codex_sessions(&path, normalized_project, thread_names, sessions, scanned);
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            *scanned += 1;
             if let Some(session) = try_read_codex_session(&path, normalized_project, thread_names) {
                 sessions.push(session);
             }
