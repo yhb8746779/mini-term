@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 #[derive(Debug, Clone, Serialize)]
@@ -26,6 +27,9 @@ fn build_gitignore(project_root: &Path) -> Option<Gitignore> {
 }
 
 const ALWAYS_IGNORE: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "__pycache__", ".superpowers"];
+
+/// 同一路径的文件变更事件，150ms 内只向前端 emit 一次，防止驱动器根目录等高频场景卡死
+const FS_EVENT_DEBOUNCE: Duration = Duration::from_millis(150);
 
 #[cfg(test)]
 fn should_ignore(name: &str, full_path: &Path, is_dir: bool, gitignore: &Option<Gitignore>) -> bool {
@@ -106,14 +110,25 @@ pub fn watch_directory(
     let project_path_clone = project_path.clone();
     let app_clone = app.clone();
 
+    // 每个路径独立防抖：150ms 内只向前端 emit 一次，避免驱动器根目录等高频场景卡死
+    let last_emitted: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+
     let mut watcher = notify::recommended_watcher(move |res: Result<NotifyEvent, _>| {
         if let Ok(event) = res {
+            let now = Instant::now();
+            let mut last = last_emitted.lock().unwrap();
             for p in &event.paths {
-                let _ = app_clone.emit("fs-change", FsChangePayload {
-                    project_path: project_path_clone.clone(),
-                    path: p.to_string_lossy().to_string(),
-                    kind: format!("{:?}", event.kind),
-                });
+                let path_str = p.to_string_lossy().to_string();
+                let should_emit = last.get(&path_str)
+                    .map_or(true, |t| now.duration_since(*t) >= FS_EVENT_DEBOUNCE);
+                if should_emit {
+                    last.insert(path_str.clone(), now);
+                    let _ = app_clone.emit("fs-change", FsChangePayload {
+                        project_path: project_path_clone.clone(),
+                        path: path_str,
+                        kind: format!("{:?}", event.kind),
+                    });
+                }
             }
         }
     }).map_err(|e| e.to_string())?;
