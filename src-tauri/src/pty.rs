@@ -28,7 +28,7 @@ struct PtyInstance {
     child: Box<dyn Child + Send + Sync>,
 }
 
-const AI_COMMANDS: &[&str] = &["claude", "codex"];
+const AI_COMMANDS: &[&str] = &["claude", "codex", "gemini"];
 
 /// 这些标志表示非交互命令（仅输出信息后退出），不应触发 AI 会话状态
 const NON_INTERACTIVE_FLAGS: &[&str] = &[
@@ -39,8 +39,8 @@ const NON_INTERACTIVE_FLAGS: &[&str] = &[
 
 /// AI 会话中的显式退出命令
 const AI_EXIT_COMMANDS: &[&str] = &[
-    "/exit", "exit",       // Claude Code & Codex 通用
-    "/quit", "quit",       // Claude Code & Codex 通用
+    "/exit", "exit",       // Claude Code & Codex & Gemini 通用
+    "/quit", "quit",       // Claude Code & Codex & Gemini 通用
     ":quit",               // Codex 交互式退出
     "/logout",             // Codex 退出
 ];
@@ -605,6 +605,25 @@ mod tests {
         let mgr = PtyManager::new();
         mgr.track_input(1, "codex\r");
         assert!(mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn detect_gemini_command() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "gemini\r");
+        assert!(mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn echo_powershell_prompt_gemini_detected() {
+        assert!(output_contains_ai_command("PS C:\\workspace> gemini"));
+    }
+
+    #[test]
+    fn gemini_version_flag_not_detected() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "gemini --version\r");
+        assert!(!mgr.is_ai_session(1));
     }
 
     #[test]
