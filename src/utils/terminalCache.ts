@@ -11,6 +11,7 @@
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
+import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager';
@@ -98,7 +99,9 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
 
   const term = new Terminal({
     fontSize: useAppStore.getState().config.terminalFontSize ?? 14,
-    fontFamily: "'JetBrains Mono', 'Cascadia Code', Consolas, monospace",
+    // CJK 备用字体：PingFang SC（macOS）/ Noto Sans Mono CJK SC（Linux）/ Microsoft YaHei（Windows）
+    // 确保中文字符有合适的字形，避免宽度计算与实际渲染不一致导致乱码
+    fontFamily: "'JetBrains Mono', 'Cascadia Code', Consolas, 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans Mono CJK SC', 'Microsoft YaHei Mono', monospace",
     fontWeight: '400',
     fontWeightBold: '600',
     cursorBlink: true,
@@ -112,6 +115,12 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
 
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
+
+  // Unicode 11 addon：修正 CJK / Emoji 双宽字符的列宽计算，避免中文乱码
+  const unicode11 = new Unicode11Addon();
+  term.loadAddon(unicode11);
+  term.unicode.activeVersion = '11';
+
   term.open(wrapper);
 
   // WebGL 渲染，降级时回退到 Canvas
