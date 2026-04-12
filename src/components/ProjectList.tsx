@@ -1,4 +1,4 @@
-import { useCallback, useState, useRef } from 'react';
+import { useCallback, useState, useRef, useEffect } from 'react';
 import { Allotment } from 'allotment';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
@@ -54,8 +54,27 @@ export function ProjectList() {
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState('');
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
   const editInputRef = useRef<HTMLInputElement>(null);
   const editProjectInputRef = useRef<HTMLInputElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (searchOpen) searchInputRef.current?.focus();
+  }, [searchOpen]);
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchQuery('');
+  }, []);
+
+  const filteredProjects = searchQuery.trim()
+    ? config.projects.filter((p) => {
+        const q = searchQuery.toLowerCase();
+        return p.name.toLowerCase().includes(q) || p.path.toLowerCase().includes(q);
+      })
+    : null;
 
   const orderedItems = getOrderedTree(config);
   const allGroups = collectAllGroups(config.projectTree ?? []);
@@ -466,7 +485,7 @@ export function ProjectList() {
         <Allotment.Pane minSize={100}>
           <div className="h-full flex flex-col overflow-hidden">
             <div
-              className="px-3 pt-3 pb-1.5 text-sm text-[var(--text-muted)] uppercase tracking-[0.12em] font-medium cursor-default"
+              className="px-3 pt-3 pb-1.5 flex items-center gap-1"
               onContextMenu={(e) => {
                 e.preventDefault();
                 showContextMenu(e.clientX, e.clientY, [
@@ -474,14 +493,75 @@ export function ProjectList() {
                 ]);
               }}
             >
-              Projects
+              <span className="flex-1 text-sm text-[var(--text-muted)] uppercase tracking-[0.12em] font-medium cursor-default">
+                Projects
+              </span>
+              <button
+                className={`w-5 h-5 flex items-center justify-center rounded transition-colors ${
+                  searchOpen
+                    ? 'text-[var(--accent)] bg-[var(--accent-subtle)]'
+                    : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                }`}
+                title="搜索项目 (Ctrl+F)"
+                onClick={() => (searchOpen ? closeSearch() : setSearchOpen(true))}
+              >
+                <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+                  <circle cx="5" cy="5" r="3.5" />
+                  <line x1="7.8" y1="7.8" x2="11" y2="11" />
+                </svg>
+              </button>
             </div>
 
+            {searchOpen && (
+              <div className="px-2 pb-1.5">
+                <div className="relative">
+                  <input
+                    ref={searchInputRef}
+                    className="w-full bg-[var(--bg-elevated)] border border-[var(--border-default)] focus:border-[var(--accent)] rounded-[var(--radius-sm)] px-2.5 py-1 text-xs text-[var(--text-primary)] outline-none placeholder:text-[var(--text-muted)] pr-6 transition-colors"
+                    placeholder="搜索项目名称或路径…"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') closeSearch();
+                    }}
+                  />
+                  {searchQuery && (
+                    <button
+                      className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+                      onClick={() => { setSearchQuery(''); searchInputRef.current?.focus(); }}
+                    >
+                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                        <line x1="1.5" y1="1.5" x2="8.5" y2="8.5" />
+                        <line x1="8.5" y1="1.5" x2="1.5" y2="8.5" />
+                      </svg>
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
             <div className="flex-1 overflow-y-auto px-1.5 space-y-0.5">
-              {orderedItems.map((item) =>
-                item.type === 'project'
-                  ? renderProjectItem(item.project, item.depth, item.parentGroupId ?? undefined)
-                  : renderGroup(item.group, item.depth)
+              {filteredProjects ? (
+                filteredProjects.length === 0 ? (
+                  <div className="px-2 py-3 text-xs text-[var(--text-muted)] text-center">无匹配项目</div>
+                ) : (
+                  filteredProjects.map((project) => (
+                    <div key={project.id}>
+                      {renderProjectItem(project, 0)}
+                      {searchQuery.trim() && (
+                        <div className="px-2.5 pb-0.5 text-[10px] text-[var(--text-muted)] truncate leading-tight -mt-0.5">
+                          {project.path}
+                        </div>
+                      )}
+                    </div>
+                  ))
+                )
+              ) : (
+                orderedItems.map((item) =>
+                  item.type === 'project'
+                    ? renderProjectItem(item.project, item.depth, item.parentGroupId ?? undefined)
+                    : renderGroup(item.group, item.depth)
+                )
               )}
             </div>
 
