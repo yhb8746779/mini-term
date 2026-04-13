@@ -80,6 +80,23 @@ fn strip_ansi_codes(s: &str) -> String {
     result
 }
 
+/// 应用退格语义：将每个 \x08 (BS) 视为"删除前一个字符"
+///
+/// zsh-syntax-highlighting 等插件在每次按键时会用 BS 回退再重绘带颜色的字符，
+/// 导致 PTY 流中出现 `c\bc` 这样的字节序列。strip_ansi 只去 ANSI 转义，
+/// 不处理 BS，会把 token 切成 `c\bc\bclaude` 之类的乱码，匹配失败。
+fn apply_backspaces(line: &str) -> String {
+    let mut result = String::new();
+    for ch in line.chars() {
+        if ch == '\x08' {
+            result.pop();
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 /// 判断一个 token 是否是 AI 命令（精确匹配或路径结尾匹配）
 fn is_ai_command_token(token: &str) -> bool {
     let t = token.to_lowercase();
@@ -158,7 +175,10 @@ fn line_contains_ai_command(line: &str) -> bool {
 /// 同时过滤非交互式标志（-v/--version/-h/--help 等），避免误识别
 fn output_contains_ai_command(output: &str) -> bool {
     let stripped = strip_ansi_codes(output).replace('\r', "\n");
-    stripped.lines().any(|line| line_contains_ai_command(line))
+    stripped.lines().any(|line| {
+        let collapsed = apply_backspaces(line);
+        line_contains_ai_command(&collapsed)
+    })
 }
 
 #[derive(Clone)]
@@ -1051,5 +1071,29 @@ mod tests {
         mgr.inject_pty_output(1, "user@host:~% claude --version");
         mgr.track_input(1, "\r");
         assert!(!mgr.is_ai_session(1));
+    }
+
+    // ── zsh-syntax-highlighting BS 重绘 + autosuggestion 真实字节流 ──────────
+    //
+    // 真实捕获自 macOS zsh + zsh-syntax-highlighting + zsh-autosuggestions：
+    // 用户输入 `c`，syntax-highlighting 用 `\b\x1b[1m\x1b[31mc\x1b[0m\x1b[39m`
+    // 把字符重写成红色，autosuggestion 在后面追加 `\x1b[90mlaude --model sonnet\x1b[39m`
+    // 然后 `\x1b[<n>D` 把光标拉回。用户按右箭头接受后再次重绘命令文本。
+    // strip_ansi 去掉转义后会留下 BS 字节，导致 split_whitespace 切出 `c\bc\bclaude` 乱码。
+    #[test]
+    fn zsh_syntax_highlight_backspace_rerender_detected() {
+        let raw = "yuhongbin@yuhongbindeMacBook-Pro jingju % c\x08\x1b[1m\x1b[31mc\x1b[0m\x1b[39m\x1b[90mlaude --model sonnet\x1b[39m\x1b[20D\x1b[0m\x1b[32mc\x1b[32ml\x1b[32ma\x1b[32mu\x1b[32md\x1b[32me\x1b[39m";
+        assert!(output_contains_ai_command(raw));
+    }
+
+    #[test]
+    fn apply_backspaces_collapses_rerender() {
+        // c<BS>c<BS>claude → claude
+        assert_eq!(apply_backspaces("c\x08c\x08claude"), "claude");
+        // 空字符串与无 BS 字符串保持不变
+        assert_eq!(apply_backspaces(""), "");
+        assert_eq!(apply_backspaces("claude"), "claude");
+        // BS 不能弹出已删完的栈
+        assert_eq!(apply_backspaces("\x08\x08abc"), "abc");
     }
 }
