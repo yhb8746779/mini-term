@@ -395,11 +395,30 @@ fn try_read_codex_session(
 // ─── Tauri Command ─────────────────────────────────────────────
 
 /// 同步扫描并返回排好序的 session 列表（供首次加载和后台刷新共用）
-fn do_scan(project_path: &str) -> Vec<AiSession> {
+fn do_scan(app: &AppHandle, project_path: &str) -> Vec<AiSession> {
+    let t0 = Instant::now();
+
+    let t_claude = Instant::now();
+    let claude_sessions = get_claude_sessions(project_path);
+    let claude_count = claude_sessions.len();
+    let claude_ms = t_claude.elapsed().as_millis();
+
+    let t_codex = Instant::now();
+    let codex_sessions = get_codex_sessions(project_path);
+    let codex_count = codex_sessions.len();
+    let codex_ms = t_codex.elapsed().as_millis();
+
     let mut sessions = Vec::new();
-    sessions.extend(get_claude_sessions(project_path));
-    sessions.extend(get_codex_sessions(project_path));
+    sessions.extend(claude_sessions);
+    sessions.extend(codex_sessions);
     sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    crate::perf_log::log_perf(app, "do_scan", &format!(
+        "project={} | claude_count={} | claude_ms={} | codex_count={} | codex_ms={} | session_count={} | cost_ms={}",
+        project_path, claude_count, claude_ms, codex_count, codex_ms,
+        sessions.len(), t0.elapsed().as_millis()
+    ));
+
     sessions
 }
 
@@ -413,7 +432,7 @@ fn refresh_in_background(app: AppHandle, cache: CacheMap, scanning: ScanningSet,
         }
     }
     thread::spawn(move || {
-        let sessions = do_scan(&project_path);
+        let sessions = do_scan(&app, &project_path);
         cache.lock().unwrap().insert(project_path.clone(), (sessions, Instant::now()));
         scanning.lock().unwrap().remove(&project_path);
         let _ = app.emit("sessions-updated", &project_path);
@@ -434,6 +453,7 @@ pub fn get_ai_sessions(
     project_path: String,
     force: Option<bool>,
 ) -> Result<SessionsResponse, String> {
+    let t0 = Instant::now();
     let cache_arc = cache.inner.clone();
     let scanning_arc = cache.scanning.clone();
     let force = force.unwrap_or(false);
@@ -451,15 +471,21 @@ pub fn get_ai_sessions(
             let need_refresh = force || elapsed >= CACHE_TTL;
             if need_refresh {
                 // 内部去重：已有线程时 refresh_in_background 直接跳过
-                refresh_in_background(app, cache_arc, scanning_arc, project_path);
+                refresh_in_background(app.clone(), cache_arc, scanning_arc, project_path.clone());
             }
-            Ok(SessionsResponse {
-                sessions,
-                scanning: need_refresh || already_scanning,
-            })
+            let scanning = need_refresh || already_scanning;
+            crate::perf_log::log_perf(&app, "get_ai_sessions", &format!(
+                "project={} | cache=hit | session_count={} | scanning={} | cost_ms={}",
+                project_path, sessions.len(), scanning, t0.elapsed().as_millis()
+            ));
+            Ok(SessionsResponse { sessions, scanning })
         }
         None => {
-            refresh_in_background(app, cache_arc, scanning_arc, project_path);
+            refresh_in_background(app.clone(), cache_arc, scanning_arc, project_path.clone());
+            crate::perf_log::log_perf(&app, "get_ai_sessions", &format!(
+                "project={} | cache=miss | session_count=0 | scanning=true | cost_ms={}",
+                project_path, t0.elapsed().as_millis()
+            ));
             Ok(SessionsResponse { sessions: vec![], scanning: true })
         }
     }

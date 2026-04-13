@@ -125,6 +125,7 @@ export function GitHistory() {
   const project = config.projects.find((p) => p.id === activeProjectId);
 
   const [repos, setRepos] = useState<GitRepoInfo[]>([]);
+  const [reposLoading, setReposLoading] = useState(false);
   const [expandedRepos, setExpandedRepos] = useState<Set<string>>(new Set());
   const [repoStates, setRepoStates] = useState<Map<string, RepoState>>(new Map());
   const [diffModal, setDiffModal] = useState<{
@@ -150,14 +151,48 @@ export function GitHistory() {
 
   const loadRepos = useCallback((force = false) => {
     if (!project) return;
-    invoke<GitRepoInfo[]>('discover_git_repos', { projectPath: project.path, force })
-      .then(setRepos)
-      .catch(() => setRepos([]));
+    invoke<GitRepoInfo[]>('discover_git_repos', { projectPath: project.path, force: force || undefined })
+      .then((data) => {
+        setRepos(data);
+        // 拿到非空数据（缓存命中或 stale）说明不需要等事件，直接结束 loading
+        if (data.length > 0) setReposLoading(false);
+        // 空数据：缓存 miss，保持 loading=true 等待 git-repos-ready 事件
+      })
+      .catch(() => {
+        setRepos([]);
+        setReposLoading(false);
+      });
   }, [project?.path]);
 
+  // 盘符根目录（如 H:\）不自动扫，仓库太多
+  function isDriveRoot(path: string): boolean {
+    return /^[A-Za-z]:[/\\]?$/.test(path);
+  }
+
   useEffect(() => {
-    loadRepos();
+    // 切项目时先重置状态
+    setRepos([]);
+    setReposLoading(false);
+    if (!project) return;
+
+    if (isDriveRoot(project.path)) {
+      // 盘符根目录：不自动扫，等用户手动刷新
+      return;
+    }
+
+    // 普通项目：延迟一帧触发，避免抢占首屏渲染关键路径
+    setReposLoading(true);
+    requestAnimationFrame(() => {
+      loadRepos();
+    });
   }, [loadRepos]);
+
+  // 后台仓库扫描完成后回填（首次 miss / stale 后台刷）
+  useTauriEvent<{ projectPath: string; repos: GitRepoInfo[] }>('git-repos-ready', useCallback((payload) => {
+    if (!project || payload.projectPath !== project.path) return;
+    setRepos(payload.repos);
+    setReposLoading(false);
+  }, [project?.path]));
 
   const loadBranches = useCallback(async (repoPath: string) => {
     try {
@@ -533,6 +568,7 @@ export function GitHistory() {
         <button
           className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-sm"
           onClick={() => {
+            setReposLoading(true);
             loadRepos(true); // 手动刷新必须绕过缓存
             for (const repoPath of expandedRepos) {
               loadCommits(repoPath);
@@ -546,7 +582,24 @@ export function GitHistory() {
       </div>
 
       <div className="flex-1 overflow-y-auto px-1" ref={scrollRef} onScroll={handleScroll}>
-        {repos.length === 0 && (
+        {repos.length === 0 && reposLoading && (
+          <div className="text-center text-[var(--text-muted)] text-sm py-6">
+            扫描 Git 仓库中…
+          </div>
+        )}
+        {repos.length === 0 && !reposLoading && project && isDriveRoot(project.path) && (
+          <div className="text-center text-[var(--text-muted)] text-sm py-6 px-3 leading-relaxed">
+            当前为磁盘根目录，Git 仓库较多
+            <br />
+            <span
+              className="text-[var(--accent)] cursor-pointer hover:underline"
+              onClick={() => { setReposLoading(true); loadRepos(true); }}
+            >
+              点击加载
+            </span>
+          </div>
+        )}
+        {repos.length === 0 && !reposLoading && project && !isDriveRoot(project.path) && (
           <div className="text-center text-[var(--text-muted)] text-sm py-6">
             未发现 Git 仓库
           </div>

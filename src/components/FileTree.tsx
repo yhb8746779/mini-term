@@ -11,6 +11,11 @@ import { DiffModal } from './DiffModal';
 import { FileViewerModal } from './FileViewerModal';
 import type { FileEntry, FsChangePayload, GitFileStatus, PtyOutputPayload } from '../types';
 
+// ─── Debug experiment switches ─────────────────────────────────
+/** true = 切换项目时跳过 get_git_status 首次加载，测试 git status 是否是主卡点 */
+const DEBUG_SKIP_GIT_STATUS_ON_SWITCH = false;
+// ───────────────────────────────────────────────────────────────
+
 interface TreeNodeProps {
   entry: FileEntry;
   projectRoot: string;
@@ -295,9 +300,9 @@ export function FileTree() {
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const rootEntriesCache = useRef<Map<string, FileEntry[]>>(new Map());
 
-  const loadGitStatus = useCallback(() => {
+  const loadGitStatus = useCallback((force = false) => {
     if (!project) return;
-    invoke<GitFileStatus[]>('get_git_status', { projectPath: project.path })
+    invoke<GitFileStatus[]>('get_git_status', { projectPath: project.path, force: force || undefined })
       .then((statuses) => {
         const map = new Map<string, GitFileStatus>();
         for (const s of statuses) map.set(s.path, s);
@@ -307,12 +312,15 @@ export function FileTree() {
   }, [project?.path]);
 
   useEffect(() => {
-    loadGitStatus();
+    if (!DEBUG_SKIP_GIT_STATUS_ON_SWITCH) {
+      loadGitStatus(false);
+    }
   }, [loadGitStatus]);
 
   const debouncedRefresh = useCallback(() => {
     if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
-    refreshTimerRef.current = setTimeout(loadGitStatus, 500);
+    // fs-change 触发时强制绕过缓存，确保文件修改后立即看到最新状态
+    refreshTimerRef.current = setTimeout(() => loadGitStatus(true), 500);
   }, [loadGitStatus]);
 
   const loadRootEntries = useCallback(() => {
@@ -354,6 +362,14 @@ export function FileTree() {
       debouncedRefresh();
     }
   }, [project?.path, debouncedRefresh]));
+
+  // 后台 git status 扫描完成后更新（冷扫不阻塞 UI，由此事件填入结果）
+  useTauriEvent<{ projectPath: string; statuses: GitFileStatus[] }>('git-status-ready', useCallback((payload) => {
+    if (!project || payload.projectPath !== project.path) return;
+    const map = new Map<string, GitFileStatus>();
+    for (const s of payload.statuses) map.set(s.path, s);
+    setGitStatusMap(map);
+  }, [project?.path]));
 
   const GIT_PATTERNS = [/create mode/, /Switched to/, /Already up to date/, /insertions?\(\+\)/, /deletions?\(-\)/];
   useTauriEvent<PtyOutputPayload>('pty-output', useCallback((payload: PtyOutputPayload) => {

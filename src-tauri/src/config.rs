@@ -335,9 +335,15 @@ pub fn load_config(app: AppHandle) -> AppConfig {
 
 #[tauri::command]
 pub fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
+    let t0 = std::time::Instant::now();
+    let projects_count = config.projects.len();
     let path = config_path(&app);
     let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    fs::write(&path, json).map_err(|e| e.to_string())
+    fs::write(&path, json).map_err(|e| e.to_string())?;
+    crate::perf_log::log_perf(&app, "save_config", &format!(
+        "projects_count={} | cost_ms={}", projects_count, t0.elapsed().as_millis()
+    ));
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,24 +1,61 @@
 use git2::{Repository, Status, StatusOptions};
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter};
 
 /// discover_git_repos 结果缓存 TTL（仓库结构变动极少，5 分钟内无需重扫）
 const GIT_REPO_CACHE_TTL: Duration = Duration::from_secs(300);
 
+/// get_git_status 结果缓存 TTL（120 秒）
+/// 对 H:\ 这类有 61 个仓库 + 7406 个变更文件的重型项目，全量扫描一次要 8-10 秒，
+/// 必须缓存；120 秒内重复切换直接返回旧数据，用户手动刷新或 fs-change 触发时强刷。
+const GIT_STATUS_CACHE_TTL: Duration = Duration::from_secs(120);
+
 type RepoCacheMap = Arc<Mutex<HashMap<String, (Vec<GitRepoInfo>, Instant)>>>;
+type StatusCacheMap = Arc<Mutex<HashMap<String, (Vec<GitFileStatus>, Instant)>>>;
+/// 正在后台扫描中的 projectPath 集合，避免同一项目并发重复扫描
+type StatusScanningSet = Arc<Mutex<HashSet<String>>>;
+type RepoScanningSet = Arc<Mutex<HashSet<String>>>;
 
 pub struct GitRepoCache {
     inner: RepoCacheMap,
+    /// get_git_status 的结果缓存（projectPath → (statuses, fetched_at)）
+    status: StatusCacheMap,
+    /// 正在后台扫描 git status 的项目路径集合
+    status_scanning: StatusScanningSet,
+    /// 正在后台扫描 git repos 的项目路径集合
+    repo_scanning: RepoScanningSet,
 }
 
 impl GitRepoCache {
     pub fn new() -> Self {
-        Self { inner: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            status: Arc::new(Mutex::new(HashMap::new())),
+            status_scanning: Arc::new(Mutex::new(HashSet::new())),
+            repo_scanning: Arc::new(Mutex::new(HashSet::new())),
+        }
     }
+}
+
+/// 后台 git status 扫描完成后推送给前端的事件载荷
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct GitStatusReadyPayload {
+    project_path: String,
+    statuses: Vec<GitFileStatus>,
+}
+
+/// 后台 git repos 扫描完成后推送给前端的事件载荷
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct GitReposReadyPayload {
+    project_path: String,
+    repos: Vec<GitRepoInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -267,65 +304,242 @@ fn find_repos(project_path: &Path) -> Vec<(String, PathBuf, Repository)> {
     repos
 }
 
-#[tauri::command]
-pub fn get_git_status(project_path: String) -> Result<Vec<GitFileStatus>, String> {
-    let path = Path::new(&project_path);
-    let repos = find_repos(path);
+/// 在独立 OS 线程中执行 git status 扫描，完成后写缓存并 emit `git-status-ready`。
+/// 使用 OS 线程而非 async，避免 git2::Repository 不满足 Send 的问题。
+fn scan_git_status_in_background(
+    app: AppHandle,
+    cache_status: StatusCacheMap,
+    cache_scanning: StatusScanningSet,
+    project_path: String,
+) {
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        let path = Path::new(&project_path);
+        let t_find = Instant::now();
+        let repos = find_repos(path);
+        let find_ms = t_find.elapsed().as_millis();
+        let repo_count = repos.len();
 
-    if repos.is_empty() {
-        return Ok(Vec::new());
+        let mut all = Vec::new();
+        for (_, _, repo) in &repos {
+            if let Ok(mut files) = collect_repo_status(repo, Some(path)) {
+                all.append(&mut files);
+            }
+        }
+        let cost_ms = t0.elapsed().as_millis();
+
+        // 写缓存
+        cache_status.lock().unwrap().insert(project_path.clone(), (all.clone(), Instant::now()));
+        // 从扫描中集合移除
+        cache_scanning.lock().unwrap().remove(&project_path);
+
+        crate::perf_log::log_perf(&app, "get_git_status", &format!(
+            "project={} | cache=miss(bg) | find_ms={} | repo_count={} | status_count={} | cost_ms={}",
+            project_path, find_ms, repo_count, all.len(), cost_ms
+        ));
+
+        // 通知前端
+        app.emit("git-status-ready", GitStatusReadyPayload {
+            project_path,
+            statuses: all,
+        }).ok();
+    });
+}
+
+/// 启动后台扫描（若同一 projectPath 未在扫描中）。
+/// 返回是否实际触发了新扫描。
+fn maybe_start_bg_scan(
+    app: AppHandle,
+    cache_status: StatusCacheMap,
+    cache_scanning: StatusScanningSet,
+    project_path: String,
+) -> bool {
+    let mut set = cache_scanning.lock().unwrap();
+    if set.contains(&project_path) {
+        return false; // 已有扫描进行中，不重复启动
     }
+    set.insert(project_path.clone());
+    drop(set);
+    scan_git_status_in_background(app, cache_status, cache_scanning, project_path);
+    true
+}
 
-    let mut all = Vec::new();
-    for (_, _, repo) in &repos {
-        if let Ok(mut files) = collect_repo_status(repo, Some(path)) {
-            all.append(&mut files);
+#[tauri::command]
+pub fn get_git_status(
+    app: AppHandle,
+    cache: tauri::State<'_, GitRepoCache>,
+    project_path: String,
+    force: Option<bool>,
+) -> Result<Vec<GitFileStatus>, String> {
+    let t0 = Instant::now();
+    let is_force = force.unwrap_or(false);
+
+    // 检查缓存
+    let cached = {
+        let guard = cache.status.lock().unwrap();
+        guard.get(&project_path).map(|(s, t)| (s.clone(), t.elapsed()))
+    };
+
+    match cached {
+        Some((statuses, elapsed)) if elapsed < GIT_STATUS_CACHE_TTL && !is_force => {
+            // 缓存新鲜且非强制刷新 → 直接返回，不扫描
+            crate::perf_log::log_perf(&app, "get_git_status", &format!(
+                "project={} | cache=hit | status_count={} | cost_ms={}",
+                project_path, statuses.len(), t0.elapsed().as_millis()
+            ));
+            Ok(statuses)
+        }
+        Some((stale_data, _)) => {
+            // 缓存过期或强制刷新 → 立即返回旧数据（stale-while-revalidate），后台重扫
+            let started = maybe_start_bg_scan(
+                app.clone(),
+                cache.status.clone(),
+                cache.status_scanning.clone(),
+                project_path.clone(),
+            );
+            crate::perf_log::log_perf(&app, "get_git_status", &format!(
+                "project={} | cache=stale | bg_started={} | status_count={} | cost_ms={}",
+                project_path, started, stale_data.len(), t0.elapsed().as_millis()
+            ));
+            Ok(stale_data)
+        }
+        None => {
+            // 首次访问，缓存为空 → 返回空列表，后台扫描，完成后 event 通知
+            let started = maybe_start_bg_scan(
+                app.clone(),
+                cache.status.clone(),
+                cache.status_scanning.clone(),
+                project_path.clone(),
+            );
+            crate::perf_log::log_perf(&app, "get_git_status", &format!(
+                "project={} | cache=empty | bg_started={} | cost_ms={}",
+                project_path, started, t0.elapsed().as_millis()
+            ));
+            Ok(vec![])
         }
     }
-    Ok(all)
+}
+
+/// 在独立 OS 线程中扫描仓库列表，完成后写缓存并 emit `git-repos-ready`。
+fn scan_git_repos_in_background(
+    app: AppHandle,
+    cache_inner: RepoCacheMap,
+    cache_scanning: RepoScanningSet,
+    project_path: String,
+) {
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        let path = Path::new(&project_path);
+
+        let repos: Vec<GitRepoInfo> = find_repos(path)
+            .into_iter()
+            .map(|(name, abs_path, repo)| {
+                let current_branch = repo.head().ok().and_then(|h| {
+                    if h.is_branch() {
+                        h.shorthand().map(|s| s.to_string())
+                    } else {
+                        h.target().map(|oid| {
+                            let s = oid.to_string();
+                            format!("({})", &s[..7.min(s.len())])
+                        })
+                    }
+                });
+                GitRepoInfo {
+                    name,
+                    path: abs_path.to_string_lossy().to_string(),
+                    current_branch,
+                }
+            })
+            .collect();
+
+        let cost_ms = t0.elapsed().as_millis();
+        let repo_count = repos.len();
+
+        cache_inner.lock().unwrap().insert(project_path.clone(), (repos.clone(), Instant::now()));
+        cache_scanning.lock().unwrap().remove(&project_path);
+
+        crate::perf_log::log_perf(&app, "discover_git_repos", &format!(
+            "project={} | cache=miss(bg) | repo_count={} | cost_ms={}",
+            project_path, repo_count, cost_ms
+        ));
+
+        app.emit("git-repos-ready", GitReposReadyPayload {
+            project_path,
+            repos,
+        }).ok();
+    });
+}
+
+/// 启动后台仓库扫描（若同一 projectPath 未在扫描中）。
+fn maybe_start_repo_bg_scan(
+    app: AppHandle,
+    cache_inner: RepoCacheMap,
+    cache_scanning: RepoScanningSet,
+    project_path: String,
+) -> bool {
+    let mut set = cache_scanning.lock().unwrap();
+    if set.contains(&project_path) {
+        return false;
+    }
+    set.insert(project_path.clone());
+    drop(set);
+    scan_git_repos_in_background(app, cache_inner, cache_scanning, project_path);
+    true
 }
 
 #[tauri::command]
 pub fn discover_git_repos(
+    app: AppHandle,
     cache: tauri::State<'_, GitRepoCache>,
     project_path: String,
     force: Option<bool>,
 ) -> Result<Vec<GitRepoInfo>, String> {
-    // 非强制刷新时命中缓存直接返回，避免每次切换项目都递归扫描目录树
-    if !force.unwrap_or(false) {
+    let t0 = Instant::now();
+    let is_force = force.unwrap_or(false);
+
+    let cached = {
         let guard = cache.inner.lock().unwrap();
-        if let Some((repos, fetched_at)) = guard.get(&project_path) {
-            if fetched_at.elapsed() < GIT_REPO_CACHE_TTL {
-                return Ok(repos.clone());
-            }
+        guard.get(&project_path).map(|(r, t)| (r.clone(), t.elapsed()))
+    };
+
+    match cached {
+        Some((repos, elapsed)) if elapsed < GIT_REPO_CACHE_TTL && !is_force => {
+            // 缓存新鲜且非强制刷新
+            crate::perf_log::log_perf(&app, "discover_git_repos", &format!(
+                "project={} | cache=hit | repo_count={} | cost_ms={}",
+                project_path, repos.len(), t0.elapsed().as_millis()
+            ));
+            Ok(repos)
+        }
+        Some((stale_repos, _)) => {
+            // 缓存过期或 force=true → 立即返回旧数据，后台重扫
+            let started = maybe_start_repo_bg_scan(
+                app.clone(),
+                cache.inner.clone(),
+                cache.repo_scanning.clone(),
+                project_path.clone(),
+            );
+            crate::perf_log::log_perf(&app, "discover_git_repos", &format!(
+                "project={} | cache=stale | bg_started={} | repo_count={} | cost_ms={}",
+                project_path, started, stale_repos.len(), t0.elapsed().as_millis()
+            ));
+            Ok(stale_repos)
+        }
+        None => {
+            // 首次访问，缓存为空 → 返回空数组，后台扫描，完成后 event 通知
+            let started = maybe_start_repo_bg_scan(
+                app.clone(),
+                cache.inner.clone(),
+                cache.repo_scanning.clone(),
+                project_path.clone(),
+            );
+            crate::perf_log::log_perf(&app, "discover_git_repos", &format!(
+                "project={} | cache=empty | bg_started={} | cost_ms={}",
+                project_path, started, t0.elapsed().as_millis()
+            ));
+            Ok(vec![])
         }
     }
-
-    let path = Path::new(&project_path);
-    let repos: Vec<GitRepoInfo> = find_repos(path)
-        .into_iter()
-        .map(|(name, abs_path, repo)| {
-            let current_branch = repo.head().ok().and_then(|h| {
-                if h.is_branch() {
-                    h.shorthand().map(|s| s.to_string())
-                } else {
-                    // detached HEAD — show short hash
-                    h.target().map(|oid| {
-                        let s = oid.to_string();
-                        format!("({})", &s[..7.min(s.len())])
-                    })
-                }
-            });
-            GitRepoInfo {
-                name,
-                path: abs_path.to_string_lossy().to_string(),
-                current_branch,
-            }
-        })
-        .collect();
-
-    cache.inner.lock().unwrap().insert(project_path, (repos.clone(), Instant::now()));
-    Ok(repos)
 }
 
 #[tauri::command]

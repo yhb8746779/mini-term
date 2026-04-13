@@ -17,6 +17,12 @@ import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
 import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus } from './types';
 
+// ─── Debug experiment switches ─────────────────────────────────
+// 将其中一个改为 true 做 A/B 对比，找到主卡点后恢复 false
+/** true = 右侧只渲染当前项目的 TerminalArea（不保活其他项目），测试 TerminalArea 保活是否是卡顿主因 */
+const DEBUG_ONLY_RENDER_ACTIVE_TERMINAL = false;
+// ───────────────────────────────────────────────────────────────
+
 export function App() {
   const [configLoaded, setConfigLoaded] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
@@ -107,15 +113,33 @@ export function App() {
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 
-  // 切换项目时保存前一个项目的布局
+  // 切换项目时保存前一个项目的布局，并记录性能埋点
   const prevProjectRef = useRef<string | null>(null);
   useEffect(() => {
-    if (prevProjectRef.current && prevProjectRef.current !== activeProjectId) {
-      flushLayoutToConfig(prevProjectRef.current);
-      flushExpandedDirsToConfig(prevProjectRef.current);
+    const from = prevProjectRef.current;
+    const to = activeProjectId;
+    if (from && from !== to) {
+      const t0 = performance.now();
+      // switch_start：切换动作发起时刻
+      invoke('log_perf_from_frontend', {
+        scope: 'switch_start',
+        details: `from=${from} | to=${to ?? 'null'}`,
+      }).catch(() => {});
+      // switch_paint_done：双 rAF 后首屏绘制完成估算
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          const costMs = Math.round(performance.now() - t0);
+          invoke('log_perf_from_frontend', {
+            scope: 'switch_paint_done',
+            details: `to=${to ?? 'null'} | cost_ms=${costMs}`,
+          }).catch(() => {});
+        });
+      });
+      flushLayoutToConfig(from);
+      flushExpandedDirsToConfig(from);
       persistConfig();
     }
-    prevProjectRef.current = activeProjectId;
+    prevProjectRef.current = to;
   }, [activeProjectId]);
 
   // 防抖保存布局尺寸
@@ -194,15 +218,26 @@ export function App() {
 
           <Allotment.Pane>
             <div className="relative h-full">
-              {config.projects.map((project) => (
-                <div
-                  key={project.id}
-                  className="absolute inset-0"
-                  style={{ display: project.id === activeProjectId ? 'block' : 'none' }}
-                >
-                  <TerminalArea projectId={project.id} projectPath={project.path} />
-                </div>
-              ))}
+              {DEBUG_ONLY_RENDER_ACTIVE_TERMINAL
+                ? /* 实验模式：只渲染当前项目，不保活其他 TerminalArea */
+                  config.projects
+                    .filter((p) => p.id === activeProjectId)
+                    .map((project) => (
+                      <div key={project.id} className="absolute inset-0">
+                        <TerminalArea projectId={project.id} projectPath={project.path} />
+                      </div>
+                    ))
+                : /* 默认模式：全部挂载，仅 display 控制可见性（保活终端进程） */
+                  config.projects.map((project) => (
+                    <div
+                      key={project.id}
+                      className="absolute inset-0"
+                      style={{ display: project.id === activeProjectId ? 'block' : 'none' }}
+                    >
+                      <TerminalArea projectId={project.id} projectPath={project.path} />
+                    </div>
+                  ))
+              }
               {config.projects.length === 0 && (
                 <div className="h-full bg-[var(--bg-terminal)] flex items-center justify-center text-[var(--text-muted)] text-sm">
                   请先在左栏添加项目

@@ -43,7 +43,8 @@ fn should_ignore(name: &str, full_path: &Path, is_dir: bool, gitignore: &Option<
 }
 
 #[tauri::command]
-pub fn list_directory(project_root: String, path: String) -> Result<Vec<FileEntry>, String> {
+pub fn list_directory(app: AppHandle, project_root: String, path: String) -> Result<Vec<FileEntry>, String> {
+    let t0 = Instant::now();
     let dir = Path::new(&path);
     if !dir.is_dir() {
         return Err(format!("Not a directory: {}", path));
@@ -78,6 +79,10 @@ pub fn list_directory(project_root: String, path: String) -> Result<Vec<FileEntr
             .then_with(|| a.ignored.cmp(&b.ignored))
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
+    crate::perf_log::log_perf(&app, "list_directory", &format!(
+        "path={} | entry_count={} | cost_ms={}",
+        path, entries.len(), t0.elapsed().as_millis()
+    ));
     Ok(entries)
 }
 

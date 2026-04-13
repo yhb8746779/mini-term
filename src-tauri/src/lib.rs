@@ -3,6 +3,7 @@ mod config;
 mod editor;
 mod fs;
 mod git;
+mod perf_log;
 mod process_monitor;
 mod pty;
 
@@ -50,6 +51,9 @@ pub fn run() {
             git::git_pull,
             git::git_push,
             editor::open_in_vscode,
+            perf_log::clear_perf_log,
+            perf_log::read_perf_log,
+            perf_log::log_perf_from_frontend,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
