@@ -149,7 +149,15 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     // WebGL 不支持
   }
 
-  // 剪贴板快捷键
+  // 剪贴板快捷键 + macOS WKWebView Ctrl 键修复
+  // macOS 的 WKWebView 对 Ctrl+A/E/K/U/W 等有系统级文本编辑绑定（继承自 NeXTSTEP），
+  // 会在 OS 层面干扰 xterm.js 隐藏 textarea 的输入，导致这些控制字符无法正确送到 PTY。
+  // 系统 Terminal.app 是原生应用不受影响，但 Mini-Term 需要显式拦截并手动发送。
+  const MACOS_CTRL_MAP: Partial<Record<string, string>> = {
+    KeyA: '\x01', KeyB: '\x02', KeyE: '\x05', KeyF: '\x06',
+    KeyK: '\x0b', KeyL: '\x0c', KeyN: '\x0e', KeyP: '\x10',
+    KeyU: '\x15', KeyW: '\x17', KeyY: '\x19',
+  };
   term.attachCustomKeyEventHandler((e) => {
     if (e.type !== 'keydown') return true;
     if (e.ctrlKey && e.shiftKey && e.code === 'KeyC') {
@@ -161,6 +169,15 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
       e.preventDefault();
       void pasteToTerminal(ptyId);
       return false;
+    }
+    // macOS 只在 Ctrl 单独按下时（无 Shift/Meta/Alt）才有系统绑定干扰
+    if (e.ctrlKey && !e.shiftKey && !e.metaKey && !e.altKey) {
+      const data = MACOS_CTRL_MAP[e.code];
+      if (data) {
+        e.preventDefault();
+        void enqueuePtyWrite(ptyId, data);
+        return false;
+      }
     }
     return true;
   });
