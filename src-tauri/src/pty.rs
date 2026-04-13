@@ -80,36 +80,85 @@ fn strip_ansi_codes(s: &str) -> String {
     result
 }
 
-/// 检查 PTY 输出中是否包含 AI 命令被 echo（例如 "PS C:\> claude" 或单独的 "claude"）
+/// 判断一个 token 是否是 AI 命令（精确匹配或路径结尾匹配）
+fn is_ai_command_token(token: &str) -> bool {
+    let t = token.to_lowercase();
+    AI_COMMANDS.iter().any(|&ai| {
+        t == ai
+            || t.ends_with(&format!("/{ai}"))
+            || t.ends_with(&format!("\\{ai}"))
+    })
+}
+
+/// 判断参数迭代器中是否包含非交互式标志（-v/--version/-h/--help/-p/--print）
+fn has_non_interactive_flag<'a>(args: impl Iterator<Item = &'a str>) -> bool {
+    args.into_iter().any(|w| NON_INTERACTIVE_FLAGS.iter().any(|&f| w == f))
+}
+
+/// 检查单行文本是否含有 AI 命令的 echo。
+///
+/// 三层识别策略：
+/// 1. **提示符 fast path**：
+///    - 终端提示符（`>` `$` `%` `#`）：出现在 prompt 末尾，命令紧随其后；
+///      用 rfind 找最后一个，仅检查其后首 token。
+///    - Unicode 主题提示符（`❯` `➜` `›` `λ`）：出现在行首，命令在目录信息之后；
+///      扫描其后所有 token，找到第一个 AI 命令 token。
+/// 2. **Token fallback**：无提示符时，对整行首 token 做检查。
+/// 3. **保守性约束**：fallback 时只匹配行首第一个 token，防止
+///    `npm install @anthropic-ai/claude-sdk` 等中间词被误判。
+fn line_contains_ai_command(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+
+    // 终端提示符：出现在行尾附近，命令紧跟其后，只检查首 token
+    const TERMINAL_PROMPT_CHARS: &[char] = &['>', '$', '%', '#'];
+    // Unicode 主题提示符：出现在行首，命令在目录名之后，需扫描所有 token
+    const UNICODE_PROMPT_CHARS: &[char] = &['❯', '➜', '›', 'λ'];
+
+    // 第一层：先找终端提示符（rfind，命中最靠近命令的那个）
+    if let Some(pos) = line.rfind(TERMINAL_PROMPT_CHARS) {
+        let ch = line[pos..].chars().next().unwrap();
+        let cmd_part = line[pos + ch.len_utf8()..].trim();
+        let mut words = cmd_part.split_whitespace();
+        let first = words.next().unwrap_or("");
+        if is_ai_command_token(first) {
+            return !has_non_interactive_flag(words);
+        }
+        // 终端提示符存在但其后首 token 不是 AI → 此行不匹配
+        return false;
+    }
+
+    // 第一层（续）：Unicode 主题提示符（❯ ➜ › λ）位于行首，命令在目录信息之后；
+    // 扫描提示符后所有 token，找到第一个 AI 命令 token。
+    if let Some(pos) = line.rfind(UNICODE_PROMPT_CHARS) {
+        let ch = line[pos..].chars().next().unwrap();
+        let cmd_part = line[pos + ch.len_utf8()..].trim();
+        let tokens: Vec<&str> = cmd_part.split_whitespace().collect();
+        for (i, &tok) in tokens.iter().enumerate() {
+            if is_ai_command_token(tok) {
+                return !has_non_interactive_flag(tokens[i + 1..].iter().copied());
+            }
+        }
+        return false;
+    }
+
+    // 第二层 + 第三层：整行 token fallback，只看行首第一个 token
+    let mut words = line.split_whitespace();
+    let first = words.next().unwrap_or("");
+    if is_ai_command_token(first) {
+        return !has_non_interactive_flag(words);
+    }
+
+    false
+}
+
+/// 检查 PTY 输出中是否包含 AI 命令被 echo（支持 PS/bash/zsh/fish/主题提示符）
 /// 同时过滤非交互式标志（-v/--version/-h/--help 等），避免误识别
 fn output_contains_ai_command(output: &str) -> bool {
     let stripped = strip_ansi_codes(output).replace('\r', "\n");
-    for line in stripped.lines() {
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        // 取提示符（> 或 $）后的命令部分（处理 PowerShell "PS C:\> cmd" 和
-        // bash "user@host:~$ cmd" 格式）；若无提示符则检查整行。
-        let cmd_part = line.rfind(|c| c == '>' || c == '$')
-            .map(|pos| &line[pos + 1..])
-            .unwrap_or(line)
-            .trim();
-        let mut words = cmd_part.split_whitespace();
-        let first = words.next().unwrap_or("").to_lowercase();
-        let is_ai = AI_COMMANDS.iter().any(|&ai| {
-            first == ai
-                || first.ends_with(&format!("/{ai}"))
-                || first.ends_with(&format!("\\{ai}"))
-        });
-        if is_ai {
-            let has_non_interactive = words.any(|w| {
-                NON_INTERACTIVE_FLAGS.iter().any(|&f| w == f)
-            });
-            if !has_non_interactive {
-                return true;
-            }
-        }
-    }
-    false
+    stripped.lines().any(|line| line_contains_ai_command(line))
 }
 
 #[derive(Clone)]
@@ -868,5 +917,139 @@ mod tests {
     #[test]
     fn output_contains_ai_command_with_carriage_return_true() {
         assert!(output_contains_ai_command("PS C:\\workspace> cl\rPS C:\\workspace> claude --model sonnet"));
+    }
+
+    // ── 扩展提示符：zsh % / root # / oh-my-zsh ➜ / Pure ❯ / fish › / λ ──
+
+    #[test]
+    fn echo_zsh_percent_prompt_claude_detected() {
+        assert!(output_contains_ai_command("user@host:~% claude"));
+    }
+
+    #[test]
+    fn echo_zsh_percent_prompt_claude_with_args_detected() {
+        assert!(output_contains_ai_command("user@host:~/projects% claude --model sonnet"));
+    }
+
+    #[test]
+    fn echo_zsh_percent_prompt_codex_detected() {
+        assert!(output_contains_ai_command("yhb@macbook:~% codex"));
+    }
+
+    #[test]
+    fn echo_bash_root_hash_prompt_claude_detected() {
+        assert!(output_contains_ai_command("root@server:/# claude --model sonnet"));
+    }
+
+    #[test]
+    fn echo_bash_root_hash_prompt_codex_detected() {
+        assert!(output_contains_ai_command("root@ubuntu:~# codex"));
+    }
+
+    #[test]
+    fn echo_ohmyzsh_arrow_prompt_claude_detected() {
+        // oh-my-zsh arrow theme: ➜  <dir> command
+        assert!(output_contains_ai_command("➜  mini-term claude"));
+    }
+
+    #[test]
+    fn echo_pure_prompt_claude_detected() {
+        // Pure prompt: ❯ command
+        assert!(output_contains_ai_command("❯ claude --model opus"));
+    }
+
+    #[test]
+    fn echo_pure_prompt_codex_detected() {
+        assert!(output_contains_ai_command("❯ codex"));
+    }
+
+    #[test]
+    fn echo_narrow_angle_prompt_claude_detected() {
+        // › prompt (fish / some themes)
+        assert!(output_contains_ai_command("› claude"));
+    }
+
+    #[test]
+    fn echo_lambda_prompt_claude_detected() {
+        // λ prompt
+        assert!(output_contains_ai_command("λ claude --model sonnet"));
+    }
+
+    // ── 扩展提示符：非交互标志仍需过滤 ──────────────────────────────────
+
+    #[test]
+    fn echo_zsh_percent_claude_version_not_detected() {
+        assert!(!output_contains_ai_command("user@host:~% claude --version"));
+    }
+
+    #[test]
+    fn echo_zsh_percent_claude_help_not_detected() {
+        assert!(!output_contains_ai_command("user@host:~% claude -h"));
+    }
+
+    #[test]
+    fn echo_pure_prompt_claude_version_not_detected() {
+        assert!(!output_contains_ai_command("❯ claude -v"));
+    }
+
+    #[test]
+    fn echo_root_hash_codex_help_not_detected() {
+        assert!(!output_contains_ai_command("root@host:~# codex --help"));
+    }
+
+    // ── Token fallback（无提示符）：保守性约束验证 ────────────────────────
+
+    #[test]
+    fn token_fallback_plain_claude_detected() {
+        // 无提示符，纯 "claude" 行（terminal 回显）
+        assert!(output_contains_ai_command("claude"));
+        assert!(output_contains_ai_command("codex"));
+        assert!(output_contains_ai_command("gemini --model flash"));
+    }
+
+    #[test]
+    fn npm_install_claude_sdk_not_false_positive() {
+        // claude 在中间 token，不应触发
+        assert!(!output_contains_ai_command("npm install @anthropic-ai/claude-sdk"));
+    }
+
+    #[test]
+    fn echo_claude_sdk_package_name_not_false_positive() {
+        // claude 出现在包名末尾但不是首 token
+        assert!(!output_contains_ai_command("pip install anthropic-claude"));
+    }
+
+    #[test]
+    fn grep_result_line_not_false_positive() {
+        // grep 结果中包含 "claude" 关键字，不应触发
+        assert!(!output_contains_ai_command("README.md:5: uses claude for AI features"));
+    }
+
+    // ── PSReadLine / zsh autosuggestion 接受路径 ──────────────────────────
+
+    #[test]
+    fn psreadline_zsh_autosuggestion_accept_detected() {
+        // 模拟 zsh autosuggestion：右箭头接受后 PTY 渲染提示行，input_buf 为空
+        let mgr = PtyManager::new();
+        mgr.inject_pty_output(1, "user@host:~% claude --model sonnet");
+        mgr.track_input(1, "\r");
+        assert!(mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn pure_prompt_autosuggestion_accept_detected() {
+        let mgr = PtyManager::new();
+        mgr.inject_pty_output(1, "❯ claude");
+        mgr.track_input(1, "\r");
+        assert!(mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn zsh_percent_autosuggestion_version_flag_not_detected() {
+        // autosuggestion 接受了带 --version 的命令，不应触发 AI 会话
+        let mgr = PtyManager::new();
+        mgr.inject_pty_output(1, "user@host:~% claude --version");
+        mgr.track_input(1, "\r");
+        assert!(!mgr.is_ai_session(1));
     }
 }
