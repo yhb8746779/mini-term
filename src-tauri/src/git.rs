@@ -1,7 +1,25 @@
 use git2::{Repository, Status, StatusOptions};
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// discover_git_repos 结果缓存 TTL（仓库结构变动极少，5 分钟内无需重扫）
+const GIT_REPO_CACHE_TTL: Duration = Duration::from_secs(300);
+
+type RepoCacheMap = Arc<Mutex<HashMap<String, (Vec<GitRepoInfo>, Instant)>>>;
+
+pub struct GitRepoCache {
+    inner: RepoCacheMap,
+}
+
+impl GitRepoCache {
+    pub fn new() -> Self {
+        Self { inner: Arc::new(Mutex::new(HashMap::new())) }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -268,10 +286,22 @@ pub fn get_git_status(project_path: String) -> Result<Vec<GitFileStatus>, String
 }
 
 #[tauri::command]
-pub fn discover_git_repos(project_path: String) -> Result<Vec<GitRepoInfo>, String> {
+pub fn discover_git_repos(
+    cache: tauri::State<'_, GitRepoCache>,
+    project_path: String,
+) -> Result<Vec<GitRepoInfo>, String> {
+    // 命中缓存直接返回，避免每次切换项目都递归扫描目录树
+    {
+        let guard = cache.inner.lock().unwrap();
+        if let Some((repos, fetched_at)) = guard.get(&project_path) {
+            if fetched_at.elapsed() < GIT_REPO_CACHE_TTL {
+                return Ok(repos.clone());
+            }
+        }
+    }
+
     let path = Path::new(&project_path);
-    let repos = find_repos(path);
-    Ok(repos
+    let repos: Vec<GitRepoInfo> = find_repos(path)
         .into_iter()
         .map(|(name, abs_path, repo)| {
             let current_branch = repo.head().ok().and_then(|h| {
@@ -291,7 +321,10 @@ pub fn discover_git_repos(project_path: String) -> Result<Vec<GitRepoInfo>, Stri
                 current_branch,
             }
         })
-        .collect())
+        .collect();
+
+    cache.inner.lock().unwrap().insert(project_path, (repos.clone(), Instant::now()));
+    Ok(repos)
 }
 
 #[tauri::command]

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore } from '../store';
@@ -43,6 +43,8 @@ export function SessionList() {
 
   const [sessions, setSessions] = useState<AiSession[]>([]);
   const [loading, setLoading] = useState(false);
+  // 标记当前是否处于"冷扫描等待"状态（后台扫描中，sessions-updated 尚未到达）
+  const waitingForScanRef = useRef(false);
 
   const activeProject = config.projects.find((p) => p.id === activeProjectId);
 
@@ -51,29 +53,38 @@ export function SessionList() {
     try {
       const result = await invoke<AiSession[]>('get_ai_sessions', { projectPath, force });
       setSessions(result);
+      // 后端立即返回空 = 冷缓存，后台扫描已启动；保持 loading=true 等待 sessions-updated
+      if (result.length === 0 && !force && !waitingForScanRef.current) {
+        waitingForScanRef.current = true;
+        return; // 不调用 setLoading(false)，继续显示"加载中…"
+      }
     } catch {
       setSessions([]);
-    } finally {
-      setLoading(false);
     }
+    setLoading(false);
+    waitingForScanRef.current = false;
   }, []);
 
-  // 切换项目时拉取（命中缓存则瞬间返回）
+  // 切换项目时重置等待标记并拉取
   useEffect(() => {
+    waitingForScanRef.current = false;
     if (activeProject?.path) {
       fetchSessions(activeProject.path);
     } else {
       setSessions([]);
+      setLoading(false);
     }
   }, [activeProject?.path, fetchSessions]);
 
-  // 后台刷新完成后静默更新当前项目的 session 列表
+  // 后台扫描完成后更新当前项目的 session 列表
   useEffect(() => {
     if (!activeProject?.path) return;
     let unlisten: (() => void) | undefined;
     listen<string>('sessions-updated', (event) => {
       if (event.payload === activeProject?.path) {
-        fetchSessions(activeProject.path); // 命中新鲜缓存，瞬间返回
+        // 标记此次 fetch 是 sessions-updated 触发的（扫描已完成），可以解除 loading
+        waitingForScanRef.current = true;
+        fetchSessions(activeProject.path);
       }
     }).then((fn) => { unlisten = fn; });
     return () => { unlisten?.(); };

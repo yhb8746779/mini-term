@@ -397,10 +397,11 @@ fn refresh_in_background(app: AppHandle, cache: CacheMap, project_path: String) 
     });
 }
 
-/// - 缓存新鲜（<10min）：直接返回，不读文件
-/// - 缓存过期：立即返回旧数据 + 后台静默刷新（完成后 emit sessions-updated）
-/// - 无缓存（首次）：同步扫一次
-/// - force=true：跳过缓存直接扫（手动刷新按钮）
+/// 所有路径均立即返回（不阻塞主线程），通过 sessions-updated 事件推送最新数据：
+/// - 缓存新鲜（<10min）：直接返回，不启动后台任务
+/// - 缓存过期：立即返回旧数据 + 后台静默刷新
+/// - 无缓存（首次）：立即返回空列表 + 后台扫描，完成后 emit sessions-updated
+/// - force=true：立即返回当前缓存（可能为空）+ 强制后台刷新
 #[tauri::command]
 pub fn get_ai_sessions(
     app: AppHandle,
@@ -409,24 +410,25 @@ pub fn get_ai_sessions(
     force: Option<bool>,
 ) -> Result<Vec<AiSession>, String> {
     let cache_arc = cache.inner.clone();
+    let force = force.unwrap_or(false);
 
-    if !force.unwrap_or(false) {
+    let cached = {
         let guard = cache_arc.lock().unwrap();
-        if let Some((sessions, fetched_at)) = guard.get(&project_path) {
-            let stale = sessions.clone();
-            let expired = fetched_at.elapsed() >= CACHE_TTL;
-            drop(guard);
+        guard.get(&project_path).map(|(s, t)| (s.clone(), t.elapsed()))
+    };
 
-            if expired {
-                // 缓存过期：返回旧数据，后台静默刷新
+    match cached {
+        Some((sessions, elapsed)) => {
+            // 有缓存：立即返回；过期或强制时启动后台刷新
+            if force || elapsed >= CACHE_TTL {
                 refresh_in_background(app, cache_arc, project_path);
             }
-            return Ok(stale);
+            Ok(sessions)
+        }
+        None => {
+            // 无缓存（首次加载）：立即返回空列表，后台扫描完成后通过 sessions-updated 通知
+            refresh_in_background(app, cache_arc, project_path);
+            Ok(vec![])
         }
     }
-
-    // 无缓存（首次加载）或强制刷新：同步扫描
-    let sessions = do_scan(&project_path);
-    cache_arc.lock().unwrap().insert(project_path, (sessions.clone(), Instant::now()));
-    Ok(sessions)
 }

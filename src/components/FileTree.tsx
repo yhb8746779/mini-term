@@ -39,6 +39,9 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
   );
   const [children, setChildren] = useState<FileEntry[]>([]);
   const reloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 用 ref 追踪展开状态，确保卸载 cleanup 能读到最新值
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
 
   const loadChildren = useCallback(async () => {
     const entries = await invoke<FileEntry[]>('list_directory', {
@@ -54,6 +57,16 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
       loadChildren();
       invoke('watch_directory', { path: entry.path, projectPath: projectRoot });
     }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 组件卸载时（切换项目）清理 watcher 和防抖 timer，防止 watcher 泄漏
+  useEffect(() => {
+    return () => {
+      if (expandedRef.current) {
+        invoke('unwatch_directory', { path: entry.path });
+      }
+      if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
+    };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleToggle = useCallback(async () => {

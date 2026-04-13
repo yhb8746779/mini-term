@@ -18,6 +18,7 @@ pub fn run() {
         .manage(pty::PtyManager::new())
         .manage(fs::FsWatcherManager::new())
         .manage(ai_sessions::SessionCache::new())
+        .manage(git::GitRepoCache::new())
         .setup(|app| {
             let pty_manager = app.state::<crate::pty::PtyManager>();
             let pty_clone = pty_manager.inner().clone();
