@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -18,16 +18,21 @@ const MAX_CODEX_FILES_SCANNED: usize = 1000;
 const CACHE_TTL: Duration = Duration::from_secs(600);
 
 type CacheMap = Arc<Mutex<HashMap<String, (Vec<AiSession>, Instant)>>>;
+/// 正在后台扫描的项目路径集合，防止同一项目重复起线程
+type ScanningSet = Arc<Mutex<HashSet<String>>>;
 
 /// 每个项目 session 列表的内存缓存（project_path → (sessions, fetched_at)）
-/// inner 使用 Arc 以便后台刷新线程持有引用
 pub struct SessionCache {
     inner: CacheMap,
+    scanning: ScanningSet,
 }
 
 impl SessionCache {
     pub fn new() -> Self {
-        Self { inner: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            scanning: Arc::new(Mutex::new(HashSet::new())),
+        }
     }
 }
 
@@ -398,11 +403,19 @@ fn do_scan(project_path: &str) -> Vec<AiSession> {
     sessions
 }
 
-/// 后台静默刷新：扫完后写缓存并 emit sessions-updated 通知前端
-fn refresh_in_background(app: AppHandle, cache: CacheMap, project_path: String) {
+/// 后台静默刷新：同一项目已有扫描线程时直接跳过（去重），扫完后更新缓存并通知前端
+fn refresh_in_background(app: AppHandle, cache: CacheMap, scanning: ScanningSet, project_path: String) {
+    {
+        let mut guard = scanning.lock().unwrap();
+        // insert 返回 false 表示已存在（已有扫描在跑），直接返回
+        if !guard.insert(project_path.clone()) {
+            return;
+        }
+    }
     thread::spawn(move || {
         let sessions = do_scan(&project_path);
         cache.lock().unwrap().insert(project_path.clone(), (sessions, Instant::now()));
+        scanning.lock().unwrap().remove(&project_path);
         let _ = app.emit("sessions-updated", &project_path);
     });
 }
@@ -422,7 +435,11 @@ pub fn get_ai_sessions(
     force: Option<bool>,
 ) -> Result<SessionsResponse, String> {
     let cache_arc = cache.inner.clone();
+    let scanning_arc = cache.scanning.clone();
     let force = force.unwrap_or(false);
+
+    // 先读当前扫描状态（可能已有别的调用在跑）
+    let already_scanning = scanning_arc.lock().unwrap().contains(&project_path);
 
     let cached = {
         let guard = cache_arc.lock().unwrap();
@@ -433,13 +450,16 @@ pub fn get_ai_sessions(
         Some((sessions, elapsed)) => {
             let need_refresh = force || elapsed >= CACHE_TTL;
             if need_refresh {
-                refresh_in_background(app, cache_arc, project_path);
+                // 内部去重：已有线程时 refresh_in_background 直接跳过
+                refresh_in_background(app, cache_arc, scanning_arc, project_path);
             }
-            Ok(SessionsResponse { sessions, scanning: need_refresh })
+            Ok(SessionsResponse {
+                sessions,
+                scanning: need_refresh || already_scanning,
+            })
         }
         None => {
-            // 无缓存（首次加载）：立即返回空列表，后台扫描
-            refresh_in_background(app, cache_arc, project_path);
+            refresh_in_background(app, cache_arc, scanning_arc, project_path);
             Ok(SessionsResponse { sessions: vec![], scanning: true })
         }
     }

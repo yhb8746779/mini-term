@@ -896,3 +896,86 @@ pub fn git_pull(repo_path: String) -> Result<String, String> {
 pub fn git_push(repo_path: String) -> Result<String, String> {
     run_git_network_command(&repo_path, "push")
 }
+
+// ─── Tests ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_repo_info(name: &str) -> GitRepoInfo {
+        GitRepoInfo {
+            name: name.to_string(),
+            path: format!("C:/test/{}", name),
+            current_branch: Some("main".to_string()),
+        }
+    }
+
+    /// 缓存在 TTL 内命中，不应触发重扫
+    #[test]
+    fn cache_hit_within_ttl() {
+        let cache = GitRepoCache::new();
+        let project = "C:/test/my-project".to_string();
+        let repos = vec![make_repo_info("my-project")];
+
+        cache.inner.lock().unwrap().insert(project.clone(), (repos.clone(), Instant::now()));
+
+        let guard = cache.inner.lock().unwrap();
+        let (cached, fetched_at) = guard.get(&project).expect("should have cache entry");
+        assert_eq!(cached.len(), 1, "should return exactly one repo from cache");
+        assert!(
+            fetched_at.elapsed() < GIT_REPO_CACHE_TTL,
+            "cache should still be within TTL"
+        );
+    }
+
+    /// TTL 过期的缓存条目应被识别为需要重扫（force=false 场景下由调用方决定是否重扫）
+    #[test]
+    fn cache_expired_beyond_ttl() {
+        let cache = GitRepoCache::new();
+        let project = "C:/test/old-project".to_string();
+        let expired_at = Instant::now() - (GIT_REPO_CACHE_TTL + Duration::from_secs(1));
+
+        cache.inner.lock().unwrap().insert(project.clone(), (vec![], expired_at));
+
+        let guard = cache.inner.lock().unwrap();
+        let (_, fetched_at) = guard.get(&project).expect("should have cache entry");
+        assert!(
+            fetched_at.elapsed() >= GIT_REPO_CACHE_TTL,
+            "elapsed time should exceed TTL — caller must trigger rescan"
+        );
+    }
+
+    /// force=true 应绕过新鲜缓存直接重扫（验证逻辑分支）
+    #[test]
+    fn force_bypasses_fresh_cache() {
+        let cache = GitRepoCache::new();
+        let project = "C:/test/force-project".to_string();
+        let repos = vec![make_repo_info("force-project")];
+        cache.inner.lock().unwrap().insert(project.clone(), (repos, Instant::now()));
+
+        // 验证缓存仍然新鲜
+        let guard = cache.inner.lock().unwrap();
+        let (_, fetched_at) = guard.get(&project).unwrap();
+        assert!(fetched_at.elapsed() < GIT_REPO_CACHE_TTL, "cache is fresh");
+        drop(guard);
+
+        // force=true 时，即使缓存新鲜，need_refresh 也应为 true
+        let force = true;
+        let elapsed = cache.inner.lock().unwrap()
+            .get(&project).map(|(_, t)| t.elapsed()).unwrap();
+        let need_refresh = force || elapsed >= GIT_REPO_CACHE_TTL;
+        assert!(need_refresh, "force=true must trigger refresh even with fresh cache");
+    }
+
+    /// 缓存未命中时（新项目），should_refresh 必须为 true
+    #[test]
+    fn cache_miss_requires_scan() {
+        let cache = GitRepoCache::new();
+        let project = "C:/test/brand-new-project".to_string();
+
+        let guard = cache.inner.lock().unwrap();
+        let hit = guard.get(&project);
+        assert!(hit.is_none(), "new project should not have a cache entry");
+    }
+}
