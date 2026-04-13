@@ -56,7 +56,13 @@ const PREDICTION_ECHO_GRACE: Duration = Duration::from_millis(300);
 /// 在此冷却窗口内的 PTY 输出不刷新 last_output，避免误判为 AI 活跃。
 const RESIZE_COOLDOWN: Duration = Duration::from_millis(800);
 
-/// 去除 ANSI 转义序列，返回纯文本
+/// 去除 ANSI 转义序列，返回纯文本。
+///
+/// 特殊处理 CSI G（Cursor Horizontal Absolute，光标横向绝对定位）：
+/// PSReadLine 等行编辑器用 `\x1b[NG]` 覆写当前行内容（历史导航、上下箭头）。
+/// 直接丢弃这个序列会导致旧命令与新命令字节拼接成乱码，无法识别 AI 命令。
+/// 将 CSI G 转义为 `\r`，配合后续 `replace('\r', '\n')` 把行在覆写点断开，
+/// 使最终写入的命令（如 `claude`）出现在独立的一行中可被正确识别。
 fn strip_ansi_codes(s: &str) -> String {
     let mut result = String::new();
     let mut chars = s.chars().peekable();
@@ -65,9 +71,18 @@ fn strip_ansi_codes(s: &str) -> String {
             match chars.peek() {
                 Some(&'[') => {
                     chars.next(); // consume '['
-                    // CSI sequence: skip until final byte (0x40–0x7E)
+                    // CSI sequence: collect until final byte (0x40–0x7E)
+                    let mut final_byte = '\0';
                     for c2 in chars.by_ref() {
-                        if ('\x40'..='\x7e').contains(&c2) { break; }
+                        if ('\x40'..='\x7e').contains(&c2) {
+                            final_byte = c2;
+                            break;
+                        }
+                    }
+                    // CHA (Cursor Horizontal Absolute) = 'G'
+                    // PSReadLine 用此序列在行内定位后覆写命令，等价于 \r
+                    if final_byte == 'G' {
+                        result.push('\r');
                     }
                 }
                 Some(&'O') => { chars.next(); chars.next(); } // SS3: ESC O <final>
@@ -245,11 +260,28 @@ impl PtyManager {
         if self.is_ai_session(pty_id) {
             return;
         }
-        let entered_recently = self.last_enter.lock().unwrap()
+        let elapsed_opt = self.last_enter.lock().unwrap()
             .get(&pty_id)
-            .map_or(false, |t| t.elapsed() <= PREDICTION_ECHO_GRACE);
-        if entered_recently && output_contains_ai_command(output) {
-            self.ai_sessions.lock().unwrap().insert(pty_id);
+            .map(|t| t.elapsed());
+        let entered_recently = elapsed_opt.map_or(false, |e| e <= PREDICTION_ECHO_GRACE);
+        if entered_recently {
+            let detected = output_contains_ai_command(output);
+            #[cfg(debug_assertions)]
+            {
+                let stripped = strip_ansi_codes(output).replace('\r', "\n");
+                eprintln!("[PTY-DBG pty={pty_id}] grace-path: elapsed={:?} detected={detected}",
+                    elapsed_opt);
+                for (i, line) in stripped.lines().enumerate().take(10) {
+                    let collapsed = apply_backspaces(line);
+                    if !collapsed.trim().is_empty() {
+                        let n = collapsed.char_indices().nth(120).map_or(collapsed.len(), |(i, _)| i);
+                        eprintln!("[PTY-DBG pty={pty_id}]   grace[{i}]: {:?}", &collapsed[..n]);
+                    }
+                }
+            }
+            if detected {
+                self.ai_sessions.lock().unwrap().insert(pty_id);
+            }
         }
     }
 
@@ -345,9 +377,26 @@ impl PtyManager {
         if entered && !in_ai && !enter_ai {
             let ose = self.output_since_enter.lock().unwrap();
             if let Some(ose_data) = ose.get(&pty_id) {
-                if output_contains_ai_command(ose_data) {
+                let detected = output_contains_ai_command(ose_data);
+                #[cfg(debug_assertions)]
+                {
+                    let stripped = strip_ansi_codes(ose_data).replace('\r', "\n");
+                    eprintln!("[PTY-DBG pty={pty_id}] Enter: OSE len={}, detected={detected}",
+                        ose_data.len());
+                    for (i, line) in stripped.lines().enumerate().take(20) {
+                        let collapsed = apply_backspaces(line);
+                        if !collapsed.trim().is_empty() {
+                            let n = collapsed.char_indices().nth(120).map_or(collapsed.len(), |(i, _)| i);
+                            eprintln!("[PTY-DBG pty={pty_id}]   line[{i}]: {:?}", &collapsed[..n]);
+                        }
+                    }
+                }
+                if detected {
                     enter_ai = true;
                 }
+            } else {
+                #[cfg(debug_assertions)]
+                eprintln!("[PTY-DBG pty={pty_id}] Enter: OSE entry missing");
             }
         }
         // Enter 后重置 output_since_enter，为下一条命令重新积累
@@ -891,6 +940,22 @@ mod tests {
         mgr.track_input(1, "\r");
         mgr.inject_pty_output(1, "PS C:\\workspace> claude --model sonnet");
         assert!(mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn psreadline_history_nav_cha_overwrite_detected() {
+        // 模拟：用户先输入 "ls ~/.codex"，再按上箭头切换为 "claude --model sonnet"。
+        // PSReadLine 用 CSI G（\x1b[NG]，光标横向绝对定位）把光标移回命令起始列，
+        // 再 erase-to-end（\x1b[K），再写入新命令。
+        // strip_ansi_codes 将 CSI G 转为 \r，output_contains_ai_command 把行在此断开，
+        // 使 "claude" 出现在独立行上被正确识别。
+        let mgr = PtyManager::new();
+        // \x1b[32G = 移到第 32 列（prompt 结束后），\x1b[K = erase-to-end
+        mgr.inject_pty_output(1,
+            "PS H:\\workspace\\self\\mini-term> ls ~/.codex\x1b[32G\x1b[Kclaude --model sonnet");
+        mgr.track_input(1, "\r");
+        assert!(mgr.is_ai_session(1),
+            "history navigation via CHA should be detected");
     }
 
     #[test]
