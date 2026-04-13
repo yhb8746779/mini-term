@@ -3,13 +3,28 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 
 /// 每个项目最多返回的会话数（避免拥有海量历史的项目卡死应用）
 const MAX_SESSIONS_PER_PROJECT: usize = 50;
 
 /// Codex 全局扫描文件上限（避免海量 session 目录遍历时间过长）
 const MAX_CODEX_FILES_SCANNED: usize = 1000;
+
+/// Session 结果缓存有效期：60s 内重复切换项目直接返回内存数据，不再扫文件
+const CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// 每个项目 session 列表的内存缓存（project_path → (sessions, fetched_at)）
+pub struct SessionCache {
+    inner: Mutex<HashMap<String, (Vec<AiSession>, Instant)>>,
+}
+
+impl SessionCache {
+    pub fn new() -> Self {
+        Self { inner: Mutex::new(HashMap::new()) }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -224,12 +239,14 @@ fn walk_codex_sessions(
         return;
     }
 
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
+    // 按名称倒序，使 2025 > 2024、12 > 11 等最新目录先处理，更快达到上限退出
+    let mut entries: Vec<_> = match fs::read_dir(dir) {
+        Ok(e) => e.flatten().collect(),
         Err(_) => return,
     };
+    entries.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
 
-    for entry in entries.flatten() {
+    for entry in entries {
         if *scanned >= MAX_CODEX_FILES_SCANNED || sessions.len() >= MAX_SESSIONS_PER_PROJECT {
             break;
         }
@@ -357,15 +374,32 @@ fn try_read_codex_session(
 
 // ─── Tauri Command ─────────────────────────────────────────────
 
+/// force=true 时跳过缓存强制重扫（用于手动刷新按钮）；
+/// 普通项目切换不传 force，命中缓存时直接返回内存数据，不读任何文件。
 #[tauri::command]
-pub fn get_ai_sessions(project_path: String) -> Result<Vec<AiSession>, String> {
-    let mut sessions = Vec::new();
+pub fn get_ai_sessions(
+    cache: tauri::State<'_, SessionCache>,
+    project_path: String,
+    force: Option<bool>,
+) -> Result<Vec<AiSession>, String> {
+    // 非强制刷新：命中 TTL 内缓存则直接返回
+    if !force.unwrap_or(false) {
+        let guard = cache.inner.lock().unwrap();
+        if let Some((sessions, fetched_at)) = guard.get(&project_path) {
+            if fetched_at.elapsed() < CACHE_TTL {
+                return Ok(sessions.clone());
+            }
+        }
+    }
 
+    // 缓存未命中或强制刷新：扫文件
+    let mut sessions = Vec::new();
     sessions.extend(get_claude_sessions(&project_path));
     sessions.extend(get_codex_sessions(&project_path));
-
-    // 按时间戳降序（最新在前）
     sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    // 写入缓存
+    cache.inner.lock().unwrap().insert(project_path, (sessions.clone(), Instant::now()));
 
     Ok(sessions)
 }

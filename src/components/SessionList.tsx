@@ -45,10 +45,10 @@ export function SessionList() {
 
   const activeProject = config.projects.find((p) => p.id === activeProjectId);
 
-  const fetchSessions = useCallback(async (projectPath: string) => {
+  const fetchSessions = useCallback(async (projectPath: string, force = false) => {
     setLoading(true);
     try {
-      const result = await invoke<AiSession[]>('get_ai_sessions', { projectPath });
+      const result = await invoke<AiSession[]>('get_ai_sessions', { projectPath, force });
       setSessions(result);
     } catch {
       setSessions([]);
@@ -72,7 +72,7 @@ export function SessionList() {
         {activeProject && (
           <span
             className="text-xs normal-case tracking-normal cursor-pointer hover:text-[var(--text-primary)] transition-colors"
-            onClick={() => fetchSessions(activeProject.path)}
+            onClick={() => fetchSessions(activeProject.path, true)}
             title="刷新会话列表"
           >
             ↻

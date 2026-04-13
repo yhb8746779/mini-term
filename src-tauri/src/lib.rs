@@ -17,6 +17,7 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::new().build())
         .manage(pty::PtyManager::new())
         .manage(fs::FsWatcherManager::new())
+        .manage(ai_sessions::SessionCache::new())
         .setup(|app| {
             let pty_manager = app.state::<crate::pty::PtyManager>();
             let pty_clone = pty_manager.inner().clone();
