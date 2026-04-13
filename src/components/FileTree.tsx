@@ -38,6 +38,7 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
     activeProjectId ? isExpanded(activeProjectId, entry.path) : false
   );
   const [children, setChildren] = useState<FileEntry[]>([]);
+  const reloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const loadChildren = useCallback(async () => {
     const entries = await invoke<FileEntry[]>('list_directory', {
@@ -80,8 +81,13 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
   }, [entry, expanded, loadChildren, projectRoot, gitStatusMap, onViewDiff, onViewFile, activeProjectId]);
 
   useTauriEvent<FsChangePayload>('fs-change', useCallback((payload: FsChangePayload) => {
-    if (expanded && payload.path.startsWith(entry.path)) {
-      loadChildren();
+    if (!expanded) return;
+    const sep = payload.path.includes('/') ? '/' : '\\';
+    const entryNorm = entry.path.replace(/[/\\]+$/, '');
+    const changedParent = payload.path.slice(0, payload.path.lastIndexOf(sep));
+    if (changedParent === entryNorm) {
+      if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
+      reloadTimerRef.current = setTimeout(loadChildren, 300);
     }
   }, [expanded, entry.path, loadChildren]));
 
@@ -274,6 +280,7 @@ export function FileTree() {
   const [gitStatusMap, setGitStatusMap] = useState<Map<string, GitFileStatus>>(new Map());
   const [diffTarget, setDiffTarget] = useState<GitFileStatus | null>(null);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const rootEntriesCache = useRef<Map<string, FileEntry[]>>(new Map());
 
   const loadGitStatus = useCallback(() => {
     if (!project) return;
@@ -297,10 +304,16 @@ export function FileTree() {
 
   const loadRootEntries = useCallback(() => {
     if (!project) return;
+    // 先从缓存立即渲染，消除切换时的白闪
+    const cached = rootEntriesCache.current.get(project.path);
+    if (cached) setRootEntries(cached);
     invoke<FileEntry[]>('list_directory', {
       projectRoot: project.path,
       path: project.path,
-    }).then(setRootEntries);
+    }).then((entries) => {
+      rootEntriesCache.current.set(project.path, entries);
+      setRootEntries(entries);
+    });
   }, [project?.path]);
 
   useEffect(() => {
@@ -314,7 +327,11 @@ export function FileTree() {
   }, [project?.path, loadRootEntries]);
 
   useTauriEvent<FsChangePayload>('fs-change', useCallback((payload: FsChangePayload) => {
-    if (project && payload.path === project.path) {
+    if (!project) return;
+    const sep = payload.path.includes('/') ? '/' : '\\';
+    const projectNorm = project.path.replace(/[/\\]+$/, '');
+    const changedParent = payload.path.slice(0, payload.path.lastIndexOf(sep));
+    if (changedParent === projectNorm) {
       loadRootEntries();
     }
   }, [project?.path, loadRootEntries]));
