@@ -34,6 +34,7 @@ export interface ProjectConfig {
   path: string;
   savedLayout?: SavedProjectLayout;
   expandedDirs?: string[];
+  lastConversationAt?: number;
 }
 
 export interface ShellConfig {
@@ -64,7 +65,9 @@ export interface SavedProjectLayout {
 
 // === 运行时状态 ===
 
-export type PaneStatus = 'idle' | 'ai-idle' | 'ai-working' | 'ai-generating' | 'error';
+export type AiProvider = 'claude' | 'codex' | 'gemini';
+
+export type PaneStatus = 'idle' | 'ai-complete' | 'ai-thinking' | 'ai-generating' | 'ai-awaiting-input' | 'error';
 
 export interface ProjectState {
   id: string;
@@ -97,13 +100,14 @@ export interface PaneState {
   customTitle?: string;
   status: PaneStatus;
   ptyId: number;
+  aiProvider?: AiProvider;
 }
 
 // === AI 会话 ===
 
 export interface AiSession {
   id: string;
-  sessionType: 'claude' | 'codex';
+  sessionType: 'claude' | 'codex' | 'gemini';
   title: string;
   timestamp: string; // ISO 8601
 }
@@ -133,6 +137,7 @@ export interface PtyExitPayload {
 export interface PtyStatusChangePayload {
   ptyId: number;
   status: PaneStatus;
+  provider?: AiProvider;
 }
 
 export interface FsChangePayload {

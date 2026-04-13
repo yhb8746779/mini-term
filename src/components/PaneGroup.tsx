@@ -68,7 +68,7 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
     if (!pane) return;
 
     const label = pane.customTitle || pane.shellName;
-    const hasAi = pane.status === 'ai-working' || pane.status === 'ai-idle' || pane.status === 'ai-generating';
+    const hasAi = pane.status === 'ai-generating' || pane.status === 'ai-thinking' || pane.status === 'ai-awaiting-input' || pane.status === 'ai-complete';
     const title = hasAi ? '关闭 AI 对话' : '关闭终端';
     const message = hasAi
       ? `终端「${label}」正在运行 AI 对话，关闭后对话将被终止，确定继续吗？`
@@ -118,7 +118,7 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
 
   const handleClosePaneGroup = useCallback(async () => {
     const aiCount = node.panes.filter(
-      (p) => p.status === 'ai-working' || p.status === 'ai-idle' || p.status === 'ai-generating'
+      (p) => p.status === 'ai-generating' || p.status === 'ai-thinking' || p.status === 'ai-awaiting-input' || p.status === 'ai-complete'
     ).length;
     const title = aiCount > 0 ? '关闭 AI 对话' : '关闭终端';
     const message = aiCount > 0
@@ -168,7 +168,7 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
               {isActive && (
                 <span className="absolute bottom-0 left-2 right-2 h-[2px] rounded-full bg-[var(--accent)]" />
               )}
-              <StatusDot status={pane.status} />
+              <StatusDot status={pane.status} provider={pane.aiProvider} />
               <span className="font-medium">{pane.customTitle || pane.shellName}</span>
               <span
                 className="ml-0.5 text-[var(--text-muted)] hover:text-[var(--color-error)] text-[12px] transition-colors"

@@ -8,6 +8,55 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
+/// 从命令 token（已小写）中提取 AI provider 名称
+fn detect_provider_from_token(token: &str) -> Option<&'static str> {
+    for &ai in AI_COMMANDS {
+        if token == ai || token.ends_with(&format!("/{ai}")) || token.ends_with(&format!("\\{ai}")) {
+            return Some(ai);
+        }
+    }
+    None
+}
+
+/// 从看起来像命令调用的单行中提取被调用的 AI provider 名称。
+/// 与 line_contains_ai_command 共用提示符识别逻辑，避免把 AI 回答里
+/// 提到的模型名（如 "Codex" 出现在输出文本中）误认为 provider。
+fn extract_provider_from_command_line(line: &str) -> Option<&'static str> {
+    let line = line.trim();
+    if line.is_empty() { return None; }
+
+    const TERMINAL_PROMPT_CHARS: &[char] = &['>', '$', '%', '#'];
+    const UNICODE_PROMPT_CHARS: &[char] = &['❯', '➜', '›', 'λ'];
+
+    let cmd_start: &str = if let Some(pos) = line.rfind(TERMINAL_PROMPT_CHARS) {
+        let ch = line[pos..].chars().next().unwrap();
+        line[pos + ch.len_utf8()..].trim()
+    } else if let Some(pos) = line.rfind(UNICODE_PROMPT_CHARS) {
+        let ch = line[pos..].chars().next().unwrap();
+        line[pos + ch.len_utf8()..].trim()
+    } else {
+        line
+    };
+
+    let first_token = cmd_start.split_whitespace().next().unwrap_or("");
+    detect_provider_from_token(&first_token.to_lowercase())
+}
+
+/// 从原始输出文本中提取最后一次调用的 AI provider 名称。
+/// 只识别看起来像命令调用的行（通过 extract_provider_from_command_line），
+/// 忽略 AI 回答正文里提到的模型名，防止 provider 被错误染色。
+fn detect_provider_from_output(output: &str) -> Option<&'static str> {
+    let stripped = strip_ansi_codes(output).replace('\r', "\n");
+    let mut last_found: Option<&'static str> = None;
+    for line in stripped.lines() {
+        let collapsed = apply_backspaces(line);
+        if let Some(provider) = extract_provider_from_command_line(&collapsed) {
+            last_found = Some(provider);
+        }
+    }
+    last_found
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PtyOutputPayload {
@@ -202,6 +251,8 @@ pub struct PtyManager {
     next_id: Arc<Mutex<u32>>,
     last_output: Arc<Mutex<HashMap<u32, Instant>>>,
     ai_sessions: Arc<Mutex<HashSet<u32>>>,
+    /// 当前 AI 会话的 provider（"claude" / "codex" / "gemini"）
+    ai_providers: Arc<Mutex<HashMap<u32, String>>>,
     input_buffers: Arc<Mutex<HashMap<u32, String>>>,
     last_ctrlc: Arc<Mutex<HashMap<u32, Instant>>>,
     last_enter: Arc<Mutex<HashMap<u32, Instant>>>,
@@ -211,6 +262,8 @@ pub struct PtyManager {
     /// resize 冷却窗口结束时间：在此之前 PTY 输出不刷新 last_output，
     /// 避免 TUI 应用 resize 重绘被误判为 AI 活跃。
     resize_cooldown_until: Arc<Mutex<HashMap<u32, Instant>>>,
+    /// 近期输出滚动窗口（上限 8KB），供 process_monitor 检测 awaiting-input 短语
+    recent_output_window: Arc<Mutex<HashMap<u32, String>>>,
 }
 
 impl PtyManager {
@@ -220,11 +273,13 @@ impl PtyManager {
             next_id: Arc::new(Mutex::new(1)),
             last_output: Arc::new(Mutex::new(HashMap::new())),
             ai_sessions: Arc::new(Mutex::new(HashSet::new())),
+            ai_providers: Arc::new(Mutex::new(HashMap::new())),
             input_buffers: Arc::new(Mutex::new(HashMap::new())),
             last_ctrlc: Arc::new(Mutex::new(HashMap::new())),
             last_enter: Arc::new(Mutex::new(HashMap::new())),
             output_since_enter: Arc::new(Mutex::new(HashMap::new())),
             resize_cooldown_until: Arc::new(Mutex::new(HashMap::new())),
+            recent_output_window: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -239,6 +294,32 @@ impl PtyManager {
 
     pub fn is_ai_session(&self, pty_id: u32) -> bool {
         self.ai_sessions.lock().unwrap().contains(&pty_id)
+    }
+
+    pub fn get_ai_provider(&self, pty_id: u32) -> Option<String> {
+        self.ai_providers.lock().unwrap().get(&pty_id).cloned()
+    }
+
+    /// 返回近期输出窗口的原始内容（含 ANSI 转义），供 process_monitor 做 awaiting-input 检测
+    pub fn get_recent_output_window(&self, pty_id: u32) -> String {
+        self.recent_output_window.lock().unwrap()
+            .get(&pty_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn append_recent_output_window(&self, pty_id: u32, data: &str) {
+        let mut map = self.recent_output_window.lock().unwrap();
+        let entry = map.entry(pty_id).or_default();
+        entry.push_str(data);
+        const ROW_CAP: usize = 8 * 1024;
+        if entry.len() > ROW_CAP {
+            let excess = entry.len() - ROW_CAP;
+            let boundary = (excess..=entry.len())
+                .find(|&i| entry.is_char_boundary(i))
+                .unwrap_or(entry.len());
+            entry.drain(..boundary);
+        }
     }
 
     fn append_output_since_enter(&self, pty_id: u32, data: &str) -> String {
@@ -281,6 +362,9 @@ impl PtyManager {
             }
             if detected {
                 self.ai_sessions.lock().unwrap().insert(pty_id);
+                if let Some(provider) = detect_provider_from_output(output) {
+                    self.ai_providers.lock().unwrap().insert(pty_id, provider.to_string());
+                }
             }
         }
     }
@@ -295,6 +379,7 @@ impl PtyManager {
         let mut enter_ai = false;
         let mut exit_ai = false;
         let mut entered = false;
+        let mut detected_provider: Option<&'static str> = None;
         {
             let mut buffers = self.input_buffers.lock().unwrap();
             let buf = buffers.entry(pty_id).or_default();
@@ -360,7 +445,10 @@ impl PtyManager {
                             let has_non_interactive_flag = is_ai_cmd && words.any(|w| {
                                 NON_INTERACTIVE_FLAGS.iter().any(|&f| w == f)
                             });
-                            if is_ai_cmd && !has_non_interactive_flag { enter_ai = true; }
+                            if is_ai_cmd && !has_non_interactive_flag {
+                                enter_ai = true;
+                                detected_provider = detect_provider_from_token(first_word);
+                            }
                         }
                         buf.clear();
                     }
@@ -393,6 +481,9 @@ impl PtyManager {
                 }
                 if detected {
                     enter_ai = true;
+                    if detected_provider.is_none() {
+                        detected_provider = detect_provider_from_output(ose_data);
+                    }
                 }
             } else {
                 #[cfg(debug_assertions)]
@@ -402,11 +493,25 @@ impl PtyManager {
         // Enter 后重置 output_since_enter，为下一条命令重新积累
         if entered {
             self.output_since_enter.lock().unwrap().insert(pty_id, String::new());
+            // AI 会话中用户回车响应（确认/输入指令），清空近期输出检测窗口，
+            // 避免残留的 "Press Enter" / "y/n" 等短语继续触发 awaiting-input
+            if in_ai {
+                self.recent_output_window.lock().unwrap().insert(pty_id, String::new());
+            }
         }
 
         if enter_ai || exit_ai {
             let mut sessions = self.ai_sessions.lock().unwrap();
-            if enter_ai { sessions.insert(pty_id); } else { sessions.remove(&pty_id); }
+            let mut providers = self.ai_providers.lock().unwrap();
+            if enter_ai {
+                sessions.insert(pty_id);
+                if let Some(p) = detected_provider {
+                    providers.insert(pty_id, p.to_string());
+                }
+            } else {
+                sessions.remove(&pty_id);
+                providers.remove(&pty_id);
+            }
         }
     }
 
@@ -563,6 +668,10 @@ pub fn create_pty(
                     pty_state_for_output
                         .try_enter_ai_from_recent_output(pty_id_for_reader, &recent_output);
 
+                    // 更新近期输出滚动窗口，供 process_monitor 做 awaiting-input 检测
+                    pty_state_for_output
+                        .append_recent_output_window(pty_id_for_reader, &data);
+
                     let _ = app_flush.emit("pty-output", PtyOutputPayload {
                         pty_id: pty_id_for_reader, data,
                     });
@@ -643,11 +752,13 @@ pub fn kill_pty(state: tauri::State<'_, PtyManager>, pty_id: u32) -> Result<(), 
     let instance = state.instances.lock().unwrap().remove(&pty_id);
     state.last_output.lock().unwrap().remove(&pty_id);
     state.ai_sessions.lock().unwrap().remove(&pty_id);
+    state.ai_providers.lock().unwrap().remove(&pty_id);
     state.input_buffers.lock().unwrap().remove(&pty_id);
     state.last_ctrlc.lock().unwrap().remove(&pty_id);
     state.last_enter.lock().unwrap().remove(&pty_id);
     state.output_since_enter.lock().unwrap().remove(&pty_id);
     state.resize_cooldown_until.lock().unwrap().remove(&pty_id);
+    state.recent_output_window.lock().unwrap().remove(&pty_id);
 
     // Drop the PTY instance on a background thread.
     //

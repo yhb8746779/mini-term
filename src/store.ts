@@ -10,6 +10,7 @@ import type {
   SplitNode,
   PaneState,
   PaneStatus,
+  AiProvider,
   SavedPane,
   SavedSplitNode,
   SavedTab,
@@ -24,6 +25,7 @@ import {
   removeGroupAndPromoteChildren,
   removeProjectFromTree,
   migrateToTree,
+  sortTreeByConversation,
 } from './utils/projectTree';
 
 // 生成唯一 ID
@@ -32,10 +34,11 @@ export const genId = () => `id-${Date.now()}-${++idCounter}`;
 
 // 计算 Tab 聚合状态
 const STATUS_PRIORITY: Record<PaneStatus, number> = {
-  error: 4,
+  error: 5,
+  'ai-awaiting-input': 4,
   'ai-generating': 3,
-  'ai-working': 2,
-  'ai-idle': 1,
+  'ai-thinking': 2,
+  'ai-complete': 1,
   idle: 0,
 };
 
@@ -51,20 +54,25 @@ function getHighestStatus(node: SplitNode): PaneStatus {
   }, 'idle');
 }
 
-// 在 SplitNode 中更新指定 pane 的状态
-function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus): SplitNode {
+// 在 SplitNode 中更新指定 pane 的状态（同时更新 aiProvider）
+function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus, provider?: AiProvider): SplitNode {
   if (node.type === 'leaf') {
     const idx = node.panes.findIndex((p) => p.ptyId === ptyId);
     if (idx >= 0) {
       const newPanes = [...node.panes];
-      newPanes[idx] = { ...newPanes[idx], status };
+      const providerUpdate = provider
+        ? { aiProvider: provider }
+        : status === 'idle'
+        ? { aiProvider: undefined as AiProvider | undefined }
+        : {};
+      newPanes[idx] = { ...newPanes[idx], status, ...providerUpdate };
       return { ...node, panes: newPanes };
     }
     return node;
   }
   return {
     ...node,
-    children: node.children.map((c) => updatePaneStatus(c, ptyId, status)),
+    children: node.children.map((c) => updatePaneStatus(c, ptyId, status, provider)),
   };
 }
 
@@ -323,7 +331,7 @@ interface AppStore {
   updateTabLayout: (projectId: string, tabId: string, layout: SplitNode) => void;
 
   // Pane 状态
-  updatePaneStatusByPty: (ptyId: number, status: PaneStatus) => void;
+  updatePaneStatusByPty: (ptyId: number, status: PaneStatus, provider?: AiProvider) => void;
 
   // Notifications
   notifications: AiCompletionNotification[];
@@ -469,7 +477,7 @@ export const useAppStore = create<AppStore>((set) => ({
       return { projectStates: newStates };
     }),
 
-  updatePaneStatusByPty: (ptyId, status) =>
+  updatePaneStatusByPty: (ptyId, status, provider) =>
     set((state) => {
       // 1. 找到 pane 所属项目并捕获 oldStatus
       let oldStatus: PaneStatus | null = null;
@@ -493,7 +501,7 @@ export const useAppStore = create<AppStore>((set) => ({
       for (const [pid, ps] of newStates) {
         let tabsChanged = false;
         const updatedTabs = ps.tabs.map((tab) => {
-          const newLayout = updatePaneStatus(tab.splitLayout, ptyId, status);
+          const newLayout = updatePaneStatus(tab.splitLayout, ptyId, status, provider);
           if (newLayout === tab.splitLayout) return tab;
           tabsChanged = true;
           return { ...tab, splitLayout: newLayout, status: getHighestStatus(newLayout) };
@@ -505,8 +513,31 @@ export const useAppStore = create<AppStore>((set) => ({
       }
       if (!changed) return state;
 
-      // 3. 检测 transition：ai-working → ai-idle
-      const isCompletion = oldStatus === 'ai-working' && status === 'ai-idle';
+      // 3. 检测 AI 会话开始/恢复：idle 或 ai-complete → ai-thinking/ai-generating/ai-awaiting-input
+      const isConversationStart =
+        (status === 'ai-thinking' || status === 'ai-generating' || status === 'ai-awaiting-input') &&
+        (oldStatus === 'idle' || oldStatus === 'ai-complete');
+
+      let updatedConfig = state.config;
+      if (isConversationStart) {
+        const now = Date.now();
+        const updatedProjects = state.config.projects.map((p) =>
+          p.id === owningProjectId ? { ...p, lastConversationAt: now } : p
+        );
+        const projectMap = new Map(updatedProjects.map((p) => [p.id, p]));
+        const sortedTree = sortTreeByConversation(state.config.projectTree ?? [], projectMap);
+        updatedConfig = {
+          ...state.config,
+          projects: updatedProjects,
+          projectTree: sortedTree,
+        };
+        // 异步持久化，不阻塞状态更新
+        queueMicrotask(() => invoke('save_config', { config: useAppStore.getState().config }));
+      }
+
+      // 4. 检测 transition：active AI → ai-complete（AI 完成一轮）
+      // ai-generating 或 ai-thinking → ai-complete 才视为"完成一轮"（处理 awaiting-input 不触发通知）
+      const isCompletion = (oldStatus === 'ai-generating' || oldStatus === 'ai-thinking') && status === 'ai-complete';
       if (isCompletion) {
         // 3a. 任务栏闪烁 — 不区分激活项目（Tauri API 自带 focus 检测）
         if (state.config.aiCompletionTaskbarFlash) {
@@ -545,7 +576,7 @@ export const useAppStore = create<AppStore>((set) => ({
         }
       }
 
-      return { projectStates: newStates };
+      return { projectStates: newStates, config: updatedConfig };
     }),
 
   pushNotification: (n) => {

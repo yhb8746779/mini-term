@@ -21,7 +21,7 @@ import {
   findGroupInTree,
   MAX_DEPTH,
 } from '../utils/projectTree';
-import type { PaneStatus, SplitNode, ProjectConfig, ProjectGroup } from '../types';
+import type { PaneStatus, AiProvider, PaneState, SplitNode, ProjectConfig, ProjectGroup } from '../types';
 
 // 保存配置的快捷方法
 function saveConfig() {
@@ -104,27 +104,50 @@ export function ProjectList() {
     setConfirmTarget(null);
   }, [confirmTarget, removeProject]);
 
-  // 返回项目内各非 idle 状态的分组汇总（按优先级降序）
-  const getProjectStatusSummary = (projectId: string): { status: PaneStatus; count: number }[] => {
+  // Provider 内各状态优先级
+  const PROVIDER_STATUS_PRIORITY: Record<PaneStatus, number> = {
+    error: 5, 'ai-awaiting-input': 4, 'ai-generating': 3, 'ai-thinking': 2, 'ai-complete': 1, idle: 0,
+  };
+  const PROVIDER_ORDER: AiProvider[] = ['claude', 'codex', 'gemini'];
+
+  // 返回项目内各 provider 的最高优先级状态（固定顺序：claude > codex > gemini）
+  const getProjectStatusSummary = (projectId: string): { provider: AiProvider; status: Exclude<PaneStatus, 'idle'> }[] => {
     const ps = projectStates.get(projectId);
     if (!ps || ps.tabs.length === 0) return [];
 
-    const collectStatuses = (node: SplitNode): PaneStatus[] => {
-      if (node.type === 'leaf') return node.panes.map((p) => p.status);
-      return node.children.flatMap(collectStatuses);
+    const collectPanes = (node: SplitNode): PaneState[] => {
+      if (node.type === 'leaf') return [...node.panes];
+      return node.children.flatMap(collectPanes);
     };
 
-    const counts: Partial<Record<PaneStatus, number>> = {};
-    for (const tab of ps.tabs) {
-      for (const s of collectStatuses(tab.splitLayout)) {
-        if (s !== 'idle') counts[s] = (counts[s] ?? 0) + 1;
+    const allPanes = ps.tabs.flatMap((tab) => collectPanes(tab.splitLayout));
+    const aiPanes = allPanes.filter((p) => p.status !== 'idle' && p.aiProvider);
+
+    const result: { provider: AiProvider; status: Exclude<PaneStatus, 'idle'> }[] = [];
+    for (const provider of PROVIDER_ORDER) {
+      const panes = aiPanes.filter((p) => p.aiProvider === provider);
+      if (panes.length === 0) continue;
+      const best = panes.reduce<PaneStatus>(
+        (acc, p) => PROVIDER_STATUS_PRIORITY[p.status] > PROVIDER_STATUS_PRIORITY[acc] ? p.status : acc,
+        'idle',
+      );
+      if (best !== 'idle') {
+        result.push({ provider, status: best as Exclude<PaneStatus, 'idle'> });
       }
     }
 
-    const ORDER: PaneStatus[] = ['error', 'ai-generating', 'ai-working', 'ai-idle'];
-    return ORDER
-      .filter((s) => (counts[s] ?? 0) > 0)
-      .map((s) => ({ status: s, count: counts[s]! }));
+    // 如果没有带 provider 的 AI 状态，但有「有 provider 关联的 error」，也汇报
+    // 不带 provider 的 error（普通终端退出非 0）不在此展示，避免误归属
+    if (result.length === 0) {
+      const providerErrors = allPanes.filter((p) => p.status === 'error' && p.aiProvider);
+      for (const provider of PROVIDER_ORDER) {
+        if (providerErrors.some((p) => p.aiProvider === provider)) {
+          result.push({ provider, status: 'error' });
+        }
+      }
+    }
+
+    return result;
   };
 
   // 创建分组
@@ -368,19 +391,14 @@ export function ProjectList() {
         ) : (
           <span className="truncate flex-1">{project.name}</span>
         )}
-        {/* AI 完成提醒优先显示；否则多终端状态汇总（每种非 idle 状态一个点 + 数量） */}
+        {/* AI 完成提醒优先显示；否则 provider 状态汇总（每个 provider 一个点，固定顺序） */}
         {showDoneTag ? <DoneTag /> : (
           <div className="flex items-center gap-0.5 flex-shrink-0">
             {statusSummary.length === 0 ? (
               <StatusDot status="idle" />
             ) : (
-              statusSummary.map(({ status, count }) => (
-                <div key={status} className="flex items-center gap-[2px]">
-                  <StatusDot status={status} />
-                  {count > 1 && (
-                    <span className="text-[9px] leading-none text-[var(--text-muted)]">{count}</span>
-                  )}
-                </div>
+              statusSummary.map(({ provider, status }) => (
+                <StatusDot key={provider} status={status} provider={provider} />
               ))
             )}
           </div>

@@ -15,7 +15,7 @@ import { ToastContainer } from './components/ToastContainer';
 import { useTauriEvent } from './hooks/useTauriEvent';
 import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
-import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus } from './types';
+import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, AiProvider } from './types';
 
 // ─── Debug experiment switches ─────────────────────────────────
 // 将其中一个改为 true 做 A/B 对比，找到主卡点后恢复 false
@@ -85,7 +85,11 @@ export function App() {
   }, []);
 
   useTauriEvent<PtyStatusChangePayload>('pty-status-change', useCallback((payload) => {
-    updatePaneStatusByPty(payload.ptyId, payload.status as PaneStatus);
+    updatePaneStatusByPty(
+      payload.ptyId,
+      payload.status as PaneStatus,
+      payload.provider as AiProvider | undefined,
+    );
   }, [updatePaneStatusByPty]));
 
   useTauriEvent<PtyExitPayload>('pty-exit', useCallback((payload) => {

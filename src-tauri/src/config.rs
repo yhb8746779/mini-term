@@ -110,6 +110,8 @@ pub struct ProjectConfig {
     pub saved_layout: Option<SavedProjectLayout>,
     #[serde(default)]
     pub expanded_dirs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_conversation_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

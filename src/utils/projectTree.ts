@@ -306,6 +306,54 @@ export function findGroupInTree(tree: ProjectTreeItem[], groupId: string): Proje
   return null;
 }
 
+// === 按最近 AI 会话排序 ===
+
+/**
+ * 对树的每个兄弟列表中的项目节点按 lastConversationAt 降序稳定排序。
+ * 组节点保持原有相对顺序，项目节点就地填入排序后结果。
+ * 不修改原始树，返回新树。
+ */
+export function sortTreeByConversation(
+  items: ProjectTreeItem[],
+  projectMap: Map<string, ProjectConfig>,
+): ProjectTreeItem[] {
+  // 先递归处理各组的子树
+  const processed: ProjectTreeItem[] = items.map((item) => {
+    if (isGroup(item)) {
+      return { ...item, children: sortTreeByConversation(item.children, projectMap) };
+    }
+    return item;
+  });
+
+  // 收集当前层级项目节点的位置与 id
+  const projectPositions: number[] = [];
+  const projectIds: string[] = [];
+  for (let i = 0; i < processed.length; i++) {
+    if (!isGroup(processed[i])) {
+      projectPositions.push(i);
+      projectIds.push(processed[i] as string);
+    }
+  }
+
+  if (projectPositions.length <= 1) return processed;
+
+  // 稳定排序：有时间戳按降序，无时间戳排后面，相等保持原序
+  const sorted = [...projectIds].sort((a, b) => {
+    const ta = projectMap.get(a)?.lastConversationAt;
+    const tb = projectMap.get(b)?.lastConversationAt;
+    if (ta !== undefined && tb !== undefined) return tb - ta;
+    if (ta !== undefined) return -1;
+    if (tb !== undefined) return 1;
+    return 0;
+  });
+
+  const result = [...processed];
+  for (let i = 0; i < projectPositions.length; i++) {
+    result[projectPositions[i]] = sorted[i];
+  }
+  return result;
+}
+
 // === 迁移辅助 ===
 
 /** 从旧配置格式迁移到 projectTree（前端侧，作为 Rust 迁移的备份） */

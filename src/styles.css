@@ -42,6 +42,15 @@
   --color-error-muted: rgba(212, 96, 90, 0.15);
   --shadow-overlay: 0 8px 32px rgba(0,0,0,0.5), 0 0 1px rgba(255,255,255,0.05);
 
+  /* AI Provider 状态颜色 */
+  --color-claude-complete: #d98b3a;
+  --color-claude-generating: #f2a65a;
+  --color-codex-complete: #2f89c5;
+  --color-codex-generating: #4db6ff;
+  --color-gemini-complete: #2ea56b;
+  --color-gemini-generating: #45c486;
+  --color-warn: #f5c518;
+
   /* Sizing */
   --radius-sm: 4px;
   --radius-md: 6px;
@@ -185,7 +194,7 @@ html, body, #root {
 }
 
 .animate-blink-slow {
-  animation: alertBlink 2s ease-in-out infinite;
+  animation: alertBlink 1.4s ease-in-out infinite;
 }
 
 .animate-slide-in {
