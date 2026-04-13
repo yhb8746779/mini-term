@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { useAppStore } from '../store';
 import { showContextMenu } from '../utils/contextMenu';
 import type { AiSession } from '../types';
@@ -57,12 +58,25 @@ export function SessionList() {
     }
   }, []);
 
+  // 切换项目时拉取（命中缓存则瞬间返回）
   useEffect(() => {
     if (activeProject?.path) {
       fetchSessions(activeProject.path);
     } else {
       setSessions([]);
     }
+  }, [activeProject?.path, fetchSessions]);
+
+  // 后台刷新完成后静默更新当前项目的 session 列表
+  useEffect(() => {
+    if (!activeProject?.path) return;
+    let unlisten: (() => void) | undefined;
+    listen<string>('sessions-updated', (event) => {
+      if (event.payload === activeProject?.path) {
+        fetchSessions(activeProject.path); // 命中新鲜缓存，瞬间返回
+      }
+    }).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
   }, [activeProject?.path, fetchSessions]);
 
   return (

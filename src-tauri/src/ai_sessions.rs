@@ -3,8 +3,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+use tauri::{AppHandle, Emitter};
 
 /// 每个项目最多返回的会话数（避免拥有海量历史的项目卡死应用）
 const MAX_SESSIONS_PER_PROJECT: usize = 50;
@@ -12,17 +14,20 @@ const MAX_SESSIONS_PER_PROJECT: usize = 50;
 /// Codex 全局扫描文件上限（避免海量 session 目录遍历时间过长）
 const MAX_CODEX_FILES_SCANNED: usize = 1000;
 
-/// Session 结果缓存有效期：60s 内重复切换项目直接返回内存数据，不再扫文件
-const CACHE_TTL: Duration = Duration::from_secs(60);
+/// Session 结果缓存有效期：10 分钟内重复切换项目直接返回内存数据，不再扫文件
+const CACHE_TTL: Duration = Duration::from_secs(600);
+
+type CacheMap = Arc<Mutex<HashMap<String, (Vec<AiSession>, Instant)>>>;
 
 /// 每个项目 session 列表的内存缓存（project_path → (sessions, fetched_at)）
+/// inner 使用 Arc 以便后台刷新线程持有引用
 pub struct SessionCache {
-    inner: Mutex<HashMap<String, (Vec<AiSession>, Instant)>>,
+    inner: CacheMap,
 }
 
 impl SessionCache {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(HashMap::new()) }
+        Self { inner: Arc::new(Mutex::new(HashMap::new())) }
     }
 }
 
@@ -374,32 +379,54 @@ fn try_read_codex_session(
 
 // ─── Tauri Command ─────────────────────────────────────────────
 
-/// force=true 时跳过缓存强制重扫（用于手动刷新按钮）；
-/// 普通项目切换不传 force，命中缓存时直接返回内存数据，不读任何文件。
+/// 同步扫描并返回排好序的 session 列表（供首次加载和后台刷新共用）
+fn do_scan(project_path: &str) -> Vec<AiSession> {
+    let mut sessions = Vec::new();
+    sessions.extend(get_claude_sessions(project_path));
+    sessions.extend(get_codex_sessions(project_path));
+    sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    sessions
+}
+
+/// 后台静默刷新：扫完后写缓存并 emit sessions-updated 通知前端
+fn refresh_in_background(app: AppHandle, cache: CacheMap, project_path: String) {
+    thread::spawn(move || {
+        let sessions = do_scan(&project_path);
+        cache.lock().unwrap().insert(project_path.clone(), (sessions, Instant::now()));
+        let _ = app.emit("sessions-updated", &project_path);
+    });
+}
+
+/// - 缓存新鲜（<10min）：直接返回，不读文件
+/// - 缓存过期：立即返回旧数据 + 后台静默刷新（完成后 emit sessions-updated）
+/// - 无缓存（首次）：同步扫一次
+/// - force=true：跳过缓存直接扫（手动刷新按钮）
 #[tauri::command]
 pub fn get_ai_sessions(
+    app: AppHandle,
     cache: tauri::State<'_, SessionCache>,
     project_path: String,
     force: Option<bool>,
 ) -> Result<Vec<AiSession>, String> {
-    // 非强制刷新：命中 TTL 内缓存则直接返回
+    let cache_arc = cache.inner.clone();
+
     if !force.unwrap_or(false) {
-        let guard = cache.inner.lock().unwrap();
+        let guard = cache_arc.lock().unwrap();
         if let Some((sessions, fetched_at)) = guard.get(&project_path) {
-            if fetched_at.elapsed() < CACHE_TTL {
-                return Ok(sessions.clone());
+            let stale = sessions.clone();
+            let expired = fetched_at.elapsed() >= CACHE_TTL;
+            drop(guard);
+
+            if expired {
+                // 缓存过期：返回旧数据，后台静默刷新
+                refresh_in_background(app, cache_arc, project_path);
             }
+            return Ok(stale);
         }
     }
 
-    // 缓存未命中或强制刷新：扫文件
-    let mut sessions = Vec::new();
-    sessions.extend(get_claude_sessions(&project_path));
-    sessions.extend(get_codex_sessions(&project_path));
-    sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-
-    // 写入缓存
-    cache.inner.lock().unwrap().insert(project_path, (sessions.clone(), Instant::now()));
-
+    // 无缓存（首次加载）或强制刷新：同步扫描
+    let sessions = do_scan(&project_path);
+    cache_arc.lock().unwrap().insert(project_path, (sessions.clone(), Instant::now()));
     Ok(sessions)
 }
