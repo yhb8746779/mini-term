@@ -148,9 +148,9 @@ export function GitHistory() {
   repoStatesRef.current = repoStates;
   const autoExpandedForRef = useRef<string | null>(null);
 
-  const loadRepos = useCallback(() => {
+  const loadRepos = useCallback((force = false) => {
     if (!project) return;
-    invoke<GitRepoInfo[]>('discover_git_repos', { projectPath: project.path })
+    invoke<GitRepoInfo[]>('discover_git_repos', { projectPath: project.path, force })
       .then(setRepos)
       .catch(() => setRepos([]));
   }, [project?.path]);
@@ -290,7 +290,7 @@ export function GitHistory() {
   const debouncedRefresh = useCallback(() => {
     if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
     refreshTimerRef.current = setTimeout(() => {
-      loadRepos();
+      loadRepos(true); // 文件系统/终端触发的刷新必须绕过缓存
       for (const repoPath of expandedReposRef.current) {
         loadCommits(repoPath);
         loadBranches(repoPath);
@@ -533,7 +533,7 @@ export function GitHistory() {
         <button
           className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-sm"
           onClick={() => {
-            loadRepos();
+            loadRepos(true); // 手动刷新必须绕过缓存
             for (const repoPath of expandedRepos) {
               loadCommits(repoPath);
               loadBranches(repoPath);

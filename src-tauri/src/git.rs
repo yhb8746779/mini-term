@@ -289,9 +289,10 @@ pub fn get_git_status(project_path: String) -> Result<Vec<GitFileStatus>, String
 pub fn discover_git_repos(
     cache: tauri::State<'_, GitRepoCache>,
     project_path: String,
+    force: Option<bool>,
 ) -> Result<Vec<GitRepoInfo>, String> {
-    // 命中缓存直接返回，避免每次切换项目都递归扫描目录树
-    {
+    // 非强制刷新时命中缓存直接返回，避免每次切换项目都递归扫描目录树
+    if !force.unwrap_or(false) {
         let guard = cache.inner.lock().unwrap();
         if let Some((repos, fetched_at)) = guard.get(&project_path) {
             if fetched_at.elapsed() < GIT_REPO_CACHE_TTL {

@@ -1,9 +1,15 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore } from '../store';
 import { showContextMenu } from '../utils/contextMenu';
 import type { AiSession } from '../types';
+
+interface SessionsResult {
+  sessions: AiSession[];
+  /** true = 后台扫描进行中，稍后 sessions-updated 到达才是最终数据 */
+  scanning: boolean;
+}
 
 /** 将 ISO 时间戳转换为简短的相对/绝对时间 */
 function formatTime(iso: string): string {
@@ -43,31 +49,26 @@ export function SessionList() {
 
   const [sessions, setSessions] = useState<AiSession[]>([]);
   const [loading, setLoading] = useState(false);
-  // 标记当前是否处于"冷扫描等待"状态（后台扫描中，sessions-updated 尚未到达）
-  const waitingForScanRef = useRef(false);
 
   const activeProject = config.projects.find((p) => p.id === activeProjectId);
 
   const fetchSessions = useCallback(async (projectPath: string, force = false) => {
     setLoading(true);
     try {
-      const result = await invoke<AiSession[]>('get_ai_sessions', { projectPath, force });
+      const { sessions: result, scanning } = await invoke<SessionsResult>('get_ai_sessions', { projectPath, force });
       setSessions(result);
-      // 后端立即返回空 = 冷缓存，后台扫描已启动；保持 loading=true 等待 sessions-updated
-      if (result.length === 0 && !force && !waitingForScanRef.current) {
-        waitingForScanRef.current = true;
-        return; // 不调用 setLoading(false)，继续显示"加载中…"
+      if (scanning) {
+        // 后台扫描中：保持 loading=true，等待 sessions-updated 事件到达后再清除
+        return;
       }
     } catch {
       setSessions([]);
     }
     setLoading(false);
-    waitingForScanRef.current = false;
   }, []);
 
-  // 切换项目时重置等待标记并拉取
+  // 切换项目时拉取
   useEffect(() => {
-    waitingForScanRef.current = false;
     if (activeProject?.path) {
       fetchSessions(activeProject.path);
     } else {
@@ -82,9 +83,7 @@ export function SessionList() {
     let unlisten: (() => void) | undefined;
     listen<string>('sessions-updated', (event) => {
       if (event.payload === activeProject?.path) {
-        // 标记此次 fetch 是 sessions-updated 触发的（扫描已完成），可以解除 loading
-        waitingForScanRef.current = true;
-        fetchSessions(activeProject.path);
+        fetchSessions(activeProject.path); // 命中新鲜缓存，scanning=false，立即结束 loading
       }
     }).then((fn) => { unlisten = fn; });
     return () => { unlisten?.(); };

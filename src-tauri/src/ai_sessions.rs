@@ -40,6 +40,16 @@ pub struct AiSession {
     pub timestamp: String, // ISO 8601
 }
 
+/// get_ai_sessions 的返回值：附带 scanning 标志，让前端精确区分
+/// "数据已完整" vs "后台扫描中、稍后会 sessions-updated"
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionsResponse {
+    pub sessions: Vec<AiSession>,
+    /// true = 后台扫描正在进行，sessions-updated 事件到达后数据会更新
+    pub scanning: bool,
+}
+
 /// 获取用户 home 目录
 fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
@@ -397,18 +407,20 @@ fn refresh_in_background(app: AppHandle, cache: CacheMap, project_path: String) 
     });
 }
 
-/// 所有路径均立即返回（不阻塞主线程），通过 sessions-updated 事件推送最新数据：
-/// - 缓存新鲜（<10min）：直接返回，不启动后台任务
-/// - 缓存过期：立即返回旧数据 + 后台静默刷新
-/// - 无缓存（首次）：立即返回空列表 + 后台扫描，完成后 emit sessions-updated
-/// - force=true：立即返回当前缓存（可能为空）+ 强制后台刷新
+/// 所有路径均立即返回（不阻塞主线程），返回值中 scanning=true 表示后台正在扫描：
+/// - 缓存新鲜（<10min）且非强制：直接返回 scanning=false，不启动后台任务
+/// - 缓存过期 或 force=true：立即返回旧数据 + 后台刷新，scanning=true
+/// - 无缓存（首次）：立即返回空列表 + 后台扫描，scanning=true
+///
+/// 前端根据 scanning 字段（而非 sessions.length）来决定是否保持"加载中"状态，
+/// 避免"无 session 项目 + 新鲜缓存"被误判为后台扫描中。
 #[tauri::command]
 pub fn get_ai_sessions(
     app: AppHandle,
     cache: tauri::State<'_, SessionCache>,
     project_path: String,
     force: Option<bool>,
-) -> Result<Vec<AiSession>, String> {
+) -> Result<SessionsResponse, String> {
     let cache_arc = cache.inner.clone();
     let force = force.unwrap_or(false);
 
@@ -419,16 +431,16 @@ pub fn get_ai_sessions(
 
     match cached {
         Some((sessions, elapsed)) => {
-            // 有缓存：立即返回；过期或强制时启动后台刷新
-            if force || elapsed >= CACHE_TTL {
+            let need_refresh = force || elapsed >= CACHE_TTL;
+            if need_refresh {
                 refresh_in_background(app, cache_arc, project_path);
             }
-            Ok(sessions)
+            Ok(SessionsResponse { sessions, scanning: need_refresh })
         }
         None => {
-            // 无缓存（首次加载）：立即返回空列表，后台扫描完成后通过 sessions-updated 通知
+            // 无缓存（首次加载）：立即返回空列表，后台扫描
             refresh_in_background(app, cache_arc, project_path);
-            Ok(vec![])
+            Ok(SessionsResponse { sessions: vec![], scanning: true })
         }
     }
 }
