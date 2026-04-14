@@ -182,20 +182,8 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     return true;
   });
 
-  // 右键：有选中文本 → 复制；无选中 → 粘贴（与 Windows Terminal 行为一致）
-  wrapper.addEventListener('contextmenu', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const sel = term.getSelection();
-    if (sel) {
-      writeText(sel);
-      term.clearSelection();
-    } else {
-      void pasteToTerminal(ptyId).finally(() => {
-        term.focus();
-      });
-    }
-  });
+  // 右键菜单统一由 TerminalInstance.tsx 的 onContextMenu 处理，
+  // 此处不再拦截，避免与外层自定义菜单冲突并干扰 TUI 鼠标交互。
 
   // 用户输入 → PTY
   const onDataDisp = term.onData((data) => {

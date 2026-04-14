@@ -130,8 +130,9 @@ export function TerminalInstance({ ptyId }: Props) {
       {
         label: '粘贴',
         onClick: () => {
-          void pasteToTerminal(ptyId);
-          getCachedTerminal(ptyId)?.term.focus();
+          void pasteToTerminal(ptyId).finally(() => {
+            getCachedTerminal(ptyId)?.term.focus();
+          });
         },
       },
     ]);
