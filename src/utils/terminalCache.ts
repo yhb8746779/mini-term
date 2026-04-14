@@ -15,7 +15,7 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { readText, readImage, writeText } from '@tauri-apps/plugin-clipboard-manager';
-import { useAppStore } from '../store';
+import { useAppStore, findPaneByPty } from '../store';
 import type { PtyOutputPayload } from '../types';
 import { getResolvedTheme } from './themeManager';
 import { createPtyWriteQueue } from './ptyWriteQueue';
@@ -263,6 +263,18 @@ const _isWindows = /Windows/.test(navigator.userAgent);
  * 第一层：通过 readImage() 直接取像素后落盘成临时 PNG（跨平台主路径）。
  * 返回临时文件路径；任何环节失败返回 null。
  */
+/** 轻量探测：剪贴板是否含有图片数据（不落盘，只读尺寸） */
+async function clipboardHasImageData(): Promise<boolean> {
+  try {
+    const image = await readImage();
+    await image.size();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 把剪贴板图片落盘成临时 PNG，返回路径；任何环节失败返回 null */
 async function trySaveStandardClipboardImage(): Promise<string | null> {
   try {
     const image = await readImage();
@@ -278,48 +290,81 @@ async function trySaveStandardClipboardImage(): Promise<string | null> {
   }
 }
 
+/**
+ * 判断 ptyId 对应的 pane 当前是否处于 AI 会话状态。
+ * 用于决定图片粘贴是走 Alt+V（让 AI 工具自己接管）还是落盘路径。
+ */
+function isAiPty(ptyId: number): boolean {
+  const { projectStates } = useAppStore.getState();
+  for (const ps of projectStates.values()) {
+    for (const tab of ps.tabs) {
+      const pane = findPaneByPty(tab.splitLayout, ptyId);
+      if (pane) {
+        return (
+          pane.status === 'ai-generating' ||
+          pane.status === 'ai-thinking' ||
+          pane.status === 'ai-complete' ||
+          pane.status === 'ai-awaiting-input'
+        );
+      }
+    }
+  }
+  return false;
+}
+
 /** 读取系统剪贴板并写入终端 PTY。
  *
- * 优先级：
- *   1. readImage() 像素落盘（跨平台，覆盖系统截图/浏览器复制图片）
- *   2. macOS NSPasteboard 原生兜底（覆盖微信截图等私有格式）
- *   3. Windows CF_DIB/CF_BITMAP 原生兜底（覆盖非标准 Win32 格式）
- *   4. 纯文本
- *   5. Alt+V（最后保险，让 AI 工具自己读图）
+ * AI pane 优先级：
+ *   1. 检测到图片 + AI pane → Alt+V（让 Claude/Codex 自己接管，得到 image #1）
+ *   2. 非 AI pane：readImage() 像素落盘 → temp PNG 路径
+ *   3. macOS NSPasteboard 原生兜底
+ *   4. Windows CF_DIB/CF_BITMAP 原生兜底
+ *   5. 纯文本
+ *   6. Alt+V 最后保险（图片存在但所有路径均失败）
  */
 export async function pasteToTerminal(ptyId: number): Promise<void> {
-  const stdPath = await trySaveStandardClipboardImage();
-  if (stdPath) {
-    await enqueuePtyWrite(ptyId, stdPath);
+  const hasImage = await clipboardHasImageData();
+
+  // AI pane：优先让 Claude/Codex 自己接管图片粘贴，得到 image #1 附件
+  if (hasImage && isAiPty(ptyId)) {
+    await enqueuePtyWrite(ptyId, '\x1bv');
     return;
   }
 
-  if (_isMacOS) {
-    try {
-      const path: string = await invoke('read_clipboard_image_macos');
-      await enqueuePtyWrite(ptyId, path);
+  // 非 AI pane：标准落盘路径
+  if (hasImage) {
+    const stdPath = await trySaveStandardClipboardImage();
+    if (stdPath) {
+      await enqueuePtyWrite(ptyId, stdPath);
       return;
-    } catch {
-      // NSPasteboard 读取失败，继续
     }
+
+    if (_isMacOS) {
+      try {
+        const path: string = await invoke('read_clipboard_image_macos');
+        await enqueuePtyWrite(ptyId, path);
+        return;
+      } catch {
+        // NSPasteboard 读取失败，继续
+      }
+    }
+
+    if (_isWindows) {
+      try {
+        const path: string = await invoke('read_clipboard_image');
+        await enqueuePtyWrite(ptyId, path);
+        return;
+      } catch {
+        // CF_DIB/CF_BITMAP 读取失败，继续
+      }
+    }
+
+    // 图片存在但所有落盘路径均失败，退回 Alt+V
+    await enqueuePtyWrite(ptyId, '\x1bv');
+    return;
   }
 
-  if (_isWindows) {
-    try {
-      const path: string = await invoke('read_clipboard_image');
-      await enqueuePtyWrite(ptyId, path);
-      return;
-    } catch {
-      // CF_DIB/CF_BITMAP 读取失败，继续
-    }
-  }
-
+  // 无图片：纯文本
   const text = await readText().catch(() => null);
-  if (text) {
-    await enqueuePtyWrite(ptyId, text);
-    return;
-  }
-
-  // 剪贴板有图但所有路径均失败，退回 Alt+V 让 AI 工具自己读
-  await enqueuePtyWrite(ptyId, '\x1bv');
+  if (text) await enqueuePtyWrite(ptyId, text);
 }

@@ -83,7 +83,7 @@ export function collectPtyIds(node: SplitNode): number[] {
 }
 
 // 查找 ptyId 所属的 pane（按 SplitNode 树深搜）
-function findPaneByPty(node: SplitNode, ptyId: number): PaneState | null {
+export function findPaneByPty(node: SplitNode, ptyId: number): PaneState | null {
   if (node.type === 'leaf') {
     return node.panes.find((p) => p.ptyId === ptyId) ?? null;
   }
