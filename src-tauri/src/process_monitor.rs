@@ -18,18 +18,24 @@ const AI_GENERATING_WINDOW: Duration = Duration::from_secs(2);
 const AI_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 强交互短语：出现即触发 ai-awaiting-input
+///
+/// 设计原则：
+/// 1. 必须是"出现在当前行末尾/疑问句"的交互提示，不能是普通说明文字中会出现的词
+/// 2. 单个短词（allow/approve/confirm）太宽泛，用更具体的短语替代
+/// 3. 已有更长、更精确的短语覆盖的词不重复加（如 "do you want to allow" 已覆盖 "allow?"）
 const AWAITING_STRONG: &[&str] = &[
-    "allow",
-    "approve",
-    "authorization",
-    "authorize",
-    "grant access",
+    // 明确询问用户的短语
+    "do you want to allow",
+    "do you want to",
+    "are you sure",
     "requires approval",
     "requesting approval",
-    "do you want to allow",
+    "grant access",
+    // 带问号的确认短语（避免 "confirmed" / "configuration" 误判）
     "continue?",
-    "confirm",
-    "are you sure",
+    "confirm?",
+    "authorize?",
+    // 按键/选项提示（出现即代表等待用户操作）
     "press enter",
     "press any key",
     "hit enter",
@@ -41,6 +47,7 @@ const AWAITING_STRONG: &[&str] = &[
     "esc to cancel",
     "ctrl+a to",
     "ctrl+b to",
+    // 布尔选择提示
     "y/n",
     "[y/n]",
     "(y/n)",
@@ -55,6 +62,12 @@ const AWAITING_EXCLUSIONS: &[&str] = &[
     "approval policy",
     "permissionmode",
     "errorcode",
+    // codex / claude 启动时的权限说明行（非交互）
+    "allowed tools",
+    "allowed:",
+    "not allowed",
+    "allowed operations",
+    "approval mode",
 ];
 
 /// 简单 ANSI strip：去掉 ESC[…m 类转义，保留可读文本
