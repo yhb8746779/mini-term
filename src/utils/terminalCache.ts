@@ -246,13 +246,29 @@ export function writePtyInput(ptyId: number, data: string): Promise<void> {
   return enqueuePtyWrite(ptyId, data);
 }
 
-/** 复制当前终端选中文本到系统剪贴板。无选中则不操作。返回是否有内容被复制。 */
+/**
+ * 获取当前选中文本：优先取 xterm 选区，fallback 到页面 DOM 选区。
+ * 解决 Claude/Codex TUI 内部自管理文本区域不反映为 xterm selection 的问题。
+ */
+export function getAnySelectedText(ptyId: number): string {
+  const termSel = cache.get(ptyId)?.term.getSelection() ?? '';
+  if (termSel) return termSel;
+  return window.getSelection()?.toString().trim() ?? '';
+}
+
+/** 复制当前选中文本到系统剪贴板（xterm 选区 + DOM 选区双路径）。返回是否有内容被复制。 */
 export async function copyTerminalSelection(ptyId: number): Promise<boolean> {
-  const cached = cache.get(ptyId);
-  if (!cached) return false;
-  const sel = cached.term.getSelection();
+  const sel = getAnySelectedText(ptyId);
   if (!sel) return false;
-  await writeText(sel);
+  try {
+    await writeText(sel);
+  } catch {
+    try {
+      await navigator.clipboard.writeText(sel);
+    } catch {
+      return false;
+    }
+  }
   return true;
 }
 

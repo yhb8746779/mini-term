@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
-import { getOrCreateTerminal, getCachedTerminal, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal } from '../utils/terminalCache';
+import { getOrCreateTerminal, getCachedTerminal, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal, getAnySelectedText } from '../utils/terminalCache';
 import { getResolvedTheme } from '../utils/themeManager';
 import { showContextMenu } from '../utils/contextMenu';
 import '@xterm/xterm/css/xterm.css';
@@ -120,7 +120,7 @@ export function TerminalInstance({ ptyId }: Props) {
 
   const handleContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
-    const hasSelection = !!getCachedTerminal(ptyId)?.term.getSelection();
+    const hasSelection = !!getAnySelectedText(ptyId);
     showContextMenu(e.clientX, e.clientY, [
       {
         label: '复制',
