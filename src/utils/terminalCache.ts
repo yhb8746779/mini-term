@@ -277,8 +277,9 @@ export async function copyTerminalSelection(ptyId: number): Promise<boolean> {
   return copyTextToClipboard(getAnySelectedText(ptyId));
 }
 
-const _isMacOS = /Mac OS X|Macintosh/.test(navigator.userAgent);
-const _isWindows = /Windows/.test(navigator.userAgent);
+export const _isMacOS = /Mac OS X|Macintosh/.test(navigator.userAgent);
+export const _isWindows = /Windows/.test(navigator.userAgent);
+export const _isLinux = /Linux/.test(navigator.userAgent) && !_isWindows && !_isMacOS;
 
 /**
  * 第一层：通过 readImage() 直接取像素后落盘成临时 PNG（跨平台主路径）。
@@ -333,47 +334,51 @@ function getAiProviderForPty(ptyId: number): AiProvider | null {
   return null;
 }
 
-/**
- * 按 provider + platform 发送对应的"原生图片粘贴"快捷键。
- *
- * macOS:
- *   claude  → Ctrl+V (\x16)   Claude Code 在 mac 上响应 Ctrl+V 触发图片附件
- *   codex   → Alt+V  (\x1bv)  本机已验证可工作的路径
- *   gemini  → Ctrl+V (\x16)
- * Windows / Linux:
- *   claude  → Alt+V  (\x1bv)
- *   codex   → Ctrl+V (\x16)
- *   gemini  → Ctrl+V (\x16)
- */
+type ImagePasteShortcut = 'ctrl-v' | 'alt-v';
+
+function getProviderImagePasteShortcut(provider: AiProvider): ImagePasteShortcut {
+  if (_isMacOS) {
+    // 本机已验证：Codex on macOS 走 Alt+V；Claude/Gemini 走 Ctrl+V。
+    if (provider === 'codex') return 'alt-v';
+    return 'ctrl-v';
+  }
+  if (_isWindows) {
+    // Windows 上所有 AI CLI 图片粘贴均走 Alt+V（用户实测确认）。
+    return 'alt-v';
+  }
+  if (_isLinux) {
+    // Linux 上三家 CLI 先统一走 Ctrl+V，便于后续按实测继续细分。
+    return 'ctrl-v';
+  }
+  return 'ctrl-v';
+}
+
+async function sendImagePasteShortcut(
+  ptyId: number,
+  shortcut: ImagePasteShortcut,
+): Promise<void> {
+  if (shortcut === 'alt-v') {
+    await enqueuePtyWrite(ptyId, '\x1bv');
+    return;
+  }
+  await enqueuePtyWrite(ptyId, '\x16');
+}
+
+/** 按 provider + platform 发送对应的"原生图片粘贴"快捷键。 */
 async function sendProviderImagePasteShortcut(
   ptyId: number,
   provider: AiProvider,
 ): Promise<void> {
-  if (_isMacOS) {
-    if (provider === 'codex') {
-      await enqueuePtyWrite(ptyId, '\x1bv'); // Alt+V：本机已验证
-    } else {
-      await enqueuePtyWrite(ptyId, '\x16');  // Ctrl+V：claude / gemini
-    }
-    return;
-  }
-  if (_isWindows) {
-    if (provider === 'claude') {
-      await enqueuePtyWrite(ptyId, '\x1bv'); // Alt+V：Windows claude
-    } else {
-      await enqueuePtyWrite(ptyId, '\x16');  // Ctrl+V：codex / gemini
-    }
-    return;
-  }
-  // Linux / fallback
-  await enqueuePtyWrite(ptyId, '\x16');
+  const shortcut = getProviderImagePasteShortcut(provider);
+  await sendImagePasteShortcut(ptyId, shortcut);
 }
 
 /** 读取系统剪贴板并写入终端 PTY。
  *
  * AI pane（按 provider + platform 分流）：
- *   macOS claude  → Ctrl+V；macOS codex → Alt+V；macOS gemini → Ctrl+V
- *   Windows claude → Alt+V；其余 → Ctrl+V
+ *   macOS:   claude → Ctrl+V；codex → Alt+V；gemini → Ctrl+V
+ *   Windows: claude → Alt+V；codex/gemini → Ctrl+V
+ *   Linux:   先统一 Ctrl+V（后续按实测继续细分）
  * 非 AI pane：
  *   readImage() 落盘 → temp PNG 路径 → macOS/Windows 原生兜底 → 纯文本 → Alt+V
  */

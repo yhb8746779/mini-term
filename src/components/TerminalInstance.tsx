@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
-import { getOrCreateTerminal, getCachedTerminal, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTextToClipboard, pasteToTerminal, getAnySelectedText } from '../utils/terminalCache';
+import { getOrCreateTerminal, getCachedTerminal, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTextToClipboard, pasteToTerminal, getAnySelectedText, _isWindows } from '../utils/terminalCache';
 import { getResolvedTheme } from '../utils/themeManager';
 import { showContextMenu } from '../utils/contextMenu';
 import '@xterm/xterm/css/xterm.css';
@@ -120,8 +120,22 @@ export function TerminalInstance({ ptyId }: Props) {
 
   const handleContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
-    // 在菜单弹出时立即拍快照，避免点击菜单项时 xterm 选区已消失
     const selectedText = getAnySelectedText(ptyId);
+
+    // Windows：与 Windows Terminal 一致，右键直接复制或粘贴，不弹菜单
+    if (_isWindows) {
+      if (selectedText) {
+        void copyTextToClipboard(selectedText);
+        getCachedTerminal(ptyId)?.term.clearSelection();
+      } else {
+        void pasteToTerminal(ptyId).finally(() => {
+          getCachedTerminal(ptyId)?.term.focus();
+        });
+      }
+      return;
+    }
+
+    // macOS / Linux：弹自定义菜单
     // 菜单关闭后统一回焦终端（复制/粘贴任意操作后都生效）
     const refocusTerminal = () => {
       requestAnimationFrame(() => {
