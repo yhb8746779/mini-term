@@ -347,19 +347,6 @@ impl PtyManager {
         let entered_recently = elapsed_opt.map_or(false, |e| e <= PREDICTION_ECHO_GRACE);
         if entered_recently {
             let detected = output_contains_ai_command(output);
-            #[cfg(debug_assertions)]
-            {
-                let stripped = strip_ansi_codes(output).replace('\r', "\n");
-                eprintln!("[PTY-DBG pty={pty_id}] grace-path: elapsed={:?} detected={detected}",
-                    elapsed_opt);
-                for (i, line) in stripped.lines().enumerate().take(10) {
-                    let collapsed = apply_backspaces(line);
-                    if !collapsed.trim().is_empty() {
-                        let n = collapsed.char_indices().nth(120).map_or(collapsed.len(), |(i, _)| i);
-                        eprintln!("[PTY-DBG pty={pty_id}]   grace[{i}]: {:?}", &collapsed[..n]);
-                    }
-                }
-            }
             if detected {
                 self.ai_sessions.lock().unwrap().insert(pty_id);
                 if let Some(provider) = detect_provider_from_output(output) {
@@ -466,28 +453,12 @@ impl PtyManager {
             let ose = self.output_since_enter.lock().unwrap();
             if let Some(ose_data) = ose.get(&pty_id) {
                 let detected = output_contains_ai_command(ose_data);
-                #[cfg(debug_assertions)]
-                {
-                    let stripped = strip_ansi_codes(ose_data).replace('\r', "\n");
-                    eprintln!("[PTY-DBG pty={pty_id}] Enter: OSE len={}, detected={detected}",
-                        ose_data.len());
-                    for (i, line) in stripped.lines().enumerate().take(20) {
-                        let collapsed = apply_backspaces(line);
-                        if !collapsed.trim().is_empty() {
-                            let n = collapsed.char_indices().nth(120).map_or(collapsed.len(), |(i, _)| i);
-                            eprintln!("[PTY-DBG pty={pty_id}]   line[{i}]: {:?}", &collapsed[..n]);
-                        }
-                    }
-                }
                 if detected {
                     enter_ai = true;
                     if detected_provider.is_none() {
                         detected_provider = detect_provider_from_output(ose_data);
                     }
                 }
-            } else {
-                #[cfg(debug_assertions)]
-                eprintln!("[PTY-DBG pty={pty_id}] Enter: OSE entry missing");
             }
         }
         // Enter 后重置 output_since_enter，为下一条命令重新积累
