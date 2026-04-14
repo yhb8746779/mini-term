@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
-import { getOrCreateTerminal, getCachedTerminal, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTextToClipboard, pasteToTerminal, getAnySelectedText, _isWindows } from '../utils/terminalCache';
+import { getOrCreateTerminal, getCachedTerminal, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTextToClipboard, pasteToTerminal, getAnySelectedText, _isWindows, _isMacOS } from '../utils/terminalCache';
 import { getResolvedTheme } from '../utils/themeManager';
 import { showContextMenu } from '../utils/contextMenu';
 import '@xterm/xterm/css/xterm.css';
@@ -122,8 +122,8 @@ export function TerminalInstance({ ptyId }: Props) {
     e.preventDefault();
     const selectedText = getAnySelectedText(ptyId);
 
-    // Windows：与 Windows Terminal 一致，右键直接复制或粘贴，不弹菜单
-    if (_isWindows) {
+    // macOS / Windows：与原生终端一致，右键直接复制或粘贴，不弹菜单
+    if (_isMacOS || _isWindows) {
       if (selectedText) {
         void copyTextToClipboard(selectedText);
         getCachedTerminal(ptyId)?.term.clearSelection();
@@ -135,8 +135,7 @@ export function TerminalInstance({ ptyId }: Props) {
       return;
     }
 
-    // macOS / Linux：弹自定义菜单
-    // 菜单关闭后统一回焦终端（复制/粘贴任意操作后都生效）
+    // Linux：暂保留菜单，等实机验证后再决定是否统一
     const refocusTerminal = () => {
       requestAnimationFrame(() => {
         getCachedTerminal(ptyId)?.term.focus();

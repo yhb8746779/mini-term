@@ -281,21 +281,6 @@ export const _isMacOS = /Mac OS X|Macintosh/.test(navigator.userAgent);
 export const _isWindows = /Windows/.test(navigator.userAgent);
 export const _isLinux = /Linux/.test(navigator.userAgent) && !_isWindows && !_isMacOS;
 
-/**
- * 第一层：通过 readImage() 直接取像素后落盘成临时 PNG（跨平台主路径）。
- * 返回临时文件路径；任何环节失败返回 null。
- */
-/** 轻量探测：剪贴板是否含有图片数据（不落盘，只读尺寸） */
-async function clipboardHasImageData(): Promise<boolean> {
-  try {
-    const image = await readImage();
-    await image.size();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /** 把剪贴板图片落盘成临时 PNG，返回路径；任何环节失败返回 null */
 async function trySaveStandardClipboardImage(): Promise<string | null> {
   try {
@@ -334,98 +319,142 @@ function getAiProviderForPty(ptyId: number): AiProvider | null {
   return null;
 }
 
-type ImagePasteShortcut = 'ctrl-v' | 'alt-v';
+// ── 平台级 AI 图片粘贴快捷键（不再按 provider 细分）────────────────────────────
 
-function getProviderImagePasteShortcut(provider: AiProvider): ImagePasteShortcut {
-  if (_isMacOS) {
-    // 本机已验证：Codex on macOS 走 Alt+V；Claude/Gemini 走 Ctrl+V。
-    if (provider === 'codex') return 'alt-v';
-    return 'ctrl-v';
-  }
-  if (_isWindows) {
-    // Windows 上所有 AI CLI 图片粘贴均走 Alt+V（用户实测确认）。
-    return 'alt-v';
-  }
-  if (_isLinux) {
-    // Linux 上三家 CLI 先统一走 Ctrl+V，便于后续按实测继续细分。
-    return 'ctrl-v';
-  }
-  return 'ctrl-v';
+/** macOS → Ctrl+V；Windows → Alt+V；Linux/其他 → Ctrl+V */
+function getPlatformAiPasteShortcut(): 'ctrl-v' | 'alt-v' {
+  if (_isWindows) return 'alt-v';
+  return 'ctrl-v'; // macOS / Linux
 }
 
-async function sendImagePasteShortcut(
-  ptyId: number,
-  shortcut: ImagePasteShortcut,
-): Promise<void> {
-  if (shortcut === 'alt-v') {
+async function sendPlatformAiPasteShortcut(ptyId: number): Promise<void> {
+  if (getPlatformAiPasteShortcut() === 'alt-v') {
     await enqueuePtyWrite(ptyId, '\x1bv');
-    return;
+  } else {
+    await enqueuePtyWrite(ptyId, '\x16');
   }
-  await enqueuePtyWrite(ptyId, '\x16');
 }
 
-/** 按 provider + platform 发送对应的"原生图片粘贴"快捷键。 */
-async function sendProviderImagePasteShortcut(
-  ptyId: number,
-  provider: AiProvider,
-): Promise<void> {
-  const shortcut = getProviderImagePasteShortcut(provider);
-  await sendImagePasteShortcut(ptyId, shortcut);
+// ── 剪贴板内容分类器 ────────────────────────────────────────────────────────────
+
+type ClipboardPayloadKind = 'plain-text' | 'raw-image' | 'rich-object' | 'empty-or-unknown';
+
+interface ClipboardPayload {
+  kind: ClipboardPayloadKind;
+  text?: string;
+}
+
+/**
+ * 检测剪贴板内容类型。判断顺序：
+ *   1. 先查 navigator.clipboard.read()（最完整）
+ *   2. 再用 readImage()（Tauri 插件）
+ *   3. 最后 readText()
+ *
+ * 关键原则：有图片/文件/富对象迹象时，不要轻易归成 plain-text。
+ */
+async function detectClipboardPayload(): Promise<ClipboardPayload> {
+  // 优先用 Web Clipboard API 读取类型信息
+  try {
+    const items = await navigator.clipboard.read();
+    for (const item of items) {
+      // 有图片类型
+      if (item.types.some((t) => t.startsWith('image/'))) {
+        return { kind: 'raw-image' };
+      }
+      // 有文件/URI/其他富对象类型（排除纯文本）
+      const hasRich = item.types.some(
+        (t) => t !== 'text/plain' && t !== 'text/html',
+      );
+      const hasText = item.types.includes('text/plain');
+      if (hasRich) {
+        // 富对象：可能同时带 text/plain，但语义上应交给 CLI 自己处理
+        return { kind: 'rich-object' };
+      }
+      if (hasText) {
+        try {
+          const blob = await item.getType('text/plain');
+          const text = await blob.text();
+          if (text.trim()) return { kind: 'plain-text', text };
+        } catch { /* ignore */ }
+      }
+    }
+  } catch { /* Clipboard API 不可用时继续 fallback */ }
+
+  // Tauri readImage() 兜底图片检测
+  try {
+    const image = await readImage();
+    await image.size();
+    return { kind: 'raw-image' };
+  } catch { /* 非图片 */ }
+
+  // readText() 兜底文本
+  try {
+    const text = await readText();
+    if (text && text.trim()) return { kind: 'plain-text', text };
+  } catch { /* ignore */ }
+
+  return { kind: 'empty-or-unknown' };
 }
 
 /** 读取系统剪贴板并写入终端 PTY。
  *
- * AI pane（按 provider + platform 分流）：
- *   macOS:   claude → Ctrl+V；codex → Alt+V；gemini → Ctrl+V
- *   Windows: claude → Alt+V；codex/gemini → Ctrl+V
- *   Linux:   先统一 Ctrl+V（后续按实测继续细分）
+ * AI pane：
+ *   plain-text → 直接写文本
+ *   其他（raw-image / rich-object / unknown）→ 平台 native paste shortcut
+ *     macOS → Ctrl+V；Windows → Alt+V；Linux → Ctrl+V
+ *
  * 非 AI pane：
- *   readImage() 落盘 → temp PNG 路径 → macOS/Windows 原生兜底 → 纯文本 → Alt+V
+ *   plain-text → 直接写文本
+ *   raw-image  → readImage() 落盘 temp PNG → macOS/Windows 原生兜底
+ *   rich-object / unknown → 尝试文本兜底，再 Alt+V 保险
  */
 export async function pasteToTerminal(ptyId: number): Promise<void> {
-  const hasImage = await clipboardHasImageData();
-  const provider = getAiProviderForPty(ptyId);
+  const isAiPane = !!getAiProviderForPty(ptyId);
+  const clipboard = await detectClipboardPayload();
 
-  // AI pane：按 provider + platform 发送专属图片粘贴快捷键
-  if (hasImage && provider) {
-    await sendProviderImagePasteShortcut(ptyId, provider);
+  if (isAiPane) {
+    // 明确纯文本：直接贴文本，不走 native paste shortcut
+    if (clipboard.kind === 'plain-text' && clipboard.text) {
+      await enqueuePtyWrite(ptyId, clipboard.text);
+      return;
+    }
+    // 其他（图片 / 富对象 / unknown）：优先交给 CLI 自己处理
+    await sendPlatformAiPasteShortcut(ptyId);
     return;
   }
 
-  // 非 AI pane：标准落盘路径
-  if (hasImage) {
+  // 非 AI pane
+  if (clipboard.kind === 'plain-text' && clipboard.text) {
+    await enqueuePtyWrite(ptyId, clipboard.text);
+    return;
+  }
+
+  if (clipboard.kind === 'raw-image') {
     const stdPath = await trySaveStandardClipboardImage();
     if (stdPath) {
       await enqueuePtyWrite(ptyId, stdPath);
       return;
     }
-
     if (_isMacOS) {
       try {
         const path: string = await invoke('read_clipboard_image_macos');
         await enqueuePtyWrite(ptyId, path);
         return;
-      } catch {
-        // NSPasteboard 读取失败，继续
-      }
+      } catch { /* 继续 */ }
     }
-
     if (_isWindows) {
       try {
         const path: string = await invoke('read_clipboard_image');
         await enqueuePtyWrite(ptyId, path);
         return;
-      } catch {
-        // CF_DIB/CF_BITMAP 读取失败，继续
-      }
+      } catch { /* 继续 */ }
     }
-
-    // 图片存在但所有落盘路径均失败，退回 Alt+V
-    await enqueuePtyWrite(ptyId, '\x1bv');
-    return;
   }
 
-  // 无图片：纯文本
-  const text = await readText().catch(() => null);
-  if (text) await enqueuePtyWrite(ptyId, text);
+  // rich-object / unknown / 图片落盘全失败：先尝试文本，最后 Alt+V 保险
+  if (clipboard.text) {
+    await enqueuePtyWrite(ptyId, clipboard.text);
+    return;
+  }
+  await enqueuePtyWrite(ptyId, '\x1bv');
 }
