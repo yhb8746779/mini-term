@@ -14,7 +14,7 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager';
+import { readText, readImage, writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useAppStore } from '../store';
 import type { PtyOutputPayload } from '../types';
 import { getResolvedTheme } from './themeManager';
@@ -191,11 +191,8 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
       writeText(sel);
       term.clearSelection();
     } else {
-      readText().then((text) => {
-        if (text) {
-          invoke('write_pty', { ptyId, data: text });
-          term.focus();
-        }
+      void pasteToTerminal(ptyId).finally(() => {
+        term.focus();
       });
     }
   });
@@ -271,8 +268,40 @@ export async function copyTerminalSelection(ptyId: number): Promise<boolean> {
   return true;
 }
 
-/** 读取系统剪贴板并写入终端 PTY。 */
+/** 检测剪贴板是否包含图片（双路径探测，降低误判概率） */
+async function clipboardHasImage(): Promise<boolean> {
+  try {
+    await readImage();
+    return true;
+  } catch {
+    // Tauri 插件可能读不到某些图片格式
+  }
+  try {
+    const items = await navigator.clipboard.read();
+    return items.some((item) => item.types.some((t) => t.startsWith('image/')));
+  } catch {
+    // 浏览器 Clipboard API 在某些环境/权限下可能不可用
+  }
+  return false;
+}
+
+/** 读取系统剪贴板并写入终端 PTY。
+ *  - 剪贴板含图片：调用 read_clipboard_image 写入临时 PNG 路径；失败则退回 Alt+V
+ *  - 剪贴板含文本：写入文本（保持原有行为）
+ */
 export async function pasteToTerminal(ptyId: number): Promise<void> {
-  const text = await readText();
+  if (await clipboardHasImage()) {
+    try {
+      const path: string = await invoke('read_clipboard_image');
+      await enqueuePtyWrite(ptyId, path);
+      return;
+    } catch {
+      // Windows 非标准格式兜底失败，退回 Alt+V 让 AI 工具自己读图
+    }
+    await enqueuePtyWrite(ptyId, '\x1bv');
+    return;
+  }
+
+  const text = await readText().catch(() => null);
   if (text) await enqueuePtyWrite(ptyId, text);
 }

@@ -1,4 +1,5 @@
 mod ai_sessions;
+mod clipboard;
 mod config;
 mod editor;
 mod fs;
@@ -21,6 +22,7 @@ pub fn run() {
         .manage(ai_sessions::SessionCache::new())
         .manage(git::GitRepoCache::new())
         .setup(|app| {
+            clipboard::cleanup_old_clipboard_images();
             let pty_manager = app.state::<crate::pty::PtyManager>();
             let pty_clone = pty_manager.inner().clone();
             process_monitor::start_monitor(app.handle().clone(), pty_clone);
@@ -54,6 +56,7 @@ pub fn run() {
             perf_log::clear_perf_log,
             perf_log::read_perf_log,
             perf_log::log_perf_from_frontend,
+            clipboard::read_clipboard_image,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
