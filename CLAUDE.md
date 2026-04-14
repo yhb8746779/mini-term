@@ -12,6 +12,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **状态管理**: Zustand（全局单一 store）
 - **布局分割**: Allotment（三栏主布局）+ 递归 SplitNode 树（分屏终端）
 
+## Git 仓库配置
+
+- **origin**（上游原始仓库）：`https://github.com/dreamlonglll/mini-term.git`（只读，不要推送）
+- **fork**（自己的 fork，推送目标）：`https://github.com/yhb8746779/mini-term.git`
+- **推送命令**：`git push fork main`（不要用 `git push` 或 `git push origin`）
+
 ## 开发命令
 
 ```bash

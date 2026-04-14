@@ -33,10 +33,10 @@ fn save_rgba_png(rgba: &[u8], width: u32, height: u32) -> Result<PathBuf, String
 mod win {
     use super::save_rgba_png;
     use std::path::PathBuf;
-    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleDC, DeleteDC, GetDIBits, SelectObject, BITMAPINFO, BITMAPINFOHEADER,
-        DIB_RGB_COLORS, HBITMAP,
+        DIB_RGB_COLORS, HBITMAP, HGDIOBJ,
     };
     use windows::Win32::System::DataExchange::{
         CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
@@ -73,13 +73,14 @@ mod win {
         let hmem = GetClipboardData(CF_DIB)
             .map_err(|e| format!("GetClipboardData(CF_DIB) 失败: {e}"))?;
 
-        let ptr = GlobalLock(HANDLE(hmem.0 as _));
+        let hglobal = HGLOBAL(hmem.0 as *mut _);
+        let ptr = GlobalLock(hglobal);
         if ptr.is_null() {
             return Err("GlobalLock 失败".into());
         }
-        let size = GlobalSize(HANDLE(hmem.0 as _));
+        let size = GlobalSize(hglobal);
         let data: Vec<u8> = std::slice::from_raw_parts(ptr as *const u8, size).to_vec();
-        let _ = GlobalUnlock(HANDLE(hmem.0 as _));
+        let _ = GlobalUnlock(hglobal);
 
         if data.len() < std::mem::size_of::<BITMAPINFOHEADER>() {
             return Err("CF_DIB 数据过短".into());
@@ -108,7 +109,7 @@ mod win {
             return Err("CreateCompatibleDC 失败".into());
         }
 
-        let old_obj = SelectObject(hdc, hbitmap.into());
+        let old_obj = SelectObject(hdc, HGDIOBJ(hbitmap.0 as _));
 
         let mut bi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
