@@ -122,6 +122,12 @@ export function TerminalInstance({ ptyId }: Props) {
     e.preventDefault();
     // 在菜单弹出时立即拍快照，避免点击菜单项时 xterm 选区已消失
     const selectedText = getAnySelectedText(ptyId);
+    // 菜单关闭后统一回焦终端（复制/粘贴任意操作后都生效）
+    const refocusTerminal = () => {
+      requestAnimationFrame(() => {
+        getCachedTerminal(ptyId)?.term.focus();
+      });
+    };
     showContextMenu(e.clientX, e.clientY, [
       {
         label: '复制',
@@ -130,13 +136,9 @@ export function TerminalInstance({ ptyId }: Props) {
       },
       {
         label: '粘贴',
-        onClick: () => {
-          void pasteToTerminal(ptyId).finally(() => {
-            getCachedTerminal(ptyId)?.term.focus();
-          });
-        },
+        onClick: () => { void pasteToTerminal(ptyId); },
       },
-    ]);
+    ], refocusTerminal);
   };
 
   return (

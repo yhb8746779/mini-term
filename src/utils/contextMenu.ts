@@ -16,7 +16,12 @@ type MenuEntry = MenuItem | MenuSeparator;
 // 避免额外的 cleanedUp 布尔标志。
 let currentCleanup: (() => void) | null = null;
 
-export function showContextMenu(x: number, y: number, items: MenuEntry[]) {
+export function showContextMenu(
+  x: number,
+  y: number,
+  items: MenuEntry[],
+  afterClose?: () => void,
+) {
   // 先关闭上一个菜单(DOM + document listener 一并清理)
   if (currentCleanup) {
     currentCleanup();
@@ -26,6 +31,8 @@ export function showContextMenu(x: number, y: number, items: MenuEntry[]) {
   menu.className = 'fixed ctx-menu text-xs';
   menu.style.left = `${x}px`;
   menu.style.top = `${y}px`;
+  // 阻止菜单自身的 mousedown 把焦点从终端抢走
+  menu.onmousedown = (e) => { e.preventDefault(); };
 
   // 先声明 cleanup/onKey,再构建菜单项,避免 item.onclick 里前向引用
   const cleanup = () => {
@@ -53,10 +60,14 @@ export function showContextMenu(x: number, y: number, items: MenuEntry[]) {
     if (entry.disabled) classes.push('disabled');
     item.className = classes.join(' ');
     item.textContent = entry.label;
+    // 阻止菜单项 mousedown 抢焦点
+    item.onmousedown = (e) => { e.preventDefault(); };
     item.onclick = () => {
       if (entry.disabled) return;
       entry.onClick();
       cleanup();
+      // 延迟一帧回调，确保 onClick 的异步操作（粘贴/复制）已入队
+      if (afterClose) requestAnimationFrame(afterClose);
     };
     menu.appendChild(item);
   });
