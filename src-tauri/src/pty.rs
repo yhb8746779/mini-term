@@ -523,6 +523,29 @@ impl PtyManager {
     }
 }
 
+/// 返回 `bytes` 中最后一个完整 UTF-8 字符之后的偏移量。
+/// 用于 PTY 输出 flush 时避免在多字节字符边界截断。
+fn find_valid_utf8_prefix_len(bytes: &[u8]) -> usize {
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        let byte = bytes[i];
+        if byte < 0x80 {
+            // ASCII，本身完整
+            return bytes.len();
+        } else if byte >= 0xC0 {
+            // 多字节序列起始字节：检查后续延续字节是否足够
+            let expected = if byte >= 0xF0 { 4 } else if byte >= 0xE0 { 3 } else { 2 };
+            if bytes.len() - i >= expected {
+                return bytes.len(); // 序列完整
+            }
+            return i; // 截断到该起始字节之前
+        }
+        // 0x80..0xBF 是延续字节，继续向前
+    }
+    i
+}
+
 #[tauri::command]
 pub fn create_pty(
     app: AppHandle,
@@ -547,9 +570,37 @@ pub fn create_pty(
     // enable colors and advanced cursor rendering.
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
-    // Ensure UTF-8 encoding for proper CJK/emoji rendering.
-    // Only set LC_CTYPE to avoid overriding the user's locale preferences.
-    cmd.env("LC_CTYPE", "UTF-8");
+
+    // ── UTF-8 locale 注入 ──────────────────────────────────────────────────
+    // GUI 应用启动时环境里可能没有完整 LANG/LC_CTYPE，导致子进程回退到 C/ASCII。
+    // 策略：继承父进程已有的 UTF-8 locale；仅在缺失时补完整 locale 名称。
+    // 不写死裸 "UTF-8"（非标准），不强制覆盖用户已有的 UTF-8 设置。
+    {
+        fn has_utf8_locale(value: &str) -> bool {
+            value.to_ascii_uppercase().contains("UTF-8")
+        }
+
+        let fallback_locale = if cfg!(target_os = "macos") {
+            "en_US.UTF-8"
+        } else {
+            "C.UTF-8"
+        };
+
+        let inherited_lang = std::env::var("LANG").ok();
+        let inherited_lc_ctype = std::env::var("LC_CTYPE").ok();
+
+        if !inherited_lang.as_deref().is_some_and(has_utf8_locale) {
+            cmd.env("LANG", fallback_locale);
+        }
+
+        if !inherited_lc_ctype.as_deref().is_some_and(has_utf8_locale) {
+            let lc_ctype_val = inherited_lang
+                .as_deref()
+                .filter(|v| has_utf8_locale(v))
+                .unwrap_or(fallback_locale);
+            cmd.env("LC_CTYPE", lc_ctype_val);
+        }
+    }
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
 
@@ -601,7 +652,11 @@ pub fn create_pty(
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if !pending.is_empty() {
-                        let data = String::from_utf8_lossy(&pending).into_owned();
+                        // 复用与常规 flush 相同的 UTF-8 边界截断逻辑，
+                        // 避免在 PTY 关闭瞬间把尾部截断的多字节字符替换成 U+FFFD。
+                        let valid_len = find_valid_utf8_prefix_len(&pending);
+                        let slice = if valid_len > 0 { &pending[..valid_len] } else { &pending[..] };
+                        let data = String::from_utf8_lossy(slice).into_owned();
                         let _ = app_flush.emit("pty-output", PtyOutputPayload {
                             pty_id: pty_id_for_reader, data,
                         });
@@ -629,34 +684,7 @@ pub fn create_pty(
             }
 
             if !pending.is_empty() {
-                // 找到最后一个完整 UTF-8 字符的边界，避免截断多字节字符
-                let valid_len = {
-                    let mut i = pending.len();
-                    // 从末尾向前扫描，找到可能不完整的 UTF-8 序列起始位置
-                    while i > 0 {
-                        i -= 1;
-                        let byte = pending[i];
-                        if byte < 0x80 {
-                            // ASCII 字符，本身就是完整的
-                            i = pending.len();
-                            break;
-                        } else if byte >= 0xC0 {
-                            // 多字节序列的起始字节，检查序列是否完整
-                            let expected_len = if byte >= 0xF0 { 4 }
-                                else if byte >= 0xE0 { 3 }
-                                else { 2 };
-                            let remaining = pending.len() - i;
-                            if remaining >= expected_len {
-                                // 序列完整
-                                i = pending.len();
-                            }
-                            // 否则 i 就是不完整序列的起始位置
-                            break;
-                        }
-                        // 0x80..0xBF 是延续字节，继续向前找起始字节
-                    }
-                    i
-                };
+                let valid_len = find_valid_utf8_prefix_len(&pending);
 
                 if valid_len > 0 {
                     let data = String::from_utf8_lossy(&pending[..valid_len]).into_owned();
