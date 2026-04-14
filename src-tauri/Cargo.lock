@@ -4743,6 +4743,7 @@ dependencies = [
  "ignore",
  "image",
  "notify",
+ "objc2",
  "pathdiff",
  "portable-pty",
  "serde",

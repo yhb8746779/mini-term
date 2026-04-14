@@ -268,40 +268,70 @@ export async function copyTerminalSelection(ptyId: number): Promise<boolean> {
   return true;
 }
 
-/** 检测剪贴板是否包含图片（双路径探测，降低误判概率） */
-async function clipboardHasImage(): Promise<boolean> {
+const _isMacOS = /Mac OS X|Macintosh/.test(navigator.userAgent);
+const _isWindows = /Windows/.test(navigator.userAgent);
+
+/**
+ * 第一层：通过 readImage() 直接取像素后落盘成临时 PNG（跨平台主路径）。
+ * 返回临时文件路径；任何环节失败返回 null。
+ */
+async function trySaveStandardClipboardImage(): Promise<string | null> {
   try {
-    await readImage();
-    return true;
+    const image = await readImage();
+    const [rgba, size] = await Promise.all([image.rgba(), image.size()]);
+    const path: string = await invoke('save_clipboard_rgba_image', {
+      rgba: Array.from(rgba),
+      width: size.width,
+      height: size.height,
+    });
+    return path;
   } catch {
-    // Tauri 插件可能读不到某些图片格式
+    return null;
   }
-  try {
-    const items = await navigator.clipboard.read();
-    return items.some((item) => item.types.some((t) => t.startsWith('image/')));
-  } catch {
-    // 浏览器 Clipboard API 在某些环境/权限下可能不可用
-  }
-  return false;
 }
 
 /** 读取系统剪贴板并写入终端 PTY。
- *  - 剪贴板含图片：调用 read_clipboard_image 写入临时 PNG 路径；失败则退回 Alt+V
- *  - 剪贴板含文本：写入文本（保持原有行为）
+ *
+ * 优先级：
+ *   1. readImage() 像素落盘（跨平台，覆盖系统截图/浏览器复制图片）
+ *   2. macOS NSPasteboard 原生兜底（覆盖微信截图等私有格式）
+ *   3. Windows CF_DIB/CF_BITMAP 原生兜底（覆盖非标准 Win32 格式）
+ *   4. 纯文本
+ *   5. Alt+V（最后保险，让 AI 工具自己读图）
  */
 export async function pasteToTerminal(ptyId: number): Promise<void> {
-  if (await clipboardHasImage()) {
+  const stdPath = await trySaveStandardClipboardImage();
+  if (stdPath) {
+    await enqueuePtyWrite(ptyId, stdPath);
+    return;
+  }
+
+  if (_isMacOS) {
+    try {
+      const path: string = await invoke('read_clipboard_image_macos');
+      await enqueuePtyWrite(ptyId, path);
+      return;
+    } catch {
+      // NSPasteboard 读取失败，继续
+    }
+  }
+
+  if (_isWindows) {
     try {
       const path: string = await invoke('read_clipboard_image');
       await enqueuePtyWrite(ptyId, path);
       return;
     } catch {
-      // Windows 非标准格式兜底失败，退回 Alt+V 让 AI 工具自己读图
+      // CF_DIB/CF_BITMAP 读取失败，继续
     }
-    await enqueuePtyWrite(ptyId, '\x1bv');
-    return;
   }
 
   const text = await readText().catch(() => null);
-  if (text) await enqueuePtyWrite(ptyId, text);
+  if (text) {
+    await enqueuePtyWrite(ptyId, text);
+    return;
+  }
+
+  // 剪贴板有图但所有路径均失败，退回 Alt+V 让 AI 工具自己读
+  await enqueuePtyWrite(ptyId, '\x1bv');
 }

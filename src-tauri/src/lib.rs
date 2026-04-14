@@ -56,6 +56,8 @@ pub fn run() {
             perf_log::clear_perf_log,
             perf_log::read_perf_log,
             perf_log::log_perf_from_frontend,
+            clipboard::save_clipboard_rgba_image,
+            clipboard::read_clipboard_image_macos,
             clipboard::read_clipboard_image,
         ])
         .run(tauri::generate_context!())

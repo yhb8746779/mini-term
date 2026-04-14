@@ -1,11 +1,39 @@
 /// 图片剪贴板支持模块
 ///
-/// - Windows：通过 Win32 API 读取 CF_DIB / CF_BITMAP 并保存为临时 PNG
-/// - 非 Windows：直接返回错误；前端捕获后退回 Alt+V（让 AI 工具自己读图）
+/// 粘贴路径（按优先级）：
+///   1. 前端 readImage() 像素 → save_clipboard_rgba_image（跨平台）
+///   2. macOS NSPasteboard 原生兜底 → read_clipboard_image_macos
+///   3. Windows CF_DIB/CF_BITMAP 原生兜底 → read_clipboard_image
+///   4. 纯文本（前端处理）
+///   5. Alt+V（最后保险）
+
+use std::path::PathBuf;
+
+// ── 公共 PNG 落盘 helper ───────────────────────────────────────────────────────
+
+fn save_rgba_png(rgba: &[u8], width: u32, height: u32) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join("mini-term-clipboard");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
+
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = dir.join(format!("clip-{millis}.png"));
+
+    image::save_buffer(&path, rgba, width, height, image::ColorType::Rgba8)
+        .map_err(|e| format!("保存 PNG 失败: {e}"))?;
+
+    Ok(path)
+}
+
+// ── Windows：CF_DIB / CF_BITMAP ───────────────────────────────────────────────
 
 #[cfg(windows)]
 mod win {
+    use super::save_rgba_png;
     use std::path::PathBuf;
+    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleDC, DeleteDC, GetDIBits, SelectObject, BITMAPINFO, BITMAPINFOHEADER,
         DIB_RGB_COLORS, HBITMAP,
@@ -14,44 +42,34 @@ mod win {
         CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     };
     use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
-    use windows::Win32::Foundation::HANDLE;
 
-    // 标准剪贴板格式常量
     const CF_DIB: u32 = 8;
     const CF_BITMAP: u32 = 2;
 
     pub fn read_clipboard_to_png() -> Result<PathBuf, String> {
         unsafe {
-            // 打开剪贴板（NULL hwnd 表示当前线程）
             OpenClipboard(None).map_err(|e| format!("打开剪贴板失败: {e}"))?;
-
             let result = try_read_clipboard();
-
-            // 无论成功失败都关闭剪贴板
             let _ = CloseClipboard();
             result
         }
     }
 
-    unsafe fn try_read_clipboard() -> Result<std::path::PathBuf, String> {
-        // 优先尝试 CF_DIB（设备无关位图，包含完整颜色信息）
+    unsafe fn try_read_clipboard() -> Result<PathBuf, String> {
         if IsClipboardFormatAvailable(CF_DIB).is_ok() {
             if let Ok(path) = read_cf_dib() {
                 return Ok(path);
             }
         }
-
-        // 再尝试 CF_BITMAP（与设备相关的 HBITMAP）
         if IsClipboardFormatAvailable(CF_BITMAP).is_ok() {
             if let Ok(path) = read_cf_bitmap() {
                 return Ok(path);
             }
         }
-
         Err("剪贴板中没有可读取的图片格式（CF_DIB / CF_BITMAP）".into())
     }
 
-    unsafe fn read_cf_dib() -> Result<std::path::PathBuf, String> {
+    unsafe fn read_cf_dib() -> Result<PathBuf, String> {
         let hmem = GetClipboardData(CF_DIB)
             .map_err(|e| format!("GetClipboardData(CF_DIB) 失败: {e}"))?;
 
@@ -60,8 +78,6 @@ mod win {
             return Err("GlobalLock 失败".into());
         }
         let size = GlobalSize(HANDLE(hmem.0 as _));
-
-        // 将内存复制到 Vec，之后立即释放锁
         let data: Vec<u8> = std::slice::from_raw_parts(ptr as *const u8, size).to_vec();
         let _ = GlobalUnlock(HANDLE(hmem.0 as _));
 
@@ -79,16 +95,14 @@ mod win {
         }
 
         let rgba = dib_to_rgba(&data, width, height, bit_count)?;
-        save_png(rgba, width, height)
+        save_rgba_png(&rgba, width, height)
     }
 
-    unsafe fn read_cf_bitmap() -> Result<std::path::PathBuf, String> {
+    unsafe fn read_cf_bitmap() -> Result<PathBuf, String> {
         let hmem = GetClipboardData(CF_BITMAP)
             .map_err(|e| format!("GetClipboardData(CF_BITMAP) 失败: {e}"))?;
 
         let hbitmap = HBITMAP(hmem.0 as _);
-
-        // 先查询尺寸：用空 BITMAPINFOHEADER 调用 GetDIBits
         let hdc = CreateCompatibleDC(None);
         if hdc.is_invalid() {
             return Err("CreateCompatibleDC 失败".into());
@@ -103,7 +117,7 @@ mod win {
                 biHeight: 0,
                 biPlanes: 1,
                 biBitCount: 32,
-                biCompression: 0, // BI_RGB
+                biCompression: 0,
                 biSizeImage: 0,
                 biXPelsPerMeter: 0,
                 biYPelsPerMeter: 0,
@@ -113,7 +127,6 @@ mod win {
             ..Default::default()
         };
 
-        // 第一次调用获取尺寸
         GetDIBits(hdc, hbitmap, 0, 0, None, &mut bi, DIB_RGB_COLORS);
         let width = bi.bmiHeader.biWidth.unsigned_abs();
         let height = bi.bmiHeader.biHeight.unsigned_abs();
@@ -125,9 +138,9 @@ mod win {
         }
 
         bi.bmiHeader.biWidth = width as i32;
-        bi.bmiHeader.biHeight = -(height as i32); // 负值 = top-down
+        bi.bmiHeader.biHeight = -(height as i32);
         bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = 0; // BI_RGB
+        bi.bmiHeader.biCompression = 0;
 
         let row_bytes = (width * 4) as usize;
         let mut pixels = vec![0u8; row_bytes * height as usize];
@@ -145,12 +158,12 @@ mod win {
         SelectObject(hdc, old_obj);
         let _ = DeleteDC(hdc);
 
-        // Win32 32-bit DIB 是 BGRA（B G R A），转 RGBA
+        // Win32 32-bit DIB：BGRA → RGBA
         for chunk in pixels.chunks_exact_mut(4) {
-            chunk.swap(0, 2); // B <-> R
+            chunk.swap(0, 2);
         }
 
-        save_png(pixels, width, height)
+        save_rgba_png(&pixels, width, height)
     }
 
     fn dib_to_rgba(data: &[u8], width: u32, height: u32, bit_count: u16) -> Result<Vec<u8>, String> {
@@ -160,7 +173,6 @@ mod win {
 
         match bit_count {
             24 => {
-                // 3 bytes per pixel, bottom-up, rows padded to 4 bytes
                 let row_bytes = ((width * 3 + 3) & !3) as usize;
                 for row in (0..height).rev() {
                     let row_start = row as usize * row_bytes;
@@ -176,7 +188,6 @@ mod win {
                 }
             }
             32 => {
-                // 4 bytes per pixel, bottom-up
                 let row_bytes = (width * 4) as usize;
                 for row in (0..height).rev() {
                     let row_start = row as usize * row_bytes;
@@ -196,29 +207,75 @@ mod win {
 
         Ok(rgba)
     }
+}
 
-    fn save_png(rgba: Vec<u8>, width: u32, height: u32) -> Result<std::path::PathBuf, String> {
-        let dir = std::env::temp_dir().join("mini-term-clipboard");
-        std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
+// ── macOS：NSPasteboard 原生兜底 ──────────────────────────────────────────────
 
-        let millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let path = dir.join(format!("clip-{millis}.png"));
+#[cfg(target_os = "macos")]
+mod mac {
+    use super::save_rgba_png;
+    use std::ffi::c_void;
+    use std::path::PathBuf;
 
-        image::save_buffer(&path, &rgba, width, height, image::ColorType::Rgba8)
-            .map_err(|e| format!("保存 PNG 失败: {e}"))?;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2::msg_send;
 
-        Ok(path)
+    pub fn read_clipboard_to_png() -> Result<PathBuf, String> {
+        unsafe {
+            let pb_cls = AnyClass::get(c"NSPasteboard")
+                .ok_or_else(|| "NSPasteboard class not found".to_string())?;
+
+            let pb: Retained<AnyObject> = msg_send![pb_cls, generalPasteboard];
+
+            // TIFF 是 macOS 剪贴板的首选格式；PNG 作为备选
+            for uti in &["public.tiff", "public.png"] {
+                let str_cls = AnyClass::get(c"NSString")
+                    .ok_or_else(|| "NSString class not found".to_string())?;
+
+                let c_uti = std::ffi::CString::new(*uti).unwrap();
+                let ns_uti: Retained<AnyObject> =
+                    msg_send![str_cls, stringWithUTF8String: c_uti.as_ptr()];
+
+                let data_opt: Option<Retained<AnyObject>> =
+                    msg_send![&pb, dataForType: &*ns_uti];
+
+                let Some(data) = data_opt else { continue };
+
+                let length: usize = msg_send![&data, length];
+                if length == 0 {
+                    continue;
+                }
+
+                let bytes: *const c_void = msg_send![&data, bytes];
+                if bytes.is_null() {
+                    continue;
+                }
+
+                let raw = std::slice::from_raw_parts(bytes as *const u8, length);
+                match image::load_from_memory(raw) {
+                    Ok(img) => {
+                        let rgba = img.to_rgba8();
+                        return save_rgba_png(rgba.as_raw(), img.width(), img.height());
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+
+        Err("NSPasteboard 中没有可用的图片数据（TIFF / PNG）".into())
     }
 }
 
+// ── 启动清理 ──────────────────────────────────────────────────────────────────
+
 /// 清理 mini-term-clipboard 目录中超过 24 小时的旧 PNG 文件。
-/// 启动时调用一次；读目录/删文件失败均静默跳过，不阻断应用启动。
+/// 启动时调用一次；读目录/删文件失败均静默跳过。
 pub fn cleanup_old_clipboard_images() {
     let dir = std::env::temp_dir().join("mini-term-clipboard");
-    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
 
     let threshold = std::time::SystemTime::now()
         .checked_sub(std::time::Duration::from_secs(24 * 60 * 60))
@@ -235,8 +292,43 @@ pub fn cleanup_old_clipboard_images() {
     }
 }
 
-/// 从剪贴板读取图片并保存为临时 PNG，返回文件路径。
-/// 仅 Windows 平台实现；非 Windows 返回错误，前端会退回 Alt+V。
+// ── Tauri commands ────────────────────────────────────────────────────────────
+
+/// 跨平台：把前端传来的 RGBA 像素落盘成临时 PNG，返回文件路径。
+#[tauri::command]
+pub fn save_clipboard_rgba_image(rgba: Vec<u8>, width: u32, height: u32) -> Result<String, String> {
+    let expected = width
+        .checked_mul(height)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| "图片尺寸溢出".to_string())?;
+
+    if rgba.len() != expected as usize {
+        return Err(format!(
+            "RGBA 长度不匹配: got {}, expected {}",
+            rgba.len(),
+            expected
+        ));
+    }
+
+    let path = save_rgba_png(&rgba, width, height)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// macOS 原生兜底：通过 NSPasteboard 读取 TIFF/PNG，保存为临时 PNG，返回路径。
+#[tauri::command]
+pub fn read_clipboard_image_macos() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = mac::read_clipboard_to_png()?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("仅支持 macOS 平台".into())
+    }
+}
+
+/// Windows 原生兜底：通过 CF_DIB/CF_BITMAP 读取，保存为临时 PNG，返回路径。
 #[tauri::command]
 pub fn read_clipboard_image() -> Result<String, String> {
     #[cfg(windows)]
@@ -246,6 +338,6 @@ pub fn read_clipboard_image() -> Result<String, String> {
     }
     #[cfg(not(windows))]
     {
-        Err("图片剪贴板仅支持 Windows 平台".into())
+        Err("图片剪贴板 Win32 兜底仅支持 Windows 平台".into())
     }
 }
