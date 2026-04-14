@@ -16,7 +16,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { readText, readImage, writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useAppStore, findPaneByPty } from '../store';
-import type { PtyOutputPayload } from '../types';
+import type { PtyOutputPayload, AiProvider } from '../types';
 import { getResolvedTheme } from './themeManager';
 import { createPtyWriteQueue } from './ptyWriteQueue';
 
@@ -291,43 +291,78 @@ async function trySaveStandardClipboardImage(): Promise<string | null> {
 }
 
 /**
- * 判断 ptyId 对应的 pane 当前是否处于 AI 会话状态。
- * 用于决定图片粘贴是走 Alt+V（让 AI 工具自己接管）还是落盘路径。
+ * 返回 ptyId 对应 pane 的 AI provider（仅在 AI 活跃状态时）。
+ * 非 AI pane 或状态为 idle/error 时返回 null。
  */
-function isAiPty(ptyId: number): boolean {
+function getAiProviderForPty(ptyId: number): AiProvider | null {
   const { projectStates } = useAppStore.getState();
   for (const ps of projectStates.values()) {
     for (const tab of ps.tabs) {
       const pane = findPaneByPty(tab.splitLayout, ptyId);
       if (pane) {
-        return (
+        const isAi =
           pane.status === 'ai-generating' ||
           pane.status === 'ai-thinking' ||
           pane.status === 'ai-complete' ||
-          pane.status === 'ai-awaiting-input'
-        );
+          pane.status === 'ai-awaiting-input';
+        return isAi ? (pane.aiProvider ?? null) : null;
       }
     }
   }
-  return false;
+  return null;
+}
+
+/**
+ * 按 provider + platform 发送对应的"原生图片粘贴"快捷键。
+ *
+ * macOS:
+ *   claude  → Ctrl+V (\x16)   Claude Code 在 mac 上响应 Ctrl+V 触发图片附件
+ *   codex   → Alt+V  (\x1bv)  本机已验证可工作的路径
+ *   gemini  → Ctrl+V (\x16)
+ * Windows / Linux:
+ *   claude  → Alt+V  (\x1bv)
+ *   codex   → Ctrl+V (\x16)
+ *   gemini  → Ctrl+V (\x16)
+ */
+async function sendProviderImagePasteShortcut(
+  ptyId: number,
+  provider: AiProvider,
+): Promise<void> {
+  if (_isMacOS) {
+    if (provider === 'codex') {
+      await enqueuePtyWrite(ptyId, '\x1bv'); // Alt+V：本机已验证
+    } else {
+      await enqueuePtyWrite(ptyId, '\x16');  // Ctrl+V：claude / gemini
+    }
+    return;
+  }
+  if (_isWindows) {
+    if (provider === 'claude') {
+      await enqueuePtyWrite(ptyId, '\x1bv'); // Alt+V：Windows claude
+    } else {
+      await enqueuePtyWrite(ptyId, '\x16');  // Ctrl+V：codex / gemini
+    }
+    return;
+  }
+  // Linux / fallback
+  await enqueuePtyWrite(ptyId, '\x16');
 }
 
 /** 读取系统剪贴板并写入终端 PTY。
  *
- * AI pane 优先级：
- *   1. 检测到图片 + AI pane → Alt+V（让 Claude/Codex 自己接管，得到 image #1）
- *   2. 非 AI pane：readImage() 像素落盘 → temp PNG 路径
- *   3. macOS NSPasteboard 原生兜底
- *   4. Windows CF_DIB/CF_BITMAP 原生兜底
- *   5. 纯文本
- *   6. Alt+V 最后保险（图片存在但所有路径均失败）
+ * AI pane（按 provider + platform 分流）：
+ *   macOS claude  → Ctrl+V；macOS codex → Alt+V；macOS gemini → Ctrl+V
+ *   Windows claude → Alt+V；其余 → Ctrl+V
+ * 非 AI pane：
+ *   readImage() 落盘 → temp PNG 路径 → macOS/Windows 原生兜底 → 纯文本 → Alt+V
  */
 export async function pasteToTerminal(ptyId: number): Promise<void> {
   const hasImage = await clipboardHasImageData();
+  const provider = getAiProviderForPty(ptyId);
 
-  // AI pane：优先让 Claude/Codex 自己接管图片粘贴，得到 image #1 附件
-  if (hasImage && isAiPty(ptyId)) {
-    await enqueuePtyWrite(ptyId, '\x1bv');
+  // AI pane：按 provider + platform 发送专属图片粘贴快捷键
+  if (hasImage && provider) {
+    await sendProviderImagePasteShortcut(ptyId, provider);
     return;
   }
 
