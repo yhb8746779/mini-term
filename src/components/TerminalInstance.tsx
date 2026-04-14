@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
-import { getOrCreateTerminal, getCachedTerminal, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal, getAnySelectedText } from '../utils/terminalCache';
+import { getOrCreateTerminal, getCachedTerminal, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTextToClipboard, pasteToTerminal, getAnySelectedText } from '../utils/terminalCache';
 import { getResolvedTheme } from '../utils/themeManager';
 import { showContextMenu } from '../utils/contextMenu';
 import '@xterm/xterm/css/xterm.css';
@@ -120,12 +120,13 @@ export function TerminalInstance({ ptyId }: Props) {
 
   const handleContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
-    const hasSelection = !!getAnySelectedText(ptyId);
+    // 在菜单弹出时立即拍快照，避免点击菜单项时 xterm 选区已消失
+    const selectedText = getAnySelectedText(ptyId);
     showContextMenu(e.clientX, e.clientY, [
       {
         label: '复制',
-        disabled: !hasSelection,
-        onClick: () => { void copyTerminalSelection(ptyId); },
+        disabled: !selectedText,
+        onClick: () => { void copyTextToClipboard(selectedText); },
       },
       {
         label: '粘贴',

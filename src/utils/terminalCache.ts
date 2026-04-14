@@ -256,20 +256,25 @@ export function getAnySelectedText(ptyId: number): string {
   return window.getSelection()?.toString().trim() ?? '';
 }
 
-/** 复制当前选中文本到系统剪贴板（xterm 选区 + DOM 选区双路径）。返回是否有内容被复制。 */
-export async function copyTerminalSelection(ptyId: number): Promise<boolean> {
-  const sel = getAnySelectedText(ptyId);
-  if (!sel) return false;
+/** 把指定文本写入系统剪贴板。供右键菜单在弹出时已拿到快照的场景使用。 */
+export async function copyTextToClipboard(text: string): Promise<boolean> {
+  if (!text) return false;
   try {
-    await writeText(sel);
+    await writeText(text);
+    return true;
   } catch {
     try {
-      await navigator.clipboard.writeText(sel);
+      await navigator.clipboard.writeText(text);
+      return true;
     } catch {
       return false;
     }
   }
-  return true;
+}
+
+/** 复制当前选中文本到系统剪贴板（供快捷键 Ctrl+Shift+C 调用）。 */
+export async function copyTerminalSelection(ptyId: number): Promise<boolean> {
+  return copyTextToClipboard(getAnySelectedText(ptyId));
 }
 
 const _isMacOS = /Mac OS X|Macintosh/.test(navigator.userAgent);
