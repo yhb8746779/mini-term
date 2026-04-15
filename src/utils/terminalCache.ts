@@ -319,16 +319,40 @@ function getAiProviderForPty(ptyId: number): AiProvider | null {
   return null;
 }
 
-// ── 平台级 AI 图片粘贴快捷键（不再按 provider 细分）────────────────────────────
+// ── 平台级 AI 粘贴快捷键 ──────────────────────────────────────────────────────
 
-/** macOS → Ctrl+V；Windows → Alt+V；Linux/其他 → Ctrl+V */
-function getPlatformAiPasteShortcut(): 'ctrl-v' | 'alt-v' {
-  if (_isWindows) return 'alt-v';
-  return 'ctrl-v'; // macOS / Linux
+/**
+ * AI pane 文本粘贴：通过 xterm.js 原生 paste 管道注入文本。
+ *
+ * term.paste() 会在 terminal 已开启 bracketed-paste 模式时自动包装
+ * \x1b[200~...\x1b[201~，让 Claude/Codex/Gemini CLI 识别为粘贴块，
+ * 从而触发 [Pasted text #1 +N lines] 预览和大段粘贴安全提示。
+ *
+ * 为什么不用 enqueuePtyWrite 直接注入 bracketed-paste 字符串：
+ *   直接注入绕过了 xterm 的 paste 管道。对某些 TUI/CLI 而言，
+ *   这种方式不能被识别为真正的"粘贴事件"，导致"文本没反应"。
+ *
+ * 为什么要先 focus：
+ *   右键等操作可能使焦点从 xterm 上漂移，term.paste() 在失焦状态下
+ *   会静默失败；主动 focus 保证调用时终端处于激活状态。
+ *
+ * 图片粘贴由 sendAiImagePasteShortcut 单独处理，两者不能混用。
+ */
+function sendAiTextPaste(ptyId: number, text: string): void {
+  const entry = cache.get(ptyId);
+  if (!entry) return;
+  entry.term.focus();
+  entry.term.paste(text);
 }
 
-async function sendPlatformAiPasteShortcut(ptyId: number): Promise<void> {
-  if (getPlatformAiPasteShortcut() === 'alt-v') {
+/**
+ * AI pane 图片粘贴：Windows → Alt+V（\x1bv）；macOS/Linux → Ctrl+V（\x16）。
+ *
+ * Alt+V 是 Claude/Codex 在 Windows 上的图片粘贴专用键，
+ * 仅在剪贴板确实含图片时发送，文本粘贴禁止使用此快捷键。
+ */
+async function sendAiImagePasteShortcut(ptyId: number): Promise<void> {
+  if (_isWindows) {
     await enqueuePtyWrite(ptyId, '\x1bv');
   } else {
     await enqueuePtyWrite(ptyId, '\x16');
@@ -345,63 +369,101 @@ interface ClipboardPayload {
 }
 
 /**
- * 检测剪贴板内容类型。判断顺序：
- *   1. 先查 navigator.clipboard.read()（最完整）
- *   2. 再用 readImage()（Tauri 插件）
- *   3. 最后 readText()
+ * 检测剪贴板内容类型。
  *
- * 关键原则：有图片/文件/富对象迹象时，不要轻易归成 plain-text。
+ * @param preferImage
+ *   true  → AI pane 模式：图片优先。
+ *           navigator.clipboard.read() 分支里读到纯文本时不立即返回，
+ *           而是暂存文本、继续走 readImage() 检测；
+ *           只有图片检测也失败后，才把暂存文本作为 plain-text 返回。
+ *           防止"图片+文本 sidecar"被 Web API 误判成纯文本。
+ *   false → 非 AI pane 模式：文本优先。
+ *           navigator.clipboard.read() 读到文本立即返回，
+ *           防止 OS 剪贴板缓存旧图片被 readImage() 误判
+ *           （如微信截图后又复制了文字的场景）。
  */
-async function detectClipboardPayload(): Promise<ClipboardPayload> {
-  // 优先用 Web Clipboard API 读取类型信息
+async function detectClipboardPayload(preferImage = false): Promise<ClipboardPayload> {
+  // Web API 文本暂存：preferImage 模式下不提前返回，留给图片检测优先
+  let deferredText: string | undefined;
+
+  // 优先用 Web Clipboard API 读取类型信息（最完整）
   try {
     const items = await navigator.clipboard.read();
     for (const item of items) {
-      // 有图片类型
+      // 有图片类型 → 两种模式都立即返回，无需继续
       if (item.types.some((t) => t.startsWith('image/'))) {
         return { kind: 'raw-image' };
       }
-      // 有文件/URI/其他富对象类型（排除纯文本）
+      // 有文件/URI/其他富对象类型（排除纯文本 / html）
       const hasRich = item.types.some(
         (t) => t !== 'text/plain' && t !== 'text/html',
       );
       const hasText = item.types.includes('text/plain');
       if (hasRich) {
-        // 富对象：可能同时带 text/plain，但语义上应交给 CLI 自己处理
         return { kind: 'rich-object' };
       }
       if (hasText) {
         try {
           const blob = await item.getType('text/plain');
           const text = await blob.text();
-          if (text.trim()) return { kind: 'plain-text', text };
+          if (text.trim()) {
+            if (!preferImage) {
+              // 非 AI pane：立即返回文本
+              return { kind: 'plain-text', text };
+            }
+            // AI pane：暂存文本，先做图片检测，防止 sidecar 文本遮蔽图片
+            deferredText = text;
+          }
         } catch { /* ignore */ }
       }
     }
   } catch { /* Clipboard API 不可用时继续 fallback */ }
 
-  // Tauri readImage() 兜底图片检测
-  try {
-    const image = await readImage();
-    await image.size();
-    return { kind: 'raw-image' };
-  } catch { /* 非图片 */ }
+  if (preferImage) {
+    // AI pane：图片优先（含 Web API 已暂存文本的情况）
+    try {
+      const image = await readImage();
+      await image.size();
+      return { kind: 'raw-image' };
+    } catch { /* 非图片 */ }
 
-  // readText() 兜底文本
-  try {
-    const text = await readText();
-    if (text && text.trim()) return { kind: 'plain-text', text };
-  } catch { /* ignore */ }
+    // 图片检测失败：优先用 Web API 暂存的文本，其次 readText() 兜底
+    if (deferredText) return { kind: 'plain-text', text: deferredText };
+    try {
+      const text = await readText();
+      if (text && text.trim()) return { kind: 'plain-text', text };
+    } catch { /* ignore */ }
+  } else {
+    // 非 AI pane：文本优先
+    try {
+      const text = await readText();
+      if (text && text.trim()) return { kind: 'plain-text', text };
+    } catch { /* ignore */ }
+
+    try {
+      const image = await readImage();
+      await image.size();
+      return { kind: 'raw-image' };
+    } catch { /* 非图片 */ }
+  }
 
   return { kind: 'empty-or-unknown' };
 }
 
 /** 读取系统剪贴板并写入终端 PTY。
  *
- * AI pane：
- *   plain-text → 直接写文本
- *   其他（raw-image / rich-object / unknown）→ 平台 native paste shortcut
- *     macOS → Ctrl+V；Windows → Alt+V；Linux → Ctrl+V
+ * AI pane（Claude / Codex / Gemini CLI）：
+ *   plain-text → Ctrl+V 让 CLI 从 OS 剪贴板读取，触发 bracketed-paste 块预览
+ *   raw-image  → 平台图片快捷键（Windows → Alt+V；macOS/Linux → Ctrl+V）
+ *   其他       → Ctrl+V 兜底
+ *
+ *   重要：不能对 AI pane 直接调用 enqueuePtyWrite() 写纯文本。
+ *   Claude/Codex/Gemini CLI 依赖 OS 剪贴板 + bracketed-paste 来识别粘贴块，
+ *   直接写入 PTY 会丢失 paste 语义，导致：
+ *     - 无 [Pasted text #1 +N lines] 预览
+ *     - 无大段粘贴安全提示
+ *     - 多行内容被当成连续键入，仅显示第一行
+ *   图片粘贴必须保持 Alt+V（Windows），不可用于文本，否则报 "no image" 错误。
  *
  * 非 AI pane：
  *   plain-text → 直接写文本
@@ -410,16 +472,23 @@ async function detectClipboardPayload(): Promise<ClipboardPayload> {
  */
 export async function pasteToTerminal(ptyId: number): Promise<void> {
   const isAiPane = !!getAiProviderForPty(ptyId);
-  const clipboard = await detectClipboardPayload();
+  // AI pane 用图片优先检测，非 AI pane 用文本优先检测
+  const clipboard = await detectClipboardPayload(isAiPane);
 
   if (isAiPane) {
-    // 明确纯文本：直接贴文本，不走 native paste shortcut
-    if (clipboard.kind === 'plain-text' && clipboard.text) {
-      await enqueuePtyWrite(ptyId, clipboard.text);
-      return;
+    if (clipboard.kind === 'raw-image') {
+      // 图片专用快捷键：Windows → Alt+V；macOS/Linux → Ctrl+V
+      // 仅在剪贴板确实含图片时发送 Alt+V，文本粘贴禁止使用
+      await sendAiImagePasteShortcut(ptyId);
+    } else if (clipboard.kind === 'plain-text' && clipboard.text) {
+      // 文本：通过 xterm 原生 paste 管道注入，触发 bracketed-paste 块识别
+      sendAiTextPaste(ptyId, clipboard.text);
+    } else {
+      // rich-object / unknown：有附带文本则走文本路径，否则不操作
+      if (clipboard.text) {
+        sendAiTextPaste(ptyId, clipboard.text);
+      }
     }
-    // 其他（图片 / 富对象 / unknown）：优先交给 CLI 自己处理
-    await sendPlatformAiPasteShortcut(ptyId);
     return;
   }
 

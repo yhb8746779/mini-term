@@ -16,6 +16,9 @@ const INITIAL_PTY_RESIZE_MIN_COLS = 40;
 export function TerminalInstance({ ptyId }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [fileDrag, setFileDrag] = useState(false);
+  // 右键选区快照：xterm 鼠标模式下，mousedown 会在 contextmenu 之前清除选区，
+  // 需要在 mousedown 时提前捕获，否则 handleContextMenu 时已读不到选中文本。
+  const selectionSnapshot = useRef('');
   const terminalFontSize = useAppStore((s) => s.config.terminalFontSize);
   const terminalFollowTheme = useAppStore((s) => s.config.terminalFollowTheme);
 
@@ -118,9 +121,18 @@ export function TerminalInstance({ ptyId }: Props) {
     }
   };
 
+  const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    // 右键 mousedown：在 xterm 清除选区之前捕获快照
+    if (e.button === 2) {
+      selectionSnapshot.current = getAnySelectedText(ptyId);
+    }
+  };
+
   const handleContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
-    const selectedText = getAnySelectedText(ptyId);
+    // 使用快照而非实时读取：xterm 鼠标模式下 mousedown 已清除选区
+    const selectedText = selectionSnapshot.current;
+    selectionSnapshot.current = '';
 
     // macOS / Windows：与原生终端一致，右键直接复制或粘贴，不弹菜单
     if (_isMacOS || _isWindows) {
@@ -159,6 +171,7 @@ export function TerminalInstance({ ptyId }: Props) {
       <div
         className="flex-1 relative bg-[var(--bg-terminal)]"
         style={panelBg ? { backgroundColor: panelBg } : undefined}
+        onMouseDown={handleMouseDown}
         onDragOverCapture={handleDragOver}
         onDragLeaveCapture={handleDragLeave}
         onDropCapture={handleDrop}
