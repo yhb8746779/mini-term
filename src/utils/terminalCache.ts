@@ -319,22 +319,34 @@ function getAiProviderForPty(ptyId: number): AiProvider | null {
   return null;
 }
 
-// ── AI pane 三条独立粘贴路径 ──────────────────────────────────────────────────
+// ── AI pane 剪贴板来源分类与粘贴路径 ──────────────────────────────────────────
 //
-// 剪贴板来源必须区分为三类，不可互换：
+// 剪贴板来源必须区分为 5 类，不可互换：
 //
-//   1. plain-text       → sendAiTextPaste
-//   2. raw-image        → sendAiScreenshotImagePaste  （截图工具图片位图）
-//   3. rich-object      → sendAiNativeHandoff          （Explorer 文件系统对象）
+//   1. plain-text           → sendAiTextPaste
+//   2. raw-image            → sendAiScreenshotImagePaste   （截图工具图片位图）
+//   3. explorer-image-files → sendAiExplorerFilesPaste     （Explorer 复制的图片文件路径）
+//   4. explorer-files       → sendAiExplorerFilesPaste     （Explorer 复制的普通文件路径）
+//   5. rich-object          → Ctrl+V fallback              （无法识别的富剪贴板对象）
 //
-// raw-image ≠ rich-object：
-//   - raw-image  = 截图工具/图片编辑器直接写入剪贴板的图片位图数据，
-//                  Mini-Term 有增强处理路径（Alt+V on Windows）。
-//   - rich-object = Explorer 复制的文件/Shell 对象/文件引用列表等，
-//                  不是图片位图，不应走图片快捷键，应 native handoff。
+// 关键区分：raw-image ≠ explorer-image-files ≠ rich-object
 //
-// 混用两者会导致：Explorer 文件对象走 Alt+V → "no image" 错误；
-//              截图图片走文本路径 → 图片内容丢失。
+//   raw-image          = 截图工具/图片编辑器直接写入剪贴板的图片位图（CF_DIB/CF_BITMAP），
+//                        Web Clipboard API 暴露 image/* MIME type。
+//                        Mini-Term 增强路径：Windows Alt+V 让 Claude/Codex 读取图片。
+//
+//   explorer-image-files = 资源管理器复制的图片文件（CF_HDROP 文件路径列表），
+//                        Rust 后端 read_clipboard_file_paths() 提取路径后按扩展名判定。
+//                        不是图片位图 → 不能走 Alt+V，必须转换为路径文本注入 AI pane。
+//
+//   explorer-files     = 资源管理器复制的普通文件（CF_HDROP 文件路径列表，非图片扩展名）。
+//                        同上，转换为路径文本注入。
+//
+//   rich-object        = Web API 可见的富对象但后端无法提取文件路径，仅 Ctrl+V fallback。
+//
+// 混用这些类型会导致：
+//   - Explorer 文件对象走 Alt+V → "no image" 错误
+//   - 截图图片走文本路径 → 图片内容丢失
 
 /**
  * AI pane 文本粘贴路径。
@@ -375,103 +387,140 @@ async function sendAiScreenshotImagePaste(ptyId: number): Promise<void> {
 }
 
 /**
- * AI pane Explorer/富对象 native handoff 路径。
+ * AI pane Explorer 文件/图片文件粘贴路径。
  *
- * 用于 Windows 资源管理器复制的文件/图片文件/Shell 对象等富剪贴板内容。
- * 这类内容不是图片位图，不能走 sendAiScreenshotImagePaste（Alt+V）。
+ * 用于已经从 CF_HDROP 提取出路径的 explorer-files / explorer-image-files 情形。
+ * 路径由 detectClipboardPayload 在分类时提前读取，此处只做格式化注入。
  *
  * 策略：
- *   1. 优先：通过 Tauri Rust 读取 CF_HDROP 文件路径列表
- *      → 把路径注入 AI pane（Claude Code 收到路径后，自行判断是图片还是文件）
- *      → 图片文件路径 → Claude Code 展示图片块
- *      → 普通文件路径 → Claude Code 展示文件引用
- *   2. 降级：CF_HDROP 读取失败或非 Windows 时发送 Ctrl+V（\x16）
- *      → 将粘贴决策权交给 AI CLI 自身
+ *   - 路径含空格时加双引号，多个路径用空格分隔（与原生 PowerShell 粘贴行为一致）
+ *   - 通过 sendAiTextPaste 触发 bracketed-paste，让 Claude Code 自行判断图片/文件
+ *     → 图片文件路径 → Claude Code 展示图片块
+ *     → 普通文件路径 → Claude Code 展示文件引用
  *
- * 为什么通过文件路径而非直接发图片：
- *   Explorer 复制的是文件引用（CF_HDROP），不是图片位图（CF_DIB）；
- *   位图数据由截图工具写入，文件引用只有路径。
- *   Claude Code 可以通过路径自行加载图片，效果等同于原生 PowerShell 粘贴。
+ * 为什么不用 sendAiScreenshotImagePaste（Alt+V）：
+ *   CF_HDROP 是文件路径引用，不是图片位图（CF_DIB/CF_BITMAP）。
+ *   Alt+V 要求剪贴板中有真实图片数据，文件引用会导致 "no image" 错误。
  */
-async function sendAiNativeHandoff(ptyId: number): Promise<void> {
-  // 尝试读取 CF_HDROP 文件路径（Windows Explorer 复制文件时使用此格式）
-  if (_isWindows) {
-    try {
-      const paths = await invoke<string[]>('read_clipboard_file_paths');
-      if (paths && paths.length > 0) {
-        // 把文件路径注入 AI pane：Claude Code 自行判断图片/文件
-        // 多个路径用空格分隔（与原生 PowerShell 粘贴行为一致）
-        const text = paths.join(' ');
-        sendAiTextPaste(ptyId, text);
-        return;
-      }
-    } catch {
-      // CF_HDROP 读取失败（非文件对象、权限问题等），降级到 Ctrl+V
-    }
-  }
-  // 非 Windows 或 CF_HDROP 不可用：Ctrl+V，让 AI CLI 从 OS 剪贴板原生读取
-  await enqueuePtyWrite(ptyId, '\x16');
+function sendAiExplorerFilesPaste(ptyId: number, paths: string[]): void {
+  // 含空格的路径加双引号，多个路径用空格分隔
+  const text = paths.map((p) => (p.includes(' ') ? `"${p}"` : p)).join(' ');
+  sendAiTextPaste(ptyId, text);
 }
 
 // ── 剪贴板内容分类器 ────────────────────────────────────────────────────────────
 
-type ClipboardPayloadKind = 'plain-text' | 'raw-image' | 'rich-object' | 'empty-or-unknown';
+type ClipboardPayloadKind =
+  | 'plain-text'
+  | 'raw-image'
+  | 'explorer-image-files'  // Explorer 复制的图片文件（CF_HDROP，扩展名为图片）
+  | 'explorer-files'        // Explorer 复制的普通文件（CF_HDROP，扩展名非图片）
+  | 'rich-object'           // Web API 可见但无法提取文件路径的富对象（residual fallback）
+  | 'empty-or-unknown';
 
 interface ClipboardPayload {
   kind: ClipboardPayloadKind;
   text?: string;
+  paths?: string[];  // explorer-image-files / explorer-files 时携带的文件路径列表
+}
+
+/** 图片文件扩展名集合，用于区分 explorer-image-files 和 explorer-files */
+const IMAGE_FILE_EXTENSIONS = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.webp',
+  '.bmp', '.svg', '.ico', '.tif', '.tiff',
+]);
+
+function isImageFilePath(p: string): boolean {
+  const lower = p.toLowerCase();
+  const dot = lower.lastIndexOf('.');
+  if (dot < 0) return false;
+  return IMAGE_FILE_EXTENSIONS.has(lower.slice(dot));
 }
 
 /**
  * 检测剪贴板内容类型。
  *
- * 分类优先级（Web Clipboard API 可用时）：
- *   1. item.types 含 image/*        → raw-image（两种模式相同）
- *   2. item.types 含非 text/* 类型  → rich-object（两种模式相同）
- *      rich-object ≠ raw-image：Explorer 复制的文件/Shell对象是富剪贴板对象，
- *      不是图片位图，AI pane 必须分开处理，不得把 rich-object 路由到图片快捷键。
- *   3. item.types 仅含 text/plain   → plain-text，立即返回
- *      AI pane 文本已明确时不得先跑 readImage()，否则造成 1-2s 可见延迟。
+ * 分类流程（v7）：
  *
- * Web API 不可用时才走 Tauri fallback：
- *   preferImage=true  (AI pane)  → 先 readImage()，再 readText()
- *   preferImage=false (非AI pane) → 先 readText()，再 readImage()
+ *   Step 1 — Web Clipboard API（类型信息最权威）：
+ *     - image/*          → raw-image，立即返回（截图工具图片位图）
+ *     - 仅 text/plain    → plain-text，立即返回（不探图，无延迟）
+ *     - 富对象（非 text/plain, 非 text/html）→ sawRich=true，继续 Step 2
+ *
+ *   Step 2 — Windows CF_HDROP 探测（rich 或 Web API 不可用时）：
+ *     - Rust read_clipboard_file_paths() 提取文件路径列表
+ *     - 全部为图片扩展名 → explorer-image-files
+ *     - 否则            → explorer-files
+ *     - CF_HDROP 失败且 sawRich=true → rich-object（residual fallback）
+ *
+ *   Step 3 — Tauri fallback（Web API 不可用 且 CF_HDROP 也失败时）：
+ *     - preferImage=true  → readImage() 先，readText() 后
+ *     - preferImage=false → readText() 先，readImage() 后
+ *
+ * 设计原则：
+ *   - plain-text 路径绝不等 CF_HDROP / readImage()，保证粘贴无延迟
+ *   - raw-image（截图位图）与 explorer-image-files（文件路径）严格分离
+ *   - rich-object 仅作 residual fallback，不再混入文件对象处理
  */
 async function detectClipboardPayload(preferImage = false): Promise<ClipboardPayload> {
-  // 优先用 Web Clipboard API（类型信息最权威）
+  // Step 1: Web Clipboard API — 仅用于快速识别截图图片位图（image/*）
+  // WebView2 对 Explorer 文件对象可能返回空 items 或 text/plain（仅文件名），
+  // 因此不能仅靠 Web API 来判断是否有 CF_HDROP，必须在 Step 2 独立探测。
+  let webItems: ClipboardItem[] = [];
   try {
-    const items = await navigator.clipboard.read();
-    for (const item of items) {
-      // Case 1: 明确图片 → raw-image，两种模式均立即返回
+    webItems = await navigator.clipboard.read();
+    for (const item of webItems) {
+      // 截图工具（微信截图、系统截图等）写入 image/* MIME type → raw-image，立即返回
+      // 截图位图优先级最高，不需要再检查 CF_HDROP
       if (item.types.some((t) => t.startsWith('image/'))) {
         return { kind: 'raw-image' };
       }
-
-      // Case 2: 富对象（文件/Shell/URI 等，排除 text/plain 和 text/html）→ rich-object
-      // 注意：rich-object 不等于 raw-image；Explorer 文件对象不是图片位图，
-      // AI pane 需要用专属路径处理，不得走图片快捷键（Alt+V）。
-      const hasRich = item.types.some(
-        (t) => t !== 'text/plain' && t !== 'text/html',
-      );
-      if (hasRich) {
-        return { kind: 'rich-object' };
-      }
-
-      // Case 3: 只有纯文本 → plain-text，立即返回
-      // AI pane：文本已明确，不得继续跑 readImage()，否则产生可见延迟。
-      if (item.types.includes('text/plain')) {
-        try {
-          const blob = await item.getType('text/plain');
-          const text = await blob.text();
-          if (text.trim()) return { kind: 'plain-text', text };
-        } catch { /* ignore */ }
-      }
     }
-  } catch { /* Clipboard API 不可用，继续走 Tauri fallback */ }
+  } catch { /* Web API 不可用，继续 */ }
 
-  // Case 4: Web API 不可用或未返回有效内容，走 Tauri fallback
+  // Step 2: Windows CF_HDROP 探测（在 Web API 文本处理之前）
+  //
+  // 为什么放在 Web API text/plain 处理之前：
+  //   WebView2 复制 Explorer 文件时，navigator.clipboard.read() 可能返回：
+  //     a) 空 items 数组（CF_HDROP 不暴露为 Web 格式）
+  //     b) text/plain（仅文件名，无完整路径）
+  //   两种情况都无法正确识别 Explorer 文件对象，必须直接读 Win32 CF_HDROP。
+  //   CF_HDROP invoke 在没有文件对象时极快（IsClipboardFormatAvailable 立即返回），
+  //   不会对纯文本粘贴造成明显延迟。
+  if (_isWindows) {
+    try {
+      const paths = await invoke<string[]>('read_clipboard_file_paths');
+      if (paths && paths.length > 0) {
+        // 全部是图片扩展名 → explorer-image-files；否则 → explorer-files
+        const allImages = paths.every(isImageFilePath);
+        return allImages
+          ? { kind: 'explorer-image-files', paths }
+          : { kind: 'explorer-files', paths };
+      }
+    } catch { /* 没有 CF_HDROP（非文件对象），继续 */ }
+  }
+
+  // Step 3: 处理 Web API 的文本 / 富对象结果（Explorer 文件已在 Step 2 处理完）
+  for (const item of webItems) {
+    // 富对象（非 text/plain, 非 text/html）→ rich-object residual fallback
+    const hasRich = item.types.some((t) => t !== 'text/plain' && t !== 'text/html');
+    if (hasRich) {
+      return { kind: 'rich-object' };
+    }
+
+    // 纯文本 → plain-text，立即返回，不探图（避免 1-2s 延迟）
+    if (item.types.includes('text/plain')) {
+      try {
+        const blob = await item.getType('text/plain');
+        const text = await blob.text();
+        if (text.trim()) return { kind: 'plain-text', text };
+      } catch { /* ignore */ }
+    }
+  }
+
+  // Step 4: Tauri fallback（Web API 完全不可用 且 CF_HDROP 无结果时）
   if (preferImage) {
-    // AI pane fallback：先尝试图片，再尝试文本
+    // AI pane fallback：先尝试图片（截图位图），再尝试文本
     try {
       const image = await readImage();
       await image.size();
@@ -500,19 +549,21 @@ async function detectClipboardPayload(preferImage = false): Promise<ClipboardPay
 
 /** 读取系统剪贴板并写入终端 PTY。
  *
- * AI pane（Claude / Codex / Gemini CLI）三条独立路径：
- *   plain-text  → sendAiTextPaste     — xterm bracketed-paste，不探图，无延迟
- *   raw-image   → sendAiScreenshotImagePaste — 截图图片位图，Windows Alt+V
- *   rich-object → sendAiNativeHandoff — Explorer 文件/Shell 对象，Ctrl+V native handoff
+ * AI pane（Claude / Codex / Gemini CLI）五条独立路径：
+ *   plain-text           → sendAiTextPaste           — bracketed-paste，无延迟
+ *   raw-image            → sendAiScreenshotImagePaste — 截图位图，Windows Alt+V
+ *   explorer-image-files → sendAiExplorerFilesPaste   — Explorer 图片文件路径注入
+ *   explorer-files       → sendAiExplorerFilesPaste   — Explorer 普通文件路径注入
+ *   rich-object          → Ctrl+V                    — 无法识别的富对象，residual fallback
  *
- *   raw-image 和 rich-object 必须分开：
- *     截图图片位图 → Alt+V 让 Claude/Codex 读取图片
- *     Explorer 文件对象 → Alt+V 报"no image"，必须用 native handoff
+ *   raw-image（截图位图）≠ explorer-image-files（文件路径引用）：
+ *     截图位图  → Alt+V 让 Claude/Codex 从剪贴板读取图片数据
+ *     文件路径  → 路径文本注入，Claude Code 按路径加载图片/文件
  *
  * 非 AI pane：
  *   plain-text  → 直接写文本
  *   raw-image   → readImage() 落盘 temp PNG → 平台原生兜底
- *   rich-object / unknown → 尝试文本兜底
+ *   其余        → 尝试文本兜底
  */
 export async function pasteToTerminal(ptyId: number): Promise<void> {
   const isAiPane = !!getAiProviderForPty(ptyId);
@@ -521,15 +572,23 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
   if (isAiPane) {
     if (clipboard.kind === 'raw-image') {
       // 截图工具图片位图 → Mini-Term 增强图片路径（Windows: Alt+V）
-      // 保留用户已有的右键截图粘贴体验
+      // 保留用户已有的右键截图粘贴体验（微信截图、QQ截图、系统截图等）
       await sendAiScreenshotImagePaste(ptyId);
     } else if (clipboard.kind === 'plain-text' && clipboard.text) {
-      // 纯文本 → xterm 原生 paste 管道，触发 bracketed-paste 块识别
+      // 纯文本 → xterm 原生 paste 管道，触发 bracketed-paste 块识别，无延迟
       sendAiTextPaste(ptyId, clipboard.text);
+    } else if (
+      (clipboard.kind === 'explorer-image-files' || clipboard.kind === 'explorer-files') &&
+      clipboard.paths
+    ) {
+      // Explorer 文件/图片文件：路径已由 detectClipboardPayload 提取
+      // 转换为路径文本注入 AI pane，Claude Code 自行判断图片/文件
+      // 注意：explorer-image-files 不走 Alt+V，路径引用 ≠ 剪贴板图片位图
+      sendAiExplorerFilesPaste(ptyId, clipboard.paths);
     } else if (clipboard.kind === 'rich-object') {
-      // Explorer 文件/Shell 对象 → native handoff（Ctrl+V）
-      // 不得走截图图片路径（Alt+V），Explorer 文件对象不是图片位图
-      await sendAiNativeHandoff(ptyId);
+      // 无法识别的富对象 residual fallback：Ctrl+V 让 AI CLI 自行决策
+      // 不得走 Alt+V，Explorer 文件对象不是图片位图
+      await enqueuePtyWrite(ptyId, '\x16');
     } else {
       // empty-or-unknown：若有附带文本则走文本路径，否则不操作
       if (clipboard.text) {
