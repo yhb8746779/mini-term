@@ -370,20 +370,31 @@ function sendAiTextPaste(ptyId: number, text: string): void {
 /**
  * AI pane 截图图片粘贴路径（仅用于真正的图片位图剪贴板内容）。
  *
- * Windows → Alt+V（\x1bv）：Claude/Codex 图片粘贴专用快捷键。
- * macOS/Linux → Ctrl+V（\x16）。
+ * Windows      → Alt+V（\x1bv）：Claude/Codex 图片粘贴专用快捷键。
+ * macOS+claude → Ctrl+V（\x16）：WKWebView 剪贴板访问权限足以让 Claude 读取图片。
+ * macOS+codex  → Alt+V（\x1bv）：Codex on mac 需要 Alt+V，与 Windows 一致。
+ * Linux        → Ctrl+V（\x16）。
  *
  * 重要限制：
  *   - 仅在剪贴板内容确实是图片位图时使用（raw-image 分类）
- *   - 禁止对 Explorer 文件对象（rich-object）使用，否则报"no image"错误
+ *   - 禁止对 Explorer/Finder 文件对象使用，否则报"no image"错误
  *   - 禁止对纯文本使用
  */
-async function sendAiScreenshotImagePaste(ptyId: number): Promise<void> {
+async function sendAiScreenshotImagePaste(ptyId: number, provider: AiProvider | null): Promise<void> {
   if (_isWindows) {
     await enqueuePtyWrite(ptyId, '\x1bv');
-  } else {
-    await enqueuePtyWrite(ptyId, '\x16');
+    return;
   }
+  if (_isMacOS) {
+    // Codex on mac 与 Windows 一致用 Alt+V；Claude/Gemini 用 Ctrl+V
+    if (provider === 'codex') {
+      await enqueuePtyWrite(ptyId, '\x1bv');
+      return;
+    }
+    await enqueuePtyWrite(ptyId, '\x16');
+    return;
+  }
+  await enqueuePtyWrite(ptyId, '\x16');
 }
 
 /**
@@ -415,6 +426,8 @@ type ClipboardPayloadKind =
   | 'raw-image'
   | 'explorer-image-files'  // Explorer 复制的图片文件（CF_HDROP，扩展名为图片）
   | 'explorer-files'        // Explorer 复制的普通文件（CF_HDROP，扩展名非图片）
+  | 'finder-image-files'    // macOS Finder 复制的图片文件（public.file-url，扩展名为图片）
+  | 'finder-files'          // macOS Finder 复制的普通文件（public.file-url）
   | 'rich-object'           // Web API 可见但无法提取文件路径的富对象（residual fallback）
   | 'empty-or-unknown';
 
@@ -438,29 +451,51 @@ function isImageFilePath(p: string): boolean {
 }
 
 /**
+ * mac 上视为"文本类"的 MIME / UTI 类型集合。
+ * 包含这些类型的 ClipboardItem 应优先走 plain-text 路径，
+ * 而非误判为 rich-object（mac 应用复制文本时常附带 RTF/public.* 等额外类型）。
+ */
+const MAC_TEXT_LIKE_TYPES = new Set([
+  'text/plain',
+  'text/html',
+  'text/rtf',
+  'public.utf8-plain-text',
+  'public.html',
+  'public.rtf',
+]);
+
+function isMacTextLikeClipboardItem(item: ClipboardItem): boolean {
+  return item.types.every((t) => MAC_TEXT_LIKE_TYPES.has(t));
+}
+
+/**
  * 检测剪贴板内容类型。
  *
- * 分类流程（v7）：
+ * 分类流程（v8）：
  *
- *   Step 1 — Web Clipboard API（类型信息最权威）：
- *     - image/*          → raw-image，立即返回（截图工具图片位图）
- *     - 仅 text/plain    → plain-text，立即返回（不探图，无延迟）
- *     - 富对象（非 text/plain, 非 text/html）→ sawRich=true，继续 Step 2
+ *   Step 1 — Web Clipboard API：
+ *     - image/*          → raw-image，立即返回
  *
- *   Step 2 — Windows CF_HDROP 探测（rich 或 Web API 不可用时）：
+ *   Step 2 — Windows CF_HDROP 探测：
  *     - Rust read_clipboard_file_paths() 提取文件路径列表
- *     - 全部为图片扩展名 → explorer-image-files
- *     - 否则            → explorer-files
- *     - CF_HDROP 失败且 sawRich=true → rich-object（residual fallback）
+ *     - 全部为图片扩展名 → explorer-image-files；否则 → explorer-files
  *
- *   Step 3 — Tauri fallback（Web API 不可用 且 CF_HDROP 也失败时）：
+ *   Step 2b — macOS Finder 文件 URL 探测：
+ *     - Rust read_clipboard_file_paths_macos() 读取 public.file-url
+ *     - 全部为图片扩展名 → finder-image-files；否则 → finder-files
+ *
+ *   Step 3 — Web API 文本 / 富对象处理：
+ *     - macOS：全是 text-like 类型 → plain-text；否则 → rich-object
+ *     - Windows/Linux：有非 text/plain & text/html 类型 → rich-object；否则 → plain-text
+ *
+ *   Step 4 — Tauri fallback（Web API 完全不可用时）：
  *     - preferImage=true  → readImage() 先，readText() 后
  *     - preferImage=false → readText() 先，readImage() 后
  *
  * 设计原则：
- *   - plain-text 路径绝不等 CF_HDROP / readImage()，保证粘贴无延迟
- *   - raw-image（截图位图）与 explorer-image-files（文件路径）严格分离
- *   - rich-object 仅作 residual fallback，不再混入文件对象处理
+ *   - raw-image（截图位图）与 finder/explorer-image-files（文件路径）严格分离
+ *   - macOS 文本不因附带 RTF/public.* 而误判为 rich-object
+ *   - Windows 现有分支顺序和 kind 名称不变
  */
 async function detectClipboardPayload(preferImage = false): Promise<ClipboardPayload> {
   // Step 1: Web Clipboard API — 仅用于快速识别截图图片位图（image/*）
@@ -500,8 +535,40 @@ async function detectClipboardPayload(preferImage = false): Promise<ClipboardPay
     } catch { /* 没有 CF_HDROP（非文件对象），继续 */ }
   }
 
-  // Step 3: 处理 Web API 的文本 / 富对象结果（Explorer 文件已在 Step 2 处理完）
+  // Step 2b: macOS Finder 文件 URL 探测（Windows CF_HDROP 对等）
+  // WKWebView 通常不暴露 public.file-url，必须通过 Rust 后端原生读取
+  if (_isMacOS) {
+    try {
+      const paths = await invoke<string[]>('read_clipboard_file_paths_macos');
+      if (paths && paths.length > 0) {
+        const allImages = paths.every(isImageFilePath);
+        return allImages
+          ? { kind: 'finder-image-files', paths }
+          : { kind: 'finder-files', paths };
+      }
+    } catch { /* 没有 file URL（非文件对象），继续 */ }
+  }
+
+  // Step 3: 处理 Web API 的文本 / 富对象结果（Explorer/Finder 文件已在 Step 2 处理完）
   for (const item of webItems) {
+    if (_isMacOS) {
+      // mac：text-like 类型（含 RTF / public.utf8-plain-text 等）优先走纯文本
+      // 避免"复制文本时附带 RTF 类型"被误判为 rich-object
+      if (isMacTextLikeClipboardItem(item)) {
+        if (item.types.includes('text/plain')) {
+          try {
+            const blob = await item.getType('text/plain');
+            const text = await blob.text();
+            if (text.trim()) return { kind: 'plain-text', text };
+          } catch { /* ignore */ }
+        }
+        continue; // text-like 但无有效 text/plain 内容，继续下一个 item
+      }
+      // 非 text-like → rich-object residual fallback
+      return { kind: 'rich-object' };
+    }
+
+    // Windows / Linux：保持现有逻辑不动
     // 富对象（非 text/plain, 非 text/html）→ rich-object residual fallback
     const hasRich = item.types.some((t) => t !== 'text/plain' && t !== 'text/html');
     if (hasRich) {
@@ -566,28 +633,28 @@ async function detectClipboardPayload(preferImage = false): Promise<ClipboardPay
  *   其余        → 尝试文本兜底
  */
 export async function pasteToTerminal(ptyId: number): Promise<void> {
-  const isAiPane = !!getAiProviderForPty(ptyId);
+  const provider = getAiProviderForPty(ptyId);
+  const isAiPane = !!provider;
   const clipboard = await detectClipboardPayload(isAiPane);
 
   if (isAiPane) {
     if (clipboard.kind === 'raw-image') {
-      // 截图工具图片位图 → Mini-Term 增强图片路径（Windows: Alt+V）
-      // 保留用户已有的右键截图粘贴体验（微信截图、QQ截图、系统截图等）
-      await sendAiScreenshotImagePaste(ptyId);
+      // 截图工具图片位图 → provider-aware 快捷键
+      // Windows: Alt+V；macOS+codex: Alt+V；macOS+claude: Ctrl+V
+      await sendAiScreenshotImagePaste(ptyId, provider);
     } else if (clipboard.kind === 'plain-text' && clipboard.text) {
       // 纯文本 → xterm 原生 paste 管道，触发 bracketed-paste 块识别，无延迟
       sendAiTextPaste(ptyId, clipboard.text);
     } else if (
-      (clipboard.kind === 'explorer-image-files' || clipboard.kind === 'explorer-files') &&
+      (clipboard.kind === 'explorer-image-files' || clipboard.kind === 'explorer-files' ||
+       clipboard.kind === 'finder-image-files'   || clipboard.kind === 'finder-files') &&
       clipboard.paths
     ) {
-      // Explorer 文件/图片文件：路径已由 detectClipboardPayload 提取
-      // 转换为路径文本注入 AI pane，Claude Code 自行判断图片/文件
-      // 注意：explorer-image-files 不走 Alt+V，路径引用 ≠ 剪贴板图片位图
+      // Explorer / Finder 文件路径：转为路径文本注入，Claude Code 自行判断图片/文件
+      // 注意：文件路径引用 ≠ 图片位图，不能走 Alt+V
       sendAiExplorerFilesPaste(ptyId, clipboard.paths);
     } else if (clipboard.kind === 'rich-object') {
       // 无法识别的富对象 residual fallback：Ctrl+V 让 AI CLI 自行决策
-      // 不得走 Alt+V，Explorer 文件对象不是图片位图
       await enqueuePtyWrite(ptyId, '\x16');
     } else {
       // empty-or-unknown：若有附带文本则走文本路径，否则不操作
