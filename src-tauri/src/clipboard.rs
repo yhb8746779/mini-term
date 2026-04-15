@@ -317,12 +317,89 @@ mod win {
 #[cfg(target_os = "macos")]
 mod mac {
     use super::save_rgba_png;
-    use std::ffi::c_void;
+    use std::ffi::{c_char, c_void, CString};
     use std::path::PathBuf;
 
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject};
     use objc2::msg_send;
+
+    // ── Finder 文件路径读取 ────────────────────────────────────────────────
+
+    /// 从 NSPasteboard 读取 public.file-url 格式的 Finder 文件路径列表。
+    /// Finder 复制文件时会把文件 URL（file:///path/to/file）写入此格式。
+    ///
+    /// 注意：某些文件的 public.file-url 是 `file:///.file:id=XXXX` 格式（Finder 内部节点 ID）。
+    /// 这种格式无法直接作为文件路径使用，通过 NSURL.path 解析后过滤掉 `/.file:` 开头的结果。
+    pub fn read_finder_file_paths() -> Result<Vec<String>, String> {
+        unsafe {
+            let pb_cls = AnyClass::get(c"NSPasteboard")
+                .ok_or_else(|| "NSPasteboard class not found".to_string())?;
+
+            let pb: Retained<AnyObject> = msg_send![pb_cls, generalPasteboard];
+
+            let items_opt: Option<Retained<AnyObject>> = msg_send![&pb, pasteboardItems];
+            let items = items_opt.ok_or_else(|| "pasteboardItems returned nil".to_string())?;
+
+            let count: usize = msg_send![&items, count];
+            if count == 0 {
+                return Err("No pasteboard items".into());
+            }
+
+            let str_cls = AnyClass::get(c"NSString")
+                .ok_or_else(|| "NSString class not found".to_string())?;
+            let url_cls = AnyClass::get(c"NSURL")
+                .ok_or_else(|| "NSURL class not found".to_string())?;
+
+            let c_type = CString::new("public.file-url").unwrap();
+            let ns_type: Retained<AnyObject> =
+                msg_send![str_cls, stringWithUTF8String: c_type.as_ptr()];
+
+            let mut paths: Vec<String> = Vec::new();
+
+            for i in 0..count {
+                let item: Retained<AnyObject> = msg_send![&items, objectAtIndex: i];
+                let url_str_opt: Option<Retained<AnyObject>> =
+                    msg_send![&item, stringForType: &*ns_type];
+
+                let Some(url_str) = url_str_opt else { continue };
+
+                // 用 NSURL 解析 URL，再取 .path，让系统处理 percent-encoding
+                // 注意：file:///.file:id=XXXX 是 Finder 节点 ID，.path 返回 /.file:id=XXXX，
+                //       这种路径无法直接使用，在下方过滤掉。
+                let url_opt: Option<Retained<AnyObject>> =
+                    msg_send![url_cls, URLWithString: &*url_str];
+                let Some(url) = url_opt else { continue };
+
+                let path_opt: Option<Retained<AnyObject>> = msg_send![&url, path];
+                let Some(path_obj) = path_opt else { continue };
+
+                let utf8: *const c_char = msg_send![&path_obj, UTF8String];
+                if utf8.is_null() {
+                    continue;
+                }
+
+                let path = std::ffi::CStr::from_ptr(utf8)
+                    .to_string_lossy()
+                    .into_owned();
+
+                // 过滤 Finder 节点 ID（/.file:id=XXXX），不是可用的文件系统路径
+                if path.starts_with("/.file:") {
+                    continue;
+                }
+
+                if !path.is_empty() {
+                    paths.push(path);
+                }
+            }
+
+            if paths.is_empty() {
+                Err("No usable file paths found in pasteboard".into())
+            } else {
+                Ok(paths)
+            }
+        }
+    }
 
     pub fn read_clipboard_to_png() -> Result<PathBuf, String> {
         unsafe {
@@ -457,5 +534,20 @@ pub fn read_clipboard_file_paths() -> Result<Vec<String>, String> {
     #[cfg(not(windows))]
     {
         Err("CF_HDROP 仅支持 Windows 平台".into())
+    }
+}
+
+/// 读取 macOS 剪贴板中的 Finder 文件路径列表（public.file-url）。
+/// Finder 复制文件/图片文件时使用此格式，返回本地路径字符串数组。
+/// 非 macOS 平台或剪贴板没有 file URL 时返回 Err。
+#[tauri::command]
+pub fn read_clipboard_file_paths_macos() -> Result<Vec<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::read_finder_file_paths()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Finder 文件路径读取仅支持 macOS 平台".into())
     }
 }
