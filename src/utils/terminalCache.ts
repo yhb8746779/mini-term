@@ -372,19 +372,21 @@ interface ClipboardPayload {
  * 检测剪贴板内容类型。
  *
  * @param preferImage
- *   true  → AI pane 模式：图片优先。
- *           navigator.clipboard.read() 分支里读到纯文本时不立即返回，
- *           而是暂存文本、继续走 readImage() 检测；
- *           只有图片检测也失败后，才把暂存文本作为 plain-text 返回。
- *           防止"图片+文本 sidecar"被 Web API 误判成纯文本。
+ *   true  → AI pane 模式：图片/富对象优先。
+ *           navigator.clipboard.read() 分支里：
+ *             - 读到纯文本：暂存（deferredText），不立即返回，先走图片检测
+ *             - 读到富对象：标记 sawRich，不立即返回，先走 readImage() 检测
+ *               （Windows 资源管理器复制的图片/文件会报告 rich 类型，但实际可能含图片数据）
+ *             - 图片检测成功 → raw-image；失败 → 依次尝试 deferredText / rich-object / readText()
  *   false → 非 AI pane 模式：文本优先。
- *           navigator.clipboard.read() 读到文本立即返回，
+ *           navigator.clipboard.read() 读到文本或富对象立即返回，
  *           防止 OS 剪贴板缓存旧图片被 readImage() 误判
  *           （如微信截图后又复制了文字的场景）。
  */
 async function detectClipboardPayload(preferImage = false): Promise<ClipboardPayload> {
-  // Web API 文本暂存：preferImage 模式下不提前返回，留给图片检测优先
+  // Web API 结果暂存（preferImage 模式下延迟返回，让图片检测优先）
   let deferredText: string | undefined;
+  let sawRich = false; // navigator.clipboard.read() 发现了富对象类型（非 image/* / text/*）
 
   // 优先用 Web Clipboard API 读取类型信息（最完整）
   try {
@@ -400,7 +402,13 @@ async function detectClipboardPayload(preferImage = false): Promise<ClipboardPay
       );
       const hasText = item.types.includes('text/plain');
       if (hasRich) {
-        return { kind: 'rich-object' };
+        if (!preferImage) {
+          // 非 AI pane：立即返回，不浪费时间做图片检测
+          return { kind: 'rich-object' };
+        }
+        // AI pane：不立即返回。Windows 资源管理器复制的图片会带 rich 类型，
+        // 但 readImage() fallback 仍可能拿到图片数据，需要先试一下。
+        sawRich = true;
       }
       if (hasText) {
         try {
@@ -420,15 +428,19 @@ async function detectClipboardPayload(preferImage = false): Promise<ClipboardPay
   } catch { /* Clipboard API 不可用时继续 fallback */ }
 
   if (preferImage) {
-    // AI pane：图片优先（含 Web API 已暂存文本的情况）
+    // AI pane：先尝试图片（涵盖 Windows Explorer 复制图片 / sawRich / deferredText 三种情况）
     try {
       const image = await readImage();
       await image.size();
       return { kind: 'raw-image' };
     } catch { /* 非图片 */ }
 
-    // 图片检测失败：优先用 Web API 暂存的文本，其次 readText() 兜底
+    // 图片检测失败，按优先级依次返回：
+    // 1. Web API 暂存的文本（sidecar 文本但无图片）
     if (deferredText) return { kind: 'plain-text', text: deferredText };
+    // 2. Web API 发现了富对象但不是图片（如 Explorer 复制的非图片文件）
+    if (sawRich) return { kind: 'rich-object' };
+    // 3. Tauri readText() 兜底
     try {
       const text = await readText();
       if (text && text.trim()) return { kind: 'plain-text', text };
@@ -483,8 +495,13 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
     } else if (clipboard.kind === 'plain-text' && clipboard.text) {
       // 文本：通过 xterm 原生 paste 管道注入，触发 bracketed-paste 块识别
       sendAiTextPaste(ptyId, clipboard.text);
+    } else if (clipboard.kind === 'rich-object') {
+      // rich-object：Windows 资源管理器复制的图片/文件等。
+      // 走 AI 原生粘贴快捷键（Windows → Alt+V），让 Claude/Codex 自行从剪贴板读取。
+      // 禁止降级为文本路径，因为这类内容没有 text 字段，且 AI CLI 能处理富剪贴板数据。
+      await sendAiImagePasteShortcut(ptyId);
     } else {
-      // rich-object / unknown：有附带文本则走文本路径，否则不操作
+      // empty-or-unknown：若有附带文本则走文本路径，否则不操作
       if (clipboard.text) {
         sendAiTextPaste(ptyId, clipboard.text);
       }
