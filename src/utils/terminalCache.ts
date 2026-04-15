@@ -380,12 +380,36 @@ async function sendAiScreenshotImagePaste(ptyId: number): Promise<void> {
  * 用于 Windows 资源管理器复制的文件/图片文件/Shell 对象等富剪贴板内容。
  * 这类内容不是图片位图，不能走 sendAiScreenshotImagePaste（Alt+V）。
  *
- * 策略：发送 Ctrl+V（\x16），将粘贴决策权交给 AI CLI 自身。
- *   Claude Code / Codex 会从 OS 剪贴板读取并自行判断如何处理文件对象。
- *   Mini-Term 在此处无法可靠重建 Explorer 文件对象的 AI 粘贴语义，
- *   native handoff 是当前最保险的路径。
+ * 策略：
+ *   1. 优先：通过 Tauri Rust 读取 CF_HDROP 文件路径列表
+ *      → 把路径注入 AI pane（Claude Code 收到路径后，自行判断是图片还是文件）
+ *      → 图片文件路径 → Claude Code 展示图片块
+ *      → 普通文件路径 → Claude Code 展示文件引用
+ *   2. 降级：CF_HDROP 读取失败或非 Windows 时发送 Ctrl+V（\x16）
+ *      → 将粘贴决策权交给 AI CLI 自身
+ *
+ * 为什么通过文件路径而非直接发图片：
+ *   Explorer 复制的是文件引用（CF_HDROP），不是图片位图（CF_DIB）；
+ *   位图数据由截图工具写入，文件引用只有路径。
+ *   Claude Code 可以通过路径自行加载图片，效果等同于原生 PowerShell 粘贴。
  */
 async function sendAiNativeHandoff(ptyId: number): Promise<void> {
+  // 尝试读取 CF_HDROP 文件路径（Windows Explorer 复制文件时使用此格式）
+  if (_isWindows) {
+    try {
+      const paths = await invoke<string[]>('read_clipboard_file_paths');
+      if (paths && paths.length > 0) {
+        // 把文件路径注入 AI pane：Claude Code 自行判断图片/文件
+        // 多个路径用空格分隔（与原生 PowerShell 粘贴行为一致）
+        const text = paths.join(' ');
+        sendAiTextPaste(ptyId, text);
+        return;
+      }
+    } catch {
+      // CF_HDROP 读取失败（非文件对象、权限问题等），降级到 Ctrl+V
+    }
+  }
+  // 非 Windows 或 CF_HDROP 不可用：Ctrl+V，让 AI CLI 从 OS 剪贴板原生读取
   await enqueuePtyWrite(ptyId, '\x16');
 }
 

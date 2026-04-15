@@ -208,6 +208,108 @@ mod win {
 
         Ok(rgba)
     }
+
+    /// 从剪贴板读取 CF_HDROP 文件路径列表。
+    /// CF_HDROP 是 Windows 资源管理器复制文件时写入剪贴板的格式。
+    pub fn read_cf_hdrop_paths() -> Result<Vec<String>, String> {
+        unsafe {
+            OpenClipboard(None).map_err(|e| format!("打开剪贴板失败: {e}"))?;
+            let result = do_read_cf_hdrop();
+            let _ = CloseClipboard();
+            result
+        }
+    }
+
+    unsafe fn do_read_cf_hdrop() -> Result<Vec<String>, String> {
+        const CF_HDROP: u32 = 15;
+
+        if IsClipboardFormatAvailable(CF_HDROP).is_err() {
+            return Err("剪贴板中没有 CF_HDROP 格式".into());
+        }
+
+        let hmem = GetClipboardData(CF_HDROP)
+            .map_err(|e| format!("GetClipboardData(CF_HDROP) 失败: {e}"))?;
+
+        let hglobal = HGLOBAL(hmem.0 as *mut _);
+        let ptr = GlobalLock(hglobal);
+        if ptr.is_null() {
+            return Err("GlobalLock 失败".into());
+        }
+
+        let size = GlobalSize(hglobal);
+        let data: &[u8] = std::slice::from_raw_parts(ptr as *const u8, size);
+        let result = parse_dropfiles(data);
+        let _ = GlobalUnlock(hglobal);
+        result
+    }
+
+    fn parse_dropfiles(data: &[u8]) -> Result<Vec<String>, String> {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        // DROPFILES 结构布局（Windows SDK）：
+        //   0..4:   pFiles (DWORD) — 文件列表相对 DROPFILES 起始的字节偏移
+        //   4..12:  pt (POINT)     — 拖放坐标（忽略）
+        //   12..16: fNC (BOOL)     — 非客户区标志（忽略）
+        //   16..20: fWide (BOOL)   — 1 = UTF-16 文件路径；0 = ANSI
+        if data.len() < 20 {
+            return Err("CF_HDROP 数据过短".into());
+        }
+
+        let p_files = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let f_wide = u32::from_le_bytes([data[16], data[17], data[18], data[19]]) != 0;
+
+        if p_files >= data.len() {
+            return Err("CF_HDROP pFiles 偏移越界".into());
+        }
+
+        let file_data = &data[p_files..];
+        let mut paths: Vec<String> = Vec::new();
+
+        if f_wide {
+            // UTF-16LE 空终止字符串列表，双空结束
+            let words: Vec<u16> = file_data
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect();
+            let mut start = 0;
+            loop {
+                if start >= words.len() || words[start] == 0 {
+                    break;
+                }
+                let end = words[start..]
+                    .iter()
+                    .position(|&c| c == 0)
+                    .map(|p| start + p)
+                    .unwrap_or(words.len());
+                let os = OsString::from_wide(&words[start..end]);
+                paths.push(os.to_string_lossy().into_owned());
+                start = end + 1;
+            }
+        } else {
+            // ANSI 空终止字符串列表
+            let mut start = 0;
+            loop {
+                if start >= file_data.len() || file_data[start] == 0 {
+                    break;
+                }
+                let end = file_data[start..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|p| start + p)
+                    .unwrap_or(file_data.len());
+                let s = String::from_utf8_lossy(&file_data[start..end]).into_owned();
+                paths.push(s);
+                start = end + 1;
+            }
+        }
+
+        if paths.is_empty() {
+            Err("CF_HDROP 中没有文件路径".into())
+        } else {
+            Ok(paths)
+        }
+    }
 }
 
 // ── macOS：NSPasteboard 原生兜底 ──────────────────────────────────────────────
@@ -340,5 +442,20 @@ pub fn read_clipboard_image() -> Result<String, String> {
     #[cfg(not(windows))]
     {
         Err("图片剪贴板 Win32 兜底仅支持 Windows 平台".into())
+    }
+}
+
+/// 读取 Windows 剪贴板中的 CF_HDROP 文件路径列表。
+/// 资源管理器复制文件/图片文件时使用此格式，返回文件路径字符串数组。
+/// 非 Windows 平台或剪贴板没有 CF_HDROP 时返回 Err。
+#[tauri::command]
+pub fn read_clipboard_file_paths() -> Result<Vec<String>, String> {
+    #[cfg(windows)]
+    {
+        win::read_cf_hdrop_paths()
+    }
+    #[cfg(not(windows))]
+    {
+        Err("CF_HDROP 仅支持 Windows 平台".into())
     }
 }
