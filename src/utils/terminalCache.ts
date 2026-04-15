@@ -319,24 +319,34 @@ function getAiProviderForPty(ptyId: number): AiProvider | null {
   return null;
 }
 
-// ── 平台级 AI 粘贴快捷键 ──────────────────────────────────────────────────────
+// ── AI pane 三条独立粘贴路径 ──────────────────────────────────────────────────
+//
+// 剪贴板来源必须区分为三类，不可互换：
+//
+//   1. plain-text       → sendAiTextPaste
+//   2. raw-image        → sendAiScreenshotImagePaste  （截图工具图片位图）
+//   3. rich-object      → sendAiNativeHandoff          （Explorer 文件系统对象）
+//
+// raw-image ≠ rich-object：
+//   - raw-image  = 截图工具/图片编辑器直接写入剪贴板的图片位图数据，
+//                  Mini-Term 有增强处理路径（Alt+V on Windows）。
+//   - rich-object = Explorer 复制的文件/Shell 对象/文件引用列表等，
+//                  不是图片位图，不应走图片快捷键，应 native handoff。
+//
+// 混用两者会导致：Explorer 文件对象走 Alt+V → "no image" 错误；
+//              截图图片走文本路径 → 图片内容丢失。
 
 /**
- * AI pane 文本粘贴：通过 xterm.js 原生 paste 管道注入文本。
+ * AI pane 文本粘贴路径。
  *
- * term.paste() 会在 terminal 已开启 bracketed-paste 模式时自动包装
- * \x1b[200~...\x1b[201~，让 Claude/Codex/Gemini CLI 识别为粘贴块，
- * 从而触发 [Pasted text #1 +N lines] 预览和大段粘贴安全提示。
+ * term.paste() 内部包装 bracketed-paste 序列 \x1b[200~...\x1b[201~，
+ * 让 Claude/Codex/Gemini CLI 识别为粘贴块（[Pasted text #1 +N lines]）。
  *
  * 为什么不用 enqueuePtyWrite 直接注入 bracketed-paste 字符串：
- *   直接注入绕过了 xterm 的 paste 管道。对某些 TUI/CLI 而言，
- *   这种方式不能被识别为真正的"粘贴事件"，导致"文本没反应"。
+ *   直接注入绕过 xterm paste 管道，TUI CLI 不会识别为"粘贴事件"。
  *
  * 为什么要先 focus：
- *   右键等操作可能使焦点从 xterm 上漂移，term.paste() 在失焦状态下
- *   会静默失败；主动 focus 保证调用时终端处于激活状态。
- *
- * 图片粘贴由 sendAiImagePasteShortcut 单独处理，两者不能混用。
+ *   右键等操作可能使焦点从 xterm 漂移，term.paste() 在失焦时静默失败。
  */
 function sendAiTextPaste(ptyId: number, text: string): void {
   const entry = cache.get(ptyId);
@@ -346,17 +356,37 @@ function sendAiTextPaste(ptyId: number, text: string): void {
 }
 
 /**
- * AI pane 图片粘贴：Windows → Alt+V（\x1bv）；macOS/Linux → Ctrl+V（\x16）。
+ * AI pane 截图图片粘贴路径（仅用于真正的图片位图剪贴板内容）。
  *
- * Alt+V 是 Claude/Codex 在 Windows 上的图片粘贴专用键，
- * 仅在剪贴板确实含图片时发送，文本粘贴禁止使用此快捷键。
+ * Windows → Alt+V（\x1bv）：Claude/Codex 图片粘贴专用快捷键。
+ * macOS/Linux → Ctrl+V（\x16）。
+ *
+ * 重要限制：
+ *   - 仅在剪贴板内容确实是图片位图时使用（raw-image 分类）
+ *   - 禁止对 Explorer 文件对象（rich-object）使用，否则报"no image"错误
+ *   - 禁止对纯文本使用
  */
-async function sendAiImagePasteShortcut(ptyId: number): Promise<void> {
+async function sendAiScreenshotImagePaste(ptyId: number): Promise<void> {
   if (_isWindows) {
     await enqueuePtyWrite(ptyId, '\x1bv');
   } else {
     await enqueuePtyWrite(ptyId, '\x16');
   }
+}
+
+/**
+ * AI pane Explorer/富对象 native handoff 路径。
+ *
+ * 用于 Windows 资源管理器复制的文件/图片文件/Shell 对象等富剪贴板内容。
+ * 这类内容不是图片位图，不能走 sendAiScreenshotImagePaste（Alt+V）。
+ *
+ * 策略：发送 Ctrl+V（\x16），将粘贴决策权交给 AI CLI 自身。
+ *   Claude Code / Codex 会从 OS 剪贴板读取并自行判断如何处理文件对象。
+ *   Mini-Term 在此处无法可靠重建 Explorer 文件对象的 AI 粘贴语义，
+ *   native handoff 是当前最保险的路径。
+ */
+async function sendAiNativeHandoff(ptyId: number): Promise<void> {
+  await enqueuePtyWrite(ptyId, '\x16');
 }
 
 // ── 剪贴板内容分类器 ────────────────────────────────────────────────────────────
@@ -447,16 +477,13 @@ async function detectClipboardPayload(preferImage = false): Promise<ClipboardPay
 /** 读取系统剪贴板并写入终端 PTY。
  *
  * AI pane（Claude / Codex / Gemini CLI）三条独立路径：
- *   plain-text  → term.paste()（xterm 原生 paste pipeline + bracketed-paste 序列）
- *                 text 已明确时不做任何图片探测，避免 1-2s 延迟
- *   raw-image   → 图片专用快捷键（Windows Alt+V；macOS/Linux Ctrl+V）
- *                 仅对真正的图片位图使用，不能用于文本或富对象
- *   rich-object → Ctrl+V 推测性兜底
- *                 Explorer 文件/Shell 对象 ≠ 图片位图，不得走 Alt+V
+ *   plain-text  → sendAiTextPaste     — xterm bracketed-paste，不探图，无延迟
+ *   raw-image   → sendAiScreenshotImagePaste — 截图图片位图，Windows Alt+V
+ *   rich-object → sendAiNativeHandoff — Explorer 文件/Shell 对象，Ctrl+V native handoff
  *
- *   重要：不能对 AI pane 直接 enqueuePtyWrite() 纯文本。
- *   Claude/Codex/Gemini CLI 依赖 bracketed-paste 语义识别粘贴块；
- *   直接写 PTY 会丢失 paste 事件，导致无预览、多行只显示第一行等问题。
+ *   raw-image 和 rich-object 必须分开：
+ *     截图图片位图 → Alt+V 让 Claude/Codex 读取图片
+ *     Explorer 文件对象 → Alt+V 报"no image"，必须用 native handoff
  *
  * 非 AI pane：
  *   plain-text  → 直接写文本
@@ -465,31 +492,20 @@ async function detectClipboardPayload(preferImage = false): Promise<ClipboardPay
  */
 export async function pasteToTerminal(ptyId: number): Promise<void> {
   const isAiPane = !!getAiProviderForPty(ptyId);
-  // AI pane 用图片优先检测，非 AI pane 用文本优先检测
   const clipboard = await detectClipboardPayload(isAiPane);
 
   if (isAiPane) {
     if (clipboard.kind === 'raw-image') {
-      // 图片专用快捷键：Windows → Alt+V；macOS/Linux → Ctrl+V
-      // 仅在剪贴板确实含图片时发送 Alt+V，文本粘贴禁止使用
-      await sendAiImagePasteShortcut(ptyId);
+      // 截图工具图片位图 → Mini-Term 增强图片路径（Windows: Alt+V）
+      // 保留用户已有的右键截图粘贴体验
+      await sendAiScreenshotImagePaste(ptyId);
     } else if (clipboard.kind === 'plain-text' && clipboard.text) {
-      // 文本：通过 xterm 原生 paste 管道注入，触发 bracketed-paste 块识别
+      // 纯文本 → xterm 原生 paste 管道，触发 bracketed-paste 块识别
       sendAiTextPaste(ptyId, clipboard.text);
     } else if (clipboard.kind === 'rich-object') {
-      // rich-object（Explorer 复制的文件/Shell 对象等）专属路径。
-      //
-      // 不得走 sendAiImagePasteShortcut()（Alt+V）：
-      //   Alt+V 是 Claude/Codex 图片位图专用快捷键，
-      //   对非图片的 Explorer 文件对象会报"no image"错误。
-      //
-      // 不得当作纯文本处理：rich-object 没有 text 字段。
-      //
-      // 当前降级：发送 Ctrl+V（\x16）作为推测性兜底。
-      //   这让 OS/AI CLI 有机会从剪贴板原生读取富对象，
-      //   效果取决于 AI CLI 自身对富剪贴板的支持程度。
-      //   Mini-Term 无法在此处完整重建 Explorer 文件对象的 AI 粘贴语义。
-      await enqueuePtyWrite(ptyId, '\x16');
+      // Explorer 文件/Shell 对象 → native handoff（Ctrl+V）
+      // 不得走截图图片路径（Alt+V），Explorer 文件对象不是图片位图
+      await sendAiNativeHandoff(ptyId);
     } else {
       // empty-or-unknown：若有附带文本则走文本路径，否则不操作
       if (clipboard.text) {
