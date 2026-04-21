@@ -92,6 +92,18 @@ const enqueuePtyWrite = createPtyWriteQueue((ptyId, data) =>
   invoke('write_pty', { ptyId, data })
 );
 
+// ── 诊断开关 & 日志 ─────────────────────────────────────────────────────────
+// 用法：DevTools Console → localStorage.setItem('mini-term-debug', '1')
+//       调试完 → localStorage.removeItem('mini-term-debug')
+const TERM_DEBUG = localStorage.getItem('mini-term-debug') === '1';
+const FORCE_DISABLE_WEBGL = localStorage.getItem('mini-term-disable-webgl') === '1';
+const FORCE_MONO_ONLY = localStorage.getItem('mini-term-mono-only') === '1';
+
+function debugTerm(scope: string, payload: Record<string, unknown>) {
+  if (!TERM_DEBUG) return;
+  console.info(`[mini-term-debug] ${scope}`, payload);
+}
+
 export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   const existing = cache.get(ptyId);
   if (existing) return existing;
@@ -101,11 +113,15 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   wrapper.style.width = '100%';
   wrapper.style.height = '100%';
 
+  const fontFamily = FORCE_MONO_ONLY
+    ? "'JetBrains Mono', 'Cascadia Code', Consolas, monospace"
+    : "'JetBrains Mono', 'Cascadia Code', Consolas, 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans Mono CJK SC', 'Microsoft YaHei Mono', monospace";
+
   const term = new Terminal({
     fontSize: useAppStore.getState().config.terminalFontSize ?? 14,
     // CJK 备用字体：PingFang SC（macOS）/ Noto Sans Mono CJK SC（Linux）/ Microsoft YaHei（Windows）
     // 确保中文字符有合适的字形，避免宽度计算与实际渲染不一致导致乱码
-    fontFamily: "'JetBrains Mono', 'Cascadia Code', Consolas, 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans Mono CJK SC', 'Microsoft YaHei Mono', monospace",
+    fontFamily,
     fontWeight: '400',
     fontWeightBold: '600',
     cursorBlink: true,
@@ -138,16 +154,32 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   }
 
   // WebGL 渲染，降级时回退到 Canvas
-  try {
-    const webgl = new WebglAddon();
-    webgl.onContextLoss(() => {
-      webgl.dispose();
-      term.refresh(0, term.rows - 1);
-    });
-    term.loadAddon(webgl);
-  } catch {
-    // WebGL 不支持
+  if (FORCE_DISABLE_WEBGL) {
+    debugTerm('terminal:webgl_skipped', { ptyId, reason: 'FORCE_DISABLE_WEBGL' });
+  } else {
+    try {
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => {
+        debugTerm('terminal:webgl_context_loss', { ptyId });
+        webgl.dispose();
+        term.refresh(0, term.rows - 1);
+      });
+      term.loadAddon(webgl);
+      debugTerm('terminal:webgl_loaded', { ptyId });
+    } catch (err) {
+      debugTerm('terminal:webgl_failed', { ptyId, error: String(err) });
+    }
   }
+
+  debugTerm('terminal:create', {
+    ptyId,
+    fontFamily: term.options.fontFamily,
+    fontSize: term.options.fontSize,
+    lineHeight: term.options.lineHeight,
+    letterSpacing: term.options.letterSpacing,
+    webgl: !FORCE_DISABLE_WEBGL,
+    monoOnly: FORCE_MONO_ONLY,
+  });
 
   // 剪贴板快捷键 + macOS WKWebView Ctrl 键修复
   // macOS 的 WKWebView 对 Ctrl+A/E/K/U/W 等有系统级文本编辑绑定（继承自 NeXTSTEP），
@@ -389,20 +421,26 @@ function sendAiTextPaste(ptyId: number, text: string): void {
  *   - 禁止对纯文本使用
  */
 async function sendAiScreenshotImagePaste(ptyId: number, provider: AiProvider | null): Promise<void> {
+  let key: string;
+  let platform: string;
   if (_isWindows) {
+    key = 'alt+v'; platform = 'windows';
     await enqueuePtyWrite(ptyId, '\x1bv');
-    return;
-  }
-  if (_isMacOS) {
+  } else if (_isMacOS) {
+    platform = 'mac';
     // Codex on mac 与 Windows 一致用 Alt+V；Claude/Gemini 用 Ctrl+V
     if (provider === 'codex') {
+      key = 'alt+v';
       await enqueuePtyWrite(ptyId, '\x1bv');
-      return;
+    } else {
+      key = 'ctrl+v';
+      await enqueuePtyWrite(ptyId, '\x16');
     }
+  } else {
+    key = 'ctrl+v'; platform = 'linux';
     await enqueuePtyWrite(ptyId, '\x16');
-    return;
   }
-  await enqueuePtyWrite(ptyId, '\x16');
+  debugTerm('paste:image_shortcut', { ptyId, provider, key: key!, platform: platform! });
 }
 
 /**
@@ -552,14 +590,22 @@ async function detectClipboardPayload(preferImage = false): Promise<ClipboardPay
   let webItems: ClipboardItem[] = [];
   try {
     webItems = await navigator.clipboard.read();
+    debugTerm('clipboard:web_items', {
+      itemCount: webItems.length,
+      itemTypes: webItems.map((i) => [...i.types]),
+      preferImage,
+    });
     for (const item of webItems) {
       // 截图工具（微信截图、系统截图等）写入 image/* MIME type → raw-image，立即返回
       // 截图位图优先级最高，不需要再检查 CF_HDROP
       if (item.types.some((t) => t.startsWith('image/'))) {
+        debugTerm('clipboard:classified', { kind: 'raw-image', source: 'web-api-image' });
         return { kind: 'raw-image' };
       }
     }
-  } catch { /* Web API 不可用，继续 */ }
+  } catch (err) {
+    debugTerm('clipboard:navigator_read_failed', { error: String(err) });
+  }
 
   // Step 2: Windows CF_HDROP 探测（在 Web API 文本处理之前）
   //
@@ -612,7 +658,21 @@ async function detectClipboardPayload(preferImage = false): Promise<ClipboardPay
         }
         continue; // text-like 但无有效 text/plain 内容，继续下一个 item
       }
-      // 非 text-like → rich-object residual fallback
+      // 非 text-like → 先用 Tauri readImage() 二次探测 NSPasteboard。
+      // macOS WKWebView 可能不暴露 image/* MIME，但 NSPasteboard 中
+      // 实际有截图位图（如微信截图）。不检测的话会被误分为 rich-object，
+      // 导致发 Ctrl+V 而非 Alt+V，Codex 图片粘贴失败。
+      if (preferImage) {
+        try {
+          const image = await readImage();
+          await image.size();
+          debugTerm('clipboard:classified', { kind: 'raw-image', source: 'mac-tauri-readImage-fallback' });
+          return { kind: 'raw-image' };
+        } catch (err) {
+          debugTerm('clipboard:readImage_failed', { error: String(err), context: 'mac-rich-object-fallback' });
+        }
+      }
+      debugTerm('clipboard:classified', { kind: 'rich-object', source: 'mac-non-text-like' });
       return { kind: 'rich-object' };
     }
 
@@ -686,20 +746,42 @@ async function detectClipboardPayload(preferImage = false): Promise<ClipboardPay
 export async function pasteToTerminal(ptyId: number): Promise<void> {
   const provider = getAiProviderForPty(ptyId);
   const isAiPane = !!provider;
+
+  // 诊断：AI pane 身份判定（文档 §5.2）
+  if (TERM_DEBUG) {
+    const { projectStates } = useAppStore.getState();
+    let paneStatus: string | undefined;
+    let aiProvider: string | undefined;
+    for (const ps of projectStates.values()) {
+      for (const tab of ps.tabs) {
+        const pane = findPaneByPty(tab.splitLayout, ptyId);
+        if (pane) { paneStatus = pane.status; aiProvider = pane.aiProvider; break; }
+      }
+      if (paneStatus) break;
+    }
+    debugTerm('paste:ai_identity', {
+      ptyId, paneStatus, aiProvider, provider, isAiPane,
+    });
+  }
+
   const clipboard = await detectClipboardPayload(isAiPane);
 
   if (isAiPane) {
+    let route = 'noop';
     if (clipboard.kind === 'raw-image') {
+      route = 'ai-raw-image';
       // 截图工具图片位图 → provider-aware 快捷键
       // Windows: Alt+V；macOS+codex: Alt+V；macOS+claude: Ctrl+V
       await sendAiScreenshotImagePaste(ptyId, provider);
     } else if (clipboard.kind === 'plain-text' && clipboard.text) {
+      route = 'ai-text';
       // 纯文本 → xterm 原生 paste 管道，触发 bracketed-paste 块识别，无延迟
       sendAiTextPaste(ptyId, clipboard.text);
     } else if (
       (clipboard.kind === 'explorer-image-files' || clipboard.kind === 'finder-image-files') &&
       clipboard.paths
     ) {
+      route = 'ai-image-files';
       // Explorer / Finder 图片文件：加载为剪贴板位图 → Alt+V，AI CLI 读取为图片块
       // load_image_to_clipboard 将文件写入 CF_DIB/TIFF，再触发与截图相同的粘贴路径
       await sendAiExplorerImageFilesPaste(ptyId, clipboard.paths, provider);
@@ -707,18 +789,22 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
       (clipboard.kind === 'explorer-files' || clipboard.kind === 'finder-files') &&
       clipboard.paths
     ) {
+      route = 'ai-files';
       // Explorer / Finder 普通文件路径：路径文本注入，Claude Code 展示文件引用
       // 注意：文件路径引用 ≠ 图片位图，不能走 Alt+V
       sendAiExplorerFilesPaste(ptyId, clipboard.paths);
     } else if (clipboard.kind === 'rich-object') {
+      route = 'ai-rich-object-ctrl-v';
       // 无法识别的富对象 residual fallback：Ctrl+V 让 AI CLI 自行决策
       await enqueuePtyWrite(ptyId, '\x16');
     } else {
       // empty-or-unknown：若有附带文本则走文本路径，否则不操作
       if (clipboard.text) {
+        route = 'ai-text-fallback';
         sendAiTextPaste(ptyId, clipboard.text);
       }
     }
+    debugTerm('paste:route', { ptyId, provider, clipboardKind: clipboard.kind, route });
     return;
   }
 

@@ -225,6 +225,28 @@ fn strip_ansi_codes(s: &str) -> String {
                         result.push('\r');
                     }
                 }
+                Some(&']') => {
+                    // OSC (Operating System Command): ESC ] ... ST
+                    // 终结符 = BEL (\x07) 或 ST (ESC \)
+                    // macOS 上 Claude Code / Codex 设置终端标题会输出 OSC 序列，
+                    // 不消费的话 "0;Claude Code v2.x" 等会泄漏到输出缓冲区，
+                    // 干扰 banner 检测和 provider 识别。
+                    chars.next(); // consume ']'
+                    loop {
+                        match chars.next() {
+                            None => break,
+                            Some('\x07') => break, // BEL 终结
+                            Some('\x1b') => {
+                                // ST = ESC '\'
+                                if chars.peek() == Some(&'\\') {
+                                    chars.next();
+                                }
+                                break;
+                            }
+                            Some(_) => {} // 消费 OSC 内容
+                        }
+                    }
+                }
                 Some(&'O') => { chars.next(); chars.next(); } // SS3: ESC O <final>
                 _ => { chars.next(); } // other two-char escape
             }
@@ -377,6 +399,10 @@ impl PtyManager {
             // 进入 AI 状态，且在同一锁范围内原子写入 session + provider，
             // 消除 monitor 在两次独立写入之间轮询导致的 provider=None 竞态。
             if let Some(provider) = detect_provider_from_output(output) {
+                // 先清空 recent_output_window，再设置 session+provider。
+                // 防止 monitor 在两步之间抢跑 try_reconcile_ai_from_banner，
+                // 用旧 banner（如上次 Claude 的）覆盖本次检测到的 provider（如 Codex）。
+                self.recent_output_window.lock().unwrap().insert(pty_id, String::new());
                 let mut sessions = self.ai_sessions.lock().unwrap();
                 let mut providers = self.ai_providers.lock().unwrap();
                 sessions.insert(pty_id);
@@ -588,6 +614,17 @@ impl PtyManager {
         }
 
         if enter_ai || exit_ai {
+            // 先清空 recent_output_window，再更新 session+provider。
+            // 消除竞态：若先设置 provider 再清窗口，monitor 可能在两步之间抢跑
+            // try_reconcile_ai_from_banner，用旧 banner 覆盖刚设置的新 provider。
+            // 例：上次运行 Claude → window 含 Claude banner → 本次启动 Codex →
+            // Layer 1 正确设置 provider="codex" → monitor 用旧 Claude banner
+            // 把 provider 纠正回 "claude" → 蓝点不变 ← BUG。
+            // 先清窗口后，monitor 看到空窗口 → reconcile 为 no-op → provider 正确。
+            if enter_ai {
+                self.recent_output_window.lock().unwrap().insert(pty_id, String::new());
+            }
+
             {
                 let mut sessions = self.ai_sessions.lock().unwrap();
                 let mut providers = self.ai_providers.lock().unwrap();
@@ -602,14 +639,6 @@ impl PtyManager {
                 }
             } // sessions + providers 在此释放，避免下方加锁时死锁
 
-            if enter_ai {
-                // 新 AI 会话开始时清空输出窗口，防止旧 banner 在 Layer 2 banner 兜底中产生误判。
-                // 例：上一次运行了 Claude → window 含 Claude banner；本次用右箭头启动 Codex →
-                // Layer 1 可能因 ghost text 把 provider 误判为 "claude"。
-                // 清空 window 后，Layer 2 只能看到本次 Codex 的新输出，
-                // 一旦 Codex 打印其启动 banner，Layer 2 即可纠正 provider 为 "codex"。
-                self.recent_output_window.lock().unwrap().insert(pty_id, String::new());
-            }
             if exit_ai {
                 // 退出 AI 会话时清空输出窗口，防止残留的 AI 启动 banner
                 // 在下一次 banner 兜底检测中误判为新会话开始。
@@ -1530,5 +1559,84 @@ mod tests {
         mgr.try_reconcile_ai_from_banner(1);
         assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("codex"),
             "Layer 2 应通过 banner 纠正 Layer 1 的错误 provider");
+    }
+
+    // ── 同 pane 切换 provider：竞态修复验证 ───────────────────────────────
+
+    #[test]
+    fn same_pane_claude_then_codex_no_stale_banner() {
+        // 模拟 Mac 上同一 pane 的 provider 切换场景：
+        // 1. 开 Claude → banner 写入 window
+        // 2. /exit 退出 → session 清除，window 清空
+        // 3. 开 Codex → provider 应为 "codex"
+        // 4. reconcile 不应用旧 Claude banner 覆盖
+        let mgr = PtyManager::new();
+
+        // Step 1: 开 Claude
+        mgr.track_input(1, "claude\r");
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("claude"));
+        mgr.inject_banner_output(1, "Welcome to Claude Code!\n");
+
+        // Step 2: 退出
+        mgr.track_input(1, "/exit\r");
+        assert!(!mgr.is_ai_session(1));
+
+        // Step 3: 开 Codex（enter_ai 路径已清空 window，再设 provider）
+        mgr.track_input(1, "codex\r");
+        assert!(mgr.is_ai_session(1));
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("codex"),
+            "直接输入 codex 应正确设置 provider");
+
+        // Step 4: reconcile 应为 no-op（window 已清空，无旧 banner）
+        mgr.try_reconcile_ai_from_banner(1);
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("codex"),
+            "reconcile 不应用旧 Claude banner 覆盖 Codex provider");
+    }
+
+    #[test]
+    fn same_pane_enter_ai_clears_window_before_setting_provider() {
+        // 验证 enter_ai 路径的时序：window 先清空，provider 后设置。
+        // 即使 window 中有旧 Claude banner，codex 入场后 reconcile 也不会覆盖。
+        let mgr = PtyManager::new();
+
+        // 先注入旧 Claude banner（模拟上次会话残留，极端情况）
+        mgr.inject_banner_output(1, "Welcome to Claude Code!\n");
+
+        // 直接输入 codex → enter_ai 应先清 window，再设 provider
+        mgr.track_input(1, "codex\r");
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("codex"));
+
+        // reconcile 此时 window 应为空（被 enter_ai 清过）
+        mgr.try_reconcile_ai_from_banner(1);
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("codex"),
+            "enter_ai 应在设置 provider 前清空 window，防止旧 banner 竞态覆盖");
+    }
+
+    // ── OSC 序列剥离 ──────────────────────────────────────────────────────
+
+    #[test]
+    fn strip_ansi_codes_removes_osc_with_bel() {
+        // macOS 终端标题：ESC ] 0;title BEL
+        let input = "before\x1b]0;Claude Code v2.1.110\x07after";
+        let result = strip_ansi_codes(input);
+        assert_eq!(result, "beforeafter", "OSC (BEL 终结) 应被完整剥离");
+    }
+
+    #[test]
+    fn strip_ansi_codes_removes_osc_with_st() {
+        // OSC 以 ST (ESC \) 终结
+        let input = "before\x1b]0;codex title\x1b\\after";
+        let result = strip_ansi_codes(input);
+        assert_eq!(result, "beforeafter", "OSC (ST 终结) 应被完整剥离");
+    }
+
+    #[test]
+    fn osc_title_does_not_leak_into_banner_detection() {
+        // 旧版 strip_ansi_codes 不处理 OSC，会导致 "0;Claude Code v2.x" 泄漏
+        // 到 detect_provider_from_banner，可能产生误判
+        let raw = "\x1b]0;codex session\x07real output here\n";
+        let provider = detect_provider_from_banner(raw);
+        assert_ne!(provider, Some("codex"),
+            "OSC 标题中的 codex 不应被 banner 检测匹配");
     }
 }

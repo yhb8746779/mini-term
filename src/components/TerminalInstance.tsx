@@ -134,6 +134,15 @@ export function TerminalInstance({ ptyId }: Props) {
     const selectedText = selectionSnapshot.current;
     selectionSnapshot.current = '';
 
+    // 诊断日志（文档 §5.1）—— localStorage.setItem('mini-term-debug','1') 开启
+    if (localStorage.getItem('mini-term-debug') === '1') {
+      const action = selectedText ? 'copy-selected' : 'paste-no-selection';
+      console.info('[mini-term-debug] contextmenu:enter', {
+        ptyId, button: e.button, hasSelection: !!selectedText,
+        isMacOS: _isMacOS, isWindows: _isWindows, action,
+      });
+    }
+
     // macOS / Windows：与原生终端一致，右键直接复制或粘贴，不弹菜单
     if (_isMacOS || _isWindows) {
       if (selectedText) {

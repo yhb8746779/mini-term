@@ -70,7 +70,7 @@ const AWAITING_EXCLUSIONS: &[&str] = &[
     "approval mode",
 ];
 
-/// 简单 ANSI strip：去掉 ESC[…m 类转义，保留可读文本
+/// 简单 ANSI strip：去掉 ESC[…m / OSC 等转义，保留可读文本
 fn strip_ansi_simple(s: &str) -> String {
     let mut result = String::new();
     let mut chars = s.chars().peekable();
@@ -82,6 +82,21 @@ fn strip_ansi_simple(s: &str) -> String {
                     for c2 in chars.by_ref() {
                         if ('\x40'..='\x7e').contains(&c2) {
                             break;
+                        }
+                    }
+                }
+                Some(&']') => {
+                    // OSC: ESC ] ... BEL/ST — 终端标题等，完整消费避免文本泄漏
+                    chars.next(); // consume ']'
+                    loop {
+                        match chars.next() {
+                            None => break,
+                            Some('\x07') => break,
+                            Some('\x1b') => {
+                                if chars.peek() == Some(&'\\') { chars.next(); }
+                                break;
+                            }
+                            Some(_) => {}
                         }
                     }
                 }
