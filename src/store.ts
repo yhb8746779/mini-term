@@ -60,11 +60,13 @@ function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus, pr
     const idx = node.panes.findIndex((p) => p.ptyId === ptyId);
     if (idx >= 0) {
       const newPanes = [...node.panes];
+      // Part D: 当 provider 缺失时清空 aiProvider，防止旧颜色残留。
+      // 例外：error 是终态（进程已死），保留 aiProvider 供 ProjectList 错误归属展示。
       const providerUpdate = provider
         ? { aiProvider: provider }
-        : status === 'idle'
-        ? { aiProvider: undefined as AiProvider | undefined }
-        : {};
+        : status === 'error'
+        ? {} // 保留现有 aiProvider，维持错误点的 provider 归属
+        : { aiProvider: undefined as AiProvider | undefined };
       newPanes[idx] = { ...newPanes[idx], status, ...providerUpdate };
       return { ...node, panes: newPanes };
     }

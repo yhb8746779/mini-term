@@ -33,15 +33,18 @@ fn save_rgba_png(rgba: &[u8], width: u32, height: u32) -> Result<PathBuf, String
 mod win {
     use super::save_rgba_png;
     use std::path::PathBuf;
-    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::Foundation::{HANDLE, HGLOBAL};
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleDC, DeleteDC, GetDIBits, SelectObject, BITMAPINFO, BITMAPINFOHEADER,
         DIB_RGB_COLORS, HBITMAP, HGDIOBJ,
     };
     use windows::Win32::System::DataExchange::{
-        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+        CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
+        OpenClipboard, SetClipboardData,
     };
-    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+    };
 
     const CF_DIB: u32 = 8;
     const CF_BITMAP: u32 = 2;
@@ -243,6 +246,89 @@ mod win {
         result
     }
 
+    /// 从磁盘图片文件加载图像，写入 Windows 剪贴板为 CF_DIB 格式，
+    /// 供 AI CLI 的 Alt+V 图片粘贴快捷键读取（与截图位图路径完全一致）。
+    pub fn write_image_file_to_clipboard(path: &str) -> Result<(), String> {
+        // 读取图片文件并解码为 RGB8
+        let img = image::open(path).map_err(|e| format!("读取图片文件失败: {e}"))?;
+        let rgb = img.to_rgb8();
+        let width = rgb.width();
+        let height = rgb.height();
+        let pixels = rgb.as_raw(); // RGB8，top-down
+
+        // CF_DIB 布局：BITMAPINFOHEADER + 24-bit BGR 像素数据（bottom-up，行 4 字节对齐）
+        let row_stride = ((width * 3 + 3) & !3) as usize;
+        let pixel_bytes = row_stride * height as usize;
+        let header_size = std::mem::size_of::<BITMAPINFOHEADER>();
+        let total_size = header_size + pixel_bytes;
+
+        let mut dib = vec![0u8; total_size];
+
+        // 写 BITMAPINFOHEADER（biHeight 正数 = bottom-up）
+        let header = BITMAPINFOHEADER {
+            biSize: header_size as u32,
+            biWidth: width as i32,
+            biHeight: height as i32,
+            biPlanes: 1,
+            biBitCount: 24,
+            biCompression: 0, // BI_RGB
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &header as *const BITMAPINFOHEADER as *const u8,
+                dib.as_mut_ptr(),
+                header_size,
+            );
+        }
+
+        // RGB8 top-down → BGR bottom-up
+        let pixel_buf = &mut dib[header_size..];
+        for row in 0..height as usize {
+            let src_row = height as usize - 1 - row; // 垂直翻转
+            let dst = row * row_stride;
+            let src = src_row * width as usize * 3;
+            for col in 0..width as usize {
+                let s = src + col * 3;
+                let d = dst + col * 3;
+                pixel_buf[d]     = pixels[s + 2]; // B
+                pixel_buf[d + 1] = pixels[s + 1]; // G
+                pixel_buf[d + 2] = pixels[s];     // R
+            }
+            // 行末填充字节已经是 0（vec 初始化）
+        }
+
+        // 写入 Windows 剪贴板
+        unsafe {
+            const CF_DIB: u32 = 8;
+
+            OpenClipboard(None).map_err(|e| format!("打开剪贴板失败: {e}"))?;
+            let result = (|| -> Result<(), String> {
+                EmptyClipboard().map_err(|e| format!("EmptyClipboard 失败: {e}"))?;
+
+                let hmem = GlobalAlloc(GMEM_MOVEABLE, total_size)
+                    .map_err(|e| format!("GlobalAlloc 失败: {e}"))?;
+                let ptr = GlobalLock(hmem);
+                if ptr.is_null() {
+                    return Err("GlobalLock 失败".into());
+                }
+                std::ptr::copy_nonoverlapping(dib.as_ptr(), ptr as *mut u8, total_size);
+                let _ = GlobalUnlock(hmem);
+
+                // 将 HGLOBAL 所有权移交给剪贴板（之后不可再 GlobalFree）
+                SetClipboardData(CF_DIB, HANDLE(hmem.0 as *mut _))
+                    .map_err(|e| format!("SetClipboardData 失败: {e}"))?;
+                Ok(())
+            })();
+            let _ = CloseClipboard();
+            result
+        }
+    }
+
     fn parse_dropfiles(data: &[u8]) -> Result<Vec<String>, String> {
         use std::ffi::OsString;
         use std::os::windows::ffi::OsStringExt;
@@ -401,6 +487,51 @@ mod mac {
         }
     }
 
+    /// 从磁盘图片文件加载图像，写入 macOS NSPasteboard 为 TIFF 格式，
+    /// 供 AI CLI 的 Ctrl+V / Alt+V 图片粘贴读取（与截图位图路径一致）。
+    pub fn write_image_file_to_clipboard(path: &str) -> Result<(), String> {
+        // 读取并解码图片文件
+        let img = image::open(path).map_err(|e| format!("读取图片文件失败: {e}"))?;
+
+        // 编码为 TIFF（NSPasteboard 首选格式，Claude/Codex 读取时优先尝试）
+        let mut tiff_cursor = std::io::Cursor::new(Vec::<u8>::new());
+        img.write_to(&mut tiff_cursor, image::ImageFormat::Tiff)
+            .map_err(|e| format!("TIFF 编码失败: {e}"))?;
+        let tiff_data = tiff_cursor.into_inner();
+
+        unsafe {
+            let pb_cls = AnyClass::get(c"NSPasteboard")
+                .ok_or_else(|| "NSPasteboard class not found".to_string())?;
+            let pb: Retained<AnyObject> = msg_send![pb_cls, generalPasteboard];
+
+            // 清空剪贴板（clearContents 返回变化计数）
+            let _: i64 = msg_send![&pb, clearContents];
+
+            let str_cls = AnyClass::get(c"NSString")
+                .ok_or_else(|| "NSString class not found".to_string())?;
+            let data_cls = AnyClass::get(c"NSData")
+                .ok_or_else(|| "NSData class not found".to_string())?;
+
+            // NSPasteboardTypeTIFF = "public.tiff"
+            let c_tiff = CString::new("public.tiff").unwrap();
+            let ns_tiff_type: Retained<AnyObject> =
+                msg_send![str_cls, stringWithUTF8String: c_tiff.as_ptr()];
+
+            // NSData from bytes
+            let ns_data: Retained<AnyObject> = msg_send![data_cls,
+                dataWithBytes: tiff_data.as_ptr() as *const c_void
+                length: tiff_data.len()];
+
+            // setData:forType: returns BOOL
+            let ok: i8 = msg_send![&pb, setData: &*ns_data forType: &*ns_tiff_type];
+            if ok == 0 {
+                return Err("NSPasteboard setData:forType: 写入失败".into());
+            }
+
+            Ok(())
+        }
+    }
+
     pub fn read_clipboard_to_png() -> Result<PathBuf, String> {
         unsafe {
             let pb_cls = AnyClass::get(c"NSPasteboard")
@@ -549,5 +680,30 @@ pub fn read_clipboard_file_paths_macos() -> Result<Vec<String>, String> {
     #[cfg(not(target_os = "macos"))]
     {
         Err("Finder 文件路径读取仅支持 macOS 平台".into())
+    }
+}
+
+/// 从磁盘图片文件加载图像并写入系统剪贴板。
+///
+/// Windows → CF_DIB（24-bit BGR bottom-up）
+/// macOS   → NSPasteboard TIFF（public.tiff）
+///
+/// 写入成功后，前端可像截图粘贴一样触发 Alt+V（Windows/Codex）或 Ctrl+V（macOS+Claude），
+/// AI CLI 将从剪贴板读取图片数据，以图片块方式展示（而非路径文本）。
+///
+/// 与截图位图路径的区别：截图是剪贴板中已有位图；此命令是先从文件加载再写入剪贴板。
+#[tauri::command]
+pub fn load_image_to_clipboard(path: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        win::write_image_file_to_clipboard(&path)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        mac::write_image_file_to_clipboard(&path)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Err(format!("load_image_to_clipboard 仅支持 Windows/macOS，path={path}"))
     }
 }

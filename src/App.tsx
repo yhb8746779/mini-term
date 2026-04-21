@@ -85,10 +85,11 @@ export function App() {
   }, []);
 
   useTauriEvent<PtyStatusChangePayload>('pty-status-change', useCallback((payload) => {
+    console.log('[fe-status]', payload.ptyId, payload.status, payload.provider ?? '(no provider)');
     updatePaneStatusByPty(
       payload.ptyId,
       payload.status as PaneStatus,
-      payload.provider as AiProvider | undefined,
+      payload.provider ? (payload.provider as AiProvider) : undefined,
     );
   }, [updatePaneStatusByPty]));
 

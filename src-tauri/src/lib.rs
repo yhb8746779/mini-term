@@ -61,6 +61,7 @@ pub fn run() {
             clipboard::read_clipboard_image,
             clipboard::read_clipboard_file_paths,
             clipboard::read_clipboard_file_paths_macos,
+            clipboard::load_image_to_clipboard,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

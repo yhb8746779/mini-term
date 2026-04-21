@@ -321,32 +321,40 @@ function getAiProviderForPty(ptyId: number): AiProvider | null {
 
 // ── AI pane 剪贴板来源分类与粘贴路径 ──────────────────────────────────────────
 //
-// 剪贴板来源必须区分为 5 类，不可互换：
+// 剪贴板来源必须区分为以下几类，三种图片相关类型不可互换：
 //
 //   1. plain-text           → sendAiTextPaste
-//   2. raw-image            → sendAiScreenshotImagePaste   （截图工具图片位图）
-//   3. explorer-image-files → sendAiExplorerFilesPaste     （Explorer 复制的图片文件路径）
-//   4. explorer-files       → sendAiExplorerFilesPaste     （Explorer 复制的普通文件路径）
-//   5. rich-object          → Ctrl+V fallback              （无法识别的富剪贴板对象）
+//   2. raw-image            → sendAiScreenshotImagePaste      （截图工具图片位图）
+//   3. explorer-image-files → sendAiExplorerImageFilesPaste   （Explorer 复制的图片文件路径）
+//   4. explorer-files       → sendAiExplorerFilesPaste        （Explorer 复制的普通文件路径）
+//   5. finder-image-files   → sendAiExplorerImageFilesPaste   （Finder 复制的图片文件路径）
+//   6. finder-files         → sendAiExplorerFilesPaste        （Finder 复制的普通文件路径）
+//   7. rich-object          → Ctrl+V fallback                 （无法识别的富剪贴板对象）
 //
-// 关键区分：raw-image ≠ explorer-image-files ≠ rich-object
+// ─── 三种"图片相关"类型的本质区别 ─────────────────────────────────────────────
 //
-//   raw-image          = 截图工具/图片编辑器直接写入剪贴板的图片位图（CF_DIB/CF_BITMAP），
-//                        Web Clipboard API 暴露 image/* MIME type。
-//                        Mini-Term 增强路径：Windows Alt+V 让 Claude/Codex 读取图片。
+//   raw-image
+//     = 截图工具/图片编辑器直接写入剪贴板的图片位图（CF_DIB/CF_BITMAP）。
+//       Web Clipboard API 暴露 image/* MIME type。
+//       Mini-Term 增强路径：Windows Alt+V 让 Claude/Codex 从剪贴板读取真实图片数据。
 //
-//   explorer-image-files = 资源管理器复制的图片文件（CF_HDROP 文件路径列表），
-//                        Rust 后端 read_clipboard_file_paths() 提取路径后按扩展名判定。
-//                        不是图片位图 → 不能走 Alt+V，必须转换为路径文本注入 AI pane。
+//   explorer-image-files / finder-image-files
+//     = 资源管理器/Finder 复制的图片文件（CF_HDROP / public.file-url 文件路径列表）。
+//       Rust 后端按扩展名判定（.png/.jpg/.gif 等）。
+//       本质是文件路径引用，不是图片位图 → 不能走 Alt+V，否则报 "no image" 错误。
+//       必须走专属路径 sendAiExplorerImageFilesPaste，与普通文件保持代码意图隔离。
 //
-//   explorer-files     = 资源管理器复制的普通文件（CF_HDROP 文件路径列表，非图片扩展名）。
-//                        同上，转换为路径文本注入。
+//   explorer-files / finder-files
+//     = 资源管理器/Finder 复制的普通文件（CF_HDROP，非图片扩展名）。
+//       路径文本注入，Claude Code 自行处理文件引用。
 //
-//   rich-object        = Web API 可见的富对象但后端无法提取文件路径，仅 Ctrl+V fallback。
+//   rich-object
+//     = Web API 可见的富对象但后端无法提取文件路径，Ctrl+V fallback。
 //
-// 混用这些类型会导致：
+// ─── 混用这些类型会导致 ────────────────────────────────────────────────────────
 //   - Explorer 文件对象走 Alt+V → "no image" 错误
 //   - 截图图片走文本路径 → 图片内容丢失
+//   - explorer-image-files 与 explorer-files 共用同一函数 → 无法针对图片文件做独立优化
 
 /**
  * AI pane 文本粘贴路径。
@@ -398,25 +406,65 @@ async function sendAiScreenshotImagePaste(ptyId: number, provider: AiProvider | 
 }
 
 /**
- * AI pane Explorer 文件/图片文件粘贴路径。
+ * AI pane 普通文件路径粘贴路径（explorer-files / finder-files）。
  *
- * 用于已经从 CF_HDROP 提取出路径的 explorer-files / explorer-image-files 情形。
+ * 用于已经从 CF_HDROP / public.file-url 提取出路径的非图片文件情形。
  * 路径由 detectClipboardPayload 在分类时提前读取，此处只做格式化注入。
  *
  * 策略：
  *   - 路径含空格时加双引号，多个路径用空格分隔（与原生 PowerShell 粘贴行为一致）
- *   - 通过 sendAiTextPaste 触发 bracketed-paste，让 Claude Code 自行判断图片/文件
- *     → 图片文件路径 → Claude Code 展示图片块
- *     → 普通文件路径 → Claude Code 展示文件引用
+ *   - 通过 sendAiTextPaste 触发 bracketed-paste，Claude Code 展示文件引用
  *
  * 为什么不用 sendAiScreenshotImagePaste（Alt+V）：
  *   CF_HDROP 是文件路径引用，不是图片位图（CF_DIB/CF_BITMAP）。
  *   Alt+V 要求剪贴板中有真实图片数据，文件引用会导致 "no image" 错误。
+ *
+ * 注意：图片文件路径请使用 sendAiExplorerImageFilesPaste，两者不可混用。
  */
 function sendAiExplorerFilesPaste(ptyId: number, paths: string[]): void {
   // 含空格的路径加双引号，多个路径用空格分隔
   const text = paths.map((p) => (p.includes(' ') ? `"${p}"` : p)).join(' ');
   sendAiTextPaste(ptyId, text);
+}
+
+/**
+ * AI pane 图片文件粘贴路径（explorer-image-files / finder-image-files）。
+ *
+ * 专用于从资源管理器/Finder 复制的图片文件（.png/.jpg/.gif 等扩展名）。
+ * 与 sendAiExplorerFilesPaste（普通文件）严格分离，不可共用同一函数。
+ *
+ * ─── 策略：load_image_to_clipboard → Alt+V / Ctrl+V ─────────────────────────
+ *   1. 调 Rust `load_image_to_clipboard(path)` 将图片文件内容写入系统剪贴板为位图
+ *      Windows → CF_DIB；macOS → NSPasteboard TIFF
+ *   2. 调 `sendAiScreenshotImagePaste`，与截图粘贴完全一致
+ *      Windows/Codex → Alt+V；macOS+Claude → Ctrl+V
+ *   AI CLI 从剪贴板读取真实图片位图，以图片块（[Pasted image #N]）展示。
+ *
+ * ─── 为什么不直接走 Alt+V（不经过此步骤）───────────────────────────────────────
+ *   资源管理器复制的文件放的是 CF_HDROP（路径引用），不是 CF_DIB（位图）。
+ *   直接 Alt+V 会让 AI CLI 读到 CF_HDROP，报 "no image" 错误。
+ *   此函数先把文件内容解码为位图写入剪贴板，再触发 Alt+V，规避该问题。
+ *
+ * ─── 多图片处理 ──────────────────────────────────────────────────────────────
+ *   多张图片依次加载→触发，AI CLI 按顺序产生多个图片块。
+ *   若某张图片加载失败，降级为路径文本注入（不中断其余图片）。
+ */
+async function sendAiExplorerImageFilesPaste(
+  ptyId: number,
+  paths: string[],
+  provider: AiProvider | null,
+): Promise<void> {
+  for (const path of paths) {
+    try {
+      // 将图片文件写入剪贴板位图（CF_DIB / NSPasteboard TIFF）
+      await invoke('load_image_to_clipboard', { path });
+      // 触发 AI CLI 图片粘贴快捷键（与截图路径完全一致）
+      await sendAiScreenshotImagePaste(ptyId, provider);
+    } catch {
+      // 降级：路径文本注入（至少让 AI CLI 能按路径加载图片）
+      sendAiTextPaste(ptyId, path.includes(' ') ? `"${path}"` : path);
+    }
+  }
 }
 
 // ── 剪贴板内容分类器 ────────────────────────────────────────────────────────────
@@ -616,16 +664,19 @@ async function detectClipboardPayload(preferImage = false): Promise<ClipboardPay
 
 /** 读取系统剪贴板并写入终端 PTY。
  *
- * AI pane（Claude / Codex / Gemini CLI）五条独立路径：
- *   plain-text           → sendAiTextPaste           — bracketed-paste，无延迟
- *   raw-image            → sendAiScreenshotImagePaste — 截图位图，Windows Alt+V
- *   explorer-image-files → sendAiExplorerFilesPaste   — Explorer 图片文件路径注入
- *   explorer-files       → sendAiExplorerFilesPaste   — Explorer 普通文件路径注入
- *   rich-object          → Ctrl+V                    — 无法识别的富对象，residual fallback
+ * AI pane（Claude / Codex / Gemini CLI）六条独立路径：
+ *   plain-text             → sendAiTextPaste                — bracketed-paste，无延迟
+ *   raw-image              → sendAiScreenshotImagePaste     — 截图位图，Windows Alt+V
+ *   explorer-image-files   → sendAiExplorerImageFilesPaste  — 文件→位图写入剪贴板→Alt+V
+ *   finder-image-files     → sendAiExplorerImageFilesPaste  — 同上（macOS）
+ *   explorer-files         → sendAiExplorerFilesPaste       — Explorer 普通文件路径注入
+ *   finder-files           → sendAiExplorerFilesPaste       — Finder 普通文件路径注入
+ *   rich-object            → Ctrl+V                        — 无法识别的富对象，residual fallback
  *
- *   raw-image（截图位图）≠ explorer-image-files（文件路径引用）：
- *     截图位图  → Alt+V 让 Claude/Codex 从剪贴板读取图片数据
- *     文件路径  → 路径文本注入，Claude Code 按路径加载图片/文件
+ *   三种"图片相关"类型严格区分（参见顶部注释）：
+ *     raw-image              = 截图工具图片位图 → Alt+V，AI CLI 直接读取剪贴板图片数据
+ *     explorer-image-files   = Rust 加载文件→写 CF_DIB/TIFF→Alt+V，AI CLI 读取为图片块
+ *     explorer-files         = 文件路径引用（非图片扩展名）→ 路径文本注入，文件引用
  *
  * 非 AI pane：
  *   plain-text  → 直接写文本
@@ -646,11 +697,17 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
       // 纯文本 → xterm 原生 paste 管道，触发 bracketed-paste 块识别，无延迟
       sendAiTextPaste(ptyId, clipboard.text);
     } else if (
-      (clipboard.kind === 'explorer-image-files' || clipboard.kind === 'explorer-files' ||
-       clipboard.kind === 'finder-image-files'   || clipboard.kind === 'finder-files') &&
+      (clipboard.kind === 'explorer-image-files' || clipboard.kind === 'finder-image-files') &&
       clipboard.paths
     ) {
-      // Explorer / Finder 文件路径：转为路径文本注入，Claude Code 自行判断图片/文件
+      // Explorer / Finder 图片文件：加载为剪贴板位图 → Alt+V，AI CLI 读取为图片块
+      // load_image_to_clipboard 将文件写入 CF_DIB/TIFF，再触发与截图相同的粘贴路径
+      await sendAiExplorerImageFilesPaste(ptyId, clipboard.paths, provider);
+    } else if (
+      (clipboard.kind === 'explorer-files' || clipboard.kind === 'finder-files') &&
+      clipboard.paths
+    ) {
+      // Explorer / Finder 普通文件路径：路径文本注入，Claude Code 展示文件引用
       // 注意：文件路径引用 ≠ 图片位图，不能走 Alt+V
       sendAiExplorerFilesPaste(ptyId, clipboard.paths);
     } else if (clipboard.kind === 'rich-object') {

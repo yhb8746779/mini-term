@@ -8,6 +8,63 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
+/// Layer 2（进程级兜底）：从近期 PTY 输出中识别 AI CLI 启动 banner，
+/// 用于在 Layer 1（命令 echo 解析）漏判时恢复会话状态。
+///
+/// 从最近行向前扫描（逐行匹配，最新 banner 优先）：
+/// 当用户从 Codex 切换到 Claude，两个 banner 都在窗口内时，
+/// 最近的一行（Claude）优先返回，不会被旧的 Codex banner 干扰。
+///
+/// 扫描全部行（无 take(N) 上限）：recent_output_window 在每次会话开始时清空，
+/// 不存在跨会话 banner 污染。Claude Code TUI 启动输出密集，有限 take 会
+/// 将 banner 推出扫描范围，导致 Layer 2 纠正失效（blue dot 永不恢复橙色）。
+///
+/// Codex 使用精确短语 ">_ openai codex"（含 ASCII art 前缀），
+/// 避免用户在 Claude 会话内讨论 Codex 时被误判。
+fn detect_provider_from_banner(raw_output: &str) -> Option<&'static str> {
+    let stripped = strip_ansi_codes(raw_output).replace('\r', "\n");
+    let lines: Vec<&str> = stripped.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return None;
+    }
+    // 从最近行向前扫描，返回第一个匹配（= 最新的 banner）。
+    // 注意：不使用 take(N) 限制。recent_output_window 在每次会话开始时被清空，
+    // 不存在跨会话的旧 banner 污染问题。Claude Code 的 TUI 启动输出非常密集，
+    // take(50) 会导致 banner 行被推出扫描范围，使 Layer 2 纠正失效。
+    for line in lines.iter().rev() {
+        let lower = line.to_lowercase();
+        // Claude Code 启动 banner（多版本兼容）：
+        //   旧版："✻ Welcome to Claude Code!" / "Welcome to Claude Code"
+        //   新版（v2.x+）："Claude Code v2.1.110" 等版本号行
+        //
+        // 注意：Claude Code TUI 使用光标定位序列（如 \x1b[1;8H）渲染单词间距，
+        // strip_ansi_codes 只删除 CSI G，其他定位序列（CSI H 等）被丢弃而不插入空格，
+        // 导致 "Claude Code v2.x" 变为 "ClaudeCode v2.x"（单词间空格丢失）。
+        // 因此需同时检查"有空格"和"无空格"两种形式。
+        if lower.contains("welcome to claude code") || lower.contains("claude code v") {
+            return Some("claude");
+        }
+        // 无空格形式（光标定位导致空格丢失）："ClaudeCode v2.x" → "claudecodev"
+        // 同时检查 OSC terminal-title 形式 "0;Claude Code v..." / "0;claude code"
+        {
+            let no_space: String = lower.split_whitespace().collect();
+            if no_space.contains("claudecodev") || no_space.contains("welcometoclaudecode") {
+                return Some("claude");
+            }
+        }
+        // Codex CLI (OpenAI) 启动 banner：">_ OpenAI Codex (v...)"
+        // 使用 ">_ openai codex" 精确匹配，避免 Claude 讨论 Codex 时误判
+        if lower.contains(">_ openai codex") {
+            return Some("codex");
+        }
+        // Gemini CLI (Google) 启动 banner
+        if lower.contains("welcome to gemini") {
+            return Some("gemini");
+        }
+    }
+    None
+}
+
 /// 从命令 token（已小写）中提取 AI provider 名称
 fn detect_provider_from_token(token: &str) -> Option<&'static str> {
     for &ai in AI_COMMANDS {
@@ -18,39 +75,73 @@ fn detect_provider_from_token(token: &str) -> Option<&'static str> {
     None
 }
 
-/// 从看起来像命令调用的单行中提取被调用的 AI provider 名称。
-/// 与 line_contains_ai_command 共用提示符识别逻辑，避免把 AI 回答里
-/// 提到的模型名（如 "Codex" 出现在输出文本中）误认为 provider。
-fn extract_provider_from_command_line(line: &str) -> Option<&'static str> {
+/// 从单行（已完成 ANSI 剥离和退格处理）中检测 AI 命令并返回 provider。
+///
+/// 与 line_contains_ai_command 使用完全相同的提示符解析逻辑（Part A）：
+/// - 终端提示符（> $ % #）：只检查其后首 token
+/// - Unicode 主题提示符（❯ ➜ › λ）：扫描其后所有 token（同 line_contains_ai_command）
+/// - 无提示符 fallback：只检查行首首 token
+///
+/// 消除了旧版 extract_provider_from_command_line 对 Unicode 提示符只检查首 token
+/// 导致的不对称问题——provider 检测能力现与会话检测能力完全对称。
+fn detect_ai_provider_from_line(line: &str) -> Option<&'static str> {
     let line = line.trim();
     if line.is_empty() { return None; }
 
     const TERMINAL_PROMPT_CHARS: &[char] = &['>', '$', '%', '#'];
     const UNICODE_PROMPT_CHARS: &[char] = &['❯', '➜', '›', 'λ'];
 
-    let cmd_start: &str = if let Some(pos) = line.rfind(TERMINAL_PROMPT_CHARS) {
+    // 终端提示符：出现在行尾附近，命令紧跟其后，只检查首 token
+    if let Some(pos) = line.rfind(TERMINAL_PROMPT_CHARS) {
         let ch = line[pos..].chars().next().unwrap();
-        line[pos + ch.len_utf8()..].trim()
-    } else if let Some(pos) = line.rfind(UNICODE_PROMPT_CHARS) {
-        let ch = line[pos..].chars().next().unwrap();
-        line[pos + ch.len_utf8()..].trim()
-    } else {
-        line
-    };
+        let cmd_part = line[pos + ch.len_utf8()..].trim();
+        let mut words = cmd_part.split_whitespace();
+        let first = words.next().unwrap_or("");
+        if let Some(provider) = detect_provider_from_token(&first.to_lowercase()) {
+            if !has_non_interactive_flag(words) {
+                return Some(provider);
+            }
+        }
+        return None;
+    }
 
-    let first_token = cmd_start.split_whitespace().next().unwrap_or("");
-    detect_provider_from_token(&first_token.to_lowercase())
+    // Unicode 主题提示符（❯ ➜ › λ）位于行首，命令在目录信息之后；
+    // 扫描其后所有 token，找到第一个 AI 命令 token（与 line_contains_ai_command 一致）
+    if let Some(pos) = line.rfind(UNICODE_PROMPT_CHARS) {
+        let ch = line[pos..].chars().next().unwrap();
+        let cmd_part = line[pos + ch.len_utf8()..].trim();
+        let tokens: Vec<&str> = cmd_part.split_whitespace().collect();
+        for (i, &tok) in tokens.iter().enumerate() {
+            if let Some(provider) = detect_provider_from_token(&tok.to_lowercase()) {
+                if !has_non_interactive_flag(tokens[i + 1..].iter().copied()) {
+                    return Some(provider);
+                }
+                return None;
+            }
+        }
+        return None;
+    }
+
+    // 无提示符 fallback：只检查行首第一个 token，防止中间词被误判
+    let mut words = line.split_whitespace();
+    let first = words.next().unwrap_or("");
+    if let Some(provider) = detect_provider_from_token(&first.to_lowercase()) {
+        if !has_non_interactive_flag(words) {
+            return Some(provider);
+        }
+    }
+    None
 }
 
 /// 从原始输出文本中提取最后一次调用的 AI provider 名称。
-/// 只识别看起来像命令调用的行（通过 extract_provider_from_command_line），
-/// 忽略 AI 回答正文里提到的模型名，防止 provider 被错误染色。
+/// 使用与 output_contains_ai_command 完全相同的解析逻辑（通过 detect_ai_provider_from_line），
+/// 确保 provider 检测能力与会话检测能力对称。
 fn detect_provider_from_output(output: &str) -> Option<&'static str> {
     let stripped = strip_ansi_codes(output).replace('\r', "\n");
     let mut last_found: Option<&'static str> = None;
     for line in stripped.lines() {
         let collapsed = apply_backspaces(line);
-        if let Some(provider) = extract_provider_from_command_line(&collapsed) {
+        if let Some(provider) = detect_ai_provider_from_line(&collapsed) {
             last_found = Some(provider);
         }
     }
@@ -161,88 +252,24 @@ fn apply_backspaces(line: &str) -> String {
     result
 }
 
-/// 判断一个 token 是否是 AI 命令（精确匹配或路径结尾匹配）
-fn is_ai_command_token(token: &str) -> bool {
-    let t = token.to_lowercase();
-    AI_COMMANDS.iter().any(|&ai| {
-        t == ai
-            || t.ends_with(&format!("/{ai}"))
-            || t.ends_with(&format!("\\{ai}"))
-    })
-}
-
 /// 判断参数迭代器中是否包含非交互式标志（-v/--version/-h/--help/-p/--print）
 fn has_non_interactive_flag<'a>(args: impl Iterator<Item = &'a str>) -> bool {
     args.into_iter().any(|w| NON_INTERACTIVE_FLAGS.iter().any(|&f| w == f))
 }
 
-/// 检查单行文本是否含有 AI 命令的 echo。
-///
-/// 三层识别策略：
-/// 1. **提示符 fast path**：
-///    - 终端提示符（`>` `$` `%` `#`）：出现在 prompt 末尾，命令紧随其后；
-///      用 rfind 找最后一个，仅检查其后首 token。
-///    - Unicode 主题提示符（`❯` `➜` `›` `λ`）：出现在行首，命令在目录信息之后；
-///      扫描其后所有 token，找到第一个 AI 命令 token。
-/// 2. **Token fallback**：无提示符时，对整行首 token 做检查。
-/// 3. **保守性约束**：fallback 时只匹配行首第一个 token，防止
-///    `npm install @anthropic-ai/claude-sdk` 等中间词被误判。
+/// 检查单行文本（已完成 ANSI 剥离和退格处理）是否含有 AI 命令的 echo。
+/// 委托给 detect_ai_provider_from_line，与 provider 提取逻辑完全一致（Part A）。
+#[allow(dead_code)]
 fn line_contains_ai_command(line: &str) -> bool {
-    let line = line.trim();
-    if line.is_empty() {
-        return false;
-    }
-
-    // 终端提示符：出现在行尾附近，命令紧跟其后，只检查首 token
-    const TERMINAL_PROMPT_CHARS: &[char] = &['>', '$', '%', '#'];
-    // Unicode 主题提示符：出现在行首，命令在目录名之后，需扫描所有 token
-    const UNICODE_PROMPT_CHARS: &[char] = &['❯', '➜', '›', 'λ'];
-
-    // 第一层：先找终端提示符（rfind，命中最靠近命令的那个）
-    if let Some(pos) = line.rfind(TERMINAL_PROMPT_CHARS) {
-        let ch = line[pos..].chars().next().unwrap();
-        let cmd_part = line[pos + ch.len_utf8()..].trim();
-        let mut words = cmd_part.split_whitespace();
-        let first = words.next().unwrap_or("");
-        if is_ai_command_token(first) {
-            return !has_non_interactive_flag(words);
-        }
-        // 终端提示符存在但其后首 token 不是 AI → 此行不匹配
-        return false;
-    }
-
-    // 第一层（续）：Unicode 主题提示符（❯ ➜ › λ）位于行首，命令在目录信息之后；
-    // 扫描提示符后所有 token，找到第一个 AI 命令 token。
-    if let Some(pos) = line.rfind(UNICODE_PROMPT_CHARS) {
-        let ch = line[pos..].chars().next().unwrap();
-        let cmd_part = line[pos + ch.len_utf8()..].trim();
-        let tokens: Vec<&str> = cmd_part.split_whitespace().collect();
-        for (i, &tok) in tokens.iter().enumerate() {
-            if is_ai_command_token(tok) {
-                return !has_non_interactive_flag(tokens[i + 1..].iter().copied());
-            }
-        }
-        return false;
-    }
-
-    // 第二层 + 第三层：整行 token fallback，只看行首第一个 token
-    let mut words = line.split_whitespace();
-    let first = words.next().unwrap_or("");
-    if is_ai_command_token(first) {
-        return !has_non_interactive_flag(words);
-    }
-
-    false
+    detect_ai_provider_from_line(line).is_some()
 }
 
 /// 检查 PTY 输出中是否包含 AI 命令被 echo（支持 PS/bash/zsh/fish/主题提示符）
-/// 同时过滤非交互式标志（-v/--version/-h/--help 等），避免误识别
+/// 同时过滤非交互式标志（-v/--version/-h/--help 等），避免误识别。
+/// 等价于 detect_provider_from_output(output).is_some()，确保两者检测能力对称。
+#[allow(dead_code)]
 fn output_contains_ai_command(output: &str) -> bool {
-    let stripped = strip_ansi_codes(output).replace('\r', "\n");
-    stripped.lines().any(|line| {
-        let collapsed = apply_backspaces(line);
-        line_contains_ai_command(&collapsed)
-    })
+    detect_provider_from_output(output).is_some()
 }
 
 #[derive(Clone)]
@@ -346,12 +373,93 @@ impl PtyManager {
             .map(|t| t.elapsed());
         let entered_recently = elapsed_opt.map_or(false, |e| e <= PREDICTION_ECHO_GRACE);
         if entered_recently {
-            let detected = output_contains_ai_command(output);
-            if detected {
-                self.ai_sessions.lock().unwrap().insert(pty_id);
-                if let Some(provider) = detect_provider_from_output(output) {
-                    self.ai_providers.lock().unwrap().insert(pty_id, provider.to_string());
-                }
+            // Part A+B: 直接用统一函数检测 provider；仅在同时能确定 provider 时才
+            // 进入 AI 状态，且在同一锁范围内原子写入 session + provider，
+            // 消除 monitor 在两次独立写入之间轮询导致的 provider=None 竞态。
+            if let Some(provider) = detect_provider_from_output(output) {
+                let mut sessions = self.ai_sessions.lock().unwrap();
+                let mut providers = self.ai_providers.lock().unwrap();
+                sessions.insert(pty_id);
+                providers.insert(pty_id, provider.to_string());
+            }
+        }
+    }
+
+    /// Part C：当 AI 会话已建立但 provider 仍未知时，从最新 PTY 输出中补填 provider。
+    /// 确保用户不需要退出再进入才能恢复 provider 颜色。
+    fn try_backfill_provider(&self, pty_id: u32, output: &str) {
+        if !self.is_ai_session(pty_id) {
+            return;
+        }
+        if self.get_ai_provider(pty_id).is_some() {
+            return; // 已有 provider，无需补填
+        }
+        if let Some(provider) = detect_provider_from_output(output) {
+            self.ai_providers.lock().unwrap().insert(pty_id, provider.to_string());
+        }
+    }
+
+    /// Part F：原子性读取 AI 会话状态和 provider，消除两次独立锁调用之间的竞态。
+    /// 同时持有两个锁，确保 monitor 读到的 (is_ai, provider) 是一致快照。
+    /// 锁获取顺序与 track_input 中一致（ai_sessions → ai_providers），不会死锁。
+    pub fn get_ai_session_info(&self, pty_id: u32) -> (bool, Option<String>) {
+        let sessions = self.ai_sessions.lock().unwrap();
+        let providers = self.ai_providers.lock().unwrap();
+        let is_ai = sessions.contains(&pty_id);
+        let provider = if is_ai { providers.get(&pty_id).cloned() } else { None };
+        (is_ai, provider)
+    }
+
+    /// Layer 2（进程级兜底）：扫描 recent_output_window 中的 AI CLI 启动 banner。
+    /// 由 process_monitor 每 500ms 调用一次。
+    ///
+    /// 三重情形：
+    /// 1. PTY 尚未进入 AI 会话，但近期输出含 banner → 建立会话 + 设置 provider
+    /// 2. PTY 已在 AI 会话中，provider 已知但与 banner 不符 → banner 纠正误判（高置信度）
+    /// 3. PTY 已在 AI 会话中，但 provider 仍为 None → 先尝试 banner，再回退到
+    ///    detect_provider_from_output 扫描 recent_output_window 中的 shell echo 行
+    ///    （PSReadLine 路径设置 enter_ai=true 但 provider 仍 None 的恢复路径）
+    ///
+    /// 安全约束：
+    /// - banner 纠正（情形 2）仅依赖高精度 banner 短语，避免 AI 会话内容误触发 provider 切换
+    /// - provider 补填（情形 3）同时使用 banner 和 output 检测，覆盖更多场景
+    pub fn try_reconcile_ai_from_banner(&self, pty_id: u32) {
+        let window = self.get_recent_output_window(pty_id);
+        if window.is_empty() {
+            return;
+        }
+
+        // banner 检测（高精度，用于会话建立和 provider 纠正）
+        let banner_detected = detect_provider_from_banner(&window);
+
+        // 原子读取当前状态（锁顺序：ai_sessions → ai_providers）
+        let (is_ai, current_provider) = {
+            let sessions = self.ai_sessions.lock().unwrap();
+            let providers = self.ai_providers.lock().unwrap();
+            let is_ai = sessions.contains(&pty_id);
+            let p = if is_ai { providers.get(&pty_id).cloned() } else { None };
+            (is_ai, p)
+        };
+
+        if !is_ai {
+            // 情形 1：尚未进入 AI 会话 → banner 触发会话建立（仅限高精度 banner）
+            if let Some(detected) = banner_detected {
+                let mut sessions = self.ai_sessions.lock().unwrap();
+                let mut providers = self.ai_providers.lock().unwrap();
+                sessions.insert(pty_id);
+                providers.insert(pty_id, detected.to_string());
+            }
+        } else if let Some(detected) = banner_detected {
+            // 情形 2：已在 AI 会话中，banner 纠正错误 provider（高精度）
+            if current_provider.as_deref() != Some(detected) {
+                self.ai_providers.lock().unwrap().insert(pty_id, detected.to_string());
+            }
+        } else if current_provider.is_none() {
+            // 情形 3：AI 会话已建立但 provider 仍缺失（banner 未命中）
+            // 回退到 detect_provider_from_output 扫描近期输出中的 shell echo 行。
+            // 仅在 provider=None 时回填，避免用 output 检测覆盖已知 provider（防误判）。
+            if let Some(detected) = detect_provider_from_output(&window) {
+                self.ai_providers.lock().unwrap().insert(pty_id, detected.to_string());
             }
         }
     }
@@ -367,6 +475,8 @@ impl PtyManager {
         let mut exit_ai = false;
         let mut entered = false;
         let mut detected_provider: Option<&'static str> = None;
+        // Enter 时 buf 的内容（需在锁外使用，所以提升到外层作用域）
+        let mut last_cmd = String::new();
         {
             let mut buffers = self.input_buffers.lock().unwrap();
             let buf = buffers.entry(pty_id).or_default();
@@ -414,6 +524,7 @@ impl PtyManager {
                         entered = true;
                         self.last_enter.lock().unwrap().insert(pty_id, Instant::now());
                         let cmd = buf.trim().to_lowercase();
+                        last_cmd = cmd.clone(); // 保存到外层，供 output_since_enter 补偿路径使用
                         if in_ai {
                             // AI 会话中：识别显式退出命令
                             if AI_EXIT_COMMANDS.iter().any(|&c| cmd == c) {
@@ -446,18 +557,23 @@ impl PtyManager {
             }
         }
 
-        // PSReadLine inline prediction 补偿：当用户按右箭头接受预测文本后再 Enter 时，
-        // input_buffers 中的 buf 因 ESC 序列清空而为空，直接输入检测无法命中。
-        // 此时扫描 output_since_enter（PTY 在 Enter 前渲染到屏幕的内容）来识别 AI 命令。
-        if entered && !in_ai && !enter_ai {
+        // PSReadLine inline prediction 补偿：当用户按右箭头接受预测文本或上箭头召回历史后
+        // 再 Enter 时，input_buffers 中的 buf 因 ESC 序列清空而为空，直接输入检测无法命中。
+        // 此时扫描 output_since_enter（PTY 在 Enter 前渲染到屏幕的内容）来判断是否是 AI 命令。
+        //
+        // 关键约束：
+        // 1. 仅在 last_cmd.is_empty() 时才走此路径（即 buf 在 Enter 时确实为空）。
+        // 2. detect_provider_from_output 返回 last_found（最后一次匹配），即 output_since_enter
+        //    中最近一次渲染的命令。PSReadLine 在每次上下箭头切换时均会用 CSI G 覆写当前行，
+        //    strip_ansi_codes 将 CSI G 转为 \r，.replace('\r', '\n') 把它断成独立行，
+        //    使"最后渲染的命令"（用户实际执行的）成为 last_found，而非早期的 ghost text。
+        //    因此直接用 detect_provider_from_output 的返回值即可得到正确的 provider。
+        if entered && !in_ai && !enter_ai && last_cmd.is_empty() {
             let ose = self.output_since_enter.lock().unwrap();
             if let Some(ose_data) = ose.get(&pty_id) {
-                let detected = output_contains_ai_command(ose_data);
-                if detected {
+                if let Some(provider) = detect_provider_from_output(ose_data) {
                     enter_ai = true;
-                    if detected_provider.is_none() {
-                        detected_provider = detect_provider_from_output(ose_data);
-                    }
+                    detected_provider = Some(provider);
                 }
             }
         }
@@ -472,16 +588,40 @@ impl PtyManager {
         }
 
         if enter_ai || exit_ai {
-            let mut sessions = self.ai_sessions.lock().unwrap();
-            let mut providers = self.ai_providers.lock().unwrap();
-            if enter_ai {
-                sessions.insert(pty_id);
-                if let Some(p) = detected_provider {
-                    providers.insert(pty_id, p.to_string());
+            {
+                let mut sessions = self.ai_sessions.lock().unwrap();
+                let mut providers = self.ai_providers.lock().unwrap();
+                if enter_ai {
+                    sessions.insert(pty_id);
+                    if let Some(p) = detected_provider {
+                        providers.insert(pty_id, p.to_string());
+                    }
+                } else {
+                    sessions.remove(&pty_id);
+                    providers.remove(&pty_id);
                 }
-            } else {
-                sessions.remove(&pty_id);
-                providers.remove(&pty_id);
+            } // sessions + providers 在此释放，避免下方加锁时死锁
+
+            if enter_ai {
+                // 新 AI 会话开始时清空输出窗口，防止旧 banner 在 Layer 2 banner 兜底中产生误判。
+                // 例：上一次运行了 Claude → window 含 Claude banner；本次用右箭头启动 Codex →
+                // Layer 1 可能因 ghost text 把 provider 误判为 "claude"。
+                // 清空 window 后，Layer 2 只能看到本次 Codex 的新输出，
+                // 一旦 Codex 打印其启动 banner，Layer 2 即可纠正 provider 为 "codex"。
+                self.recent_output_window.lock().unwrap().insert(pty_id, String::new());
+            }
+            if exit_ai {
+                // 退出 AI 会话时清空输出窗口，防止残留的 AI 启动 banner
+                // 在下一次 banner 兜底检测中误判为新会话开始。
+                //
+                // 对于 Enter 触发的退出（/exit /quit exit quit 等），
+                // 下方的 `if entered` 块也会清空这些窗口。
+                // 对于 Ctrl+D 和双 Ctrl+C 退出，`entered = false`，
+                // 必须在这里显式清空。
+                self.recent_output_window.lock().unwrap().insert(pty_id, String::new());
+                if !entered {
+                    self.output_since_enter.lock().unwrap().insert(pty_id, String::new());
+                }
             }
         }
     }
@@ -491,6 +631,12 @@ impl PtyManager {
     fn inject_pty_output(&self, pty_id: u32, data: &str) {
         let output = self.append_output_since_enter(pty_id, data);
         self.try_enter_ai_from_recent_output(pty_id, &output);
+    }
+
+    /// 仅供单元测试使用：向 recent_output_window 注入模拟 PTY 输出（模拟 banner 到来）
+    #[cfg(test)]
+    fn inject_banner_output(&self, pty_id: u32, data: &str) {
+        self.append_recent_output_window(pty_id, data);
     }
 }
 
@@ -666,6 +812,9 @@ pub fn create_pty(
                         .append_output_since_enter(pty_id_for_reader, &data);
                     pty_state_for_output
                         .try_enter_ai_from_recent_output(pty_id_for_reader, &recent_output);
+                    // Part C: 若 session 已建立但 provider 仍缺失，尝试从新输出中补全
+                    pty_state_for_output
+                        .try_backfill_provider(pty_id_for_reader, &data);
 
                     // 更新近期输出滚动窗口，供 process_monitor 做 awaiting-input 检测
                     pty_state_for_output
@@ -1270,5 +1419,116 @@ mod tests {
         assert_eq!(apply_backspaces("claude"), "claude");
         // BS 不能弹出已删完的栈
         assert_eq!(apply_backspaces("\x08\x08abc"), "abc");
+    }
+
+    // ── Layer 2：banner 兜底检测 ───────────────────────────────────────────
+
+    #[test]
+    fn banner_reconcile_detects_claude_session() {
+        // 模拟：用户上箭头历史召回 + Enter，Layer 1 命令 echo 漏判，
+        // 但 Claude Code 启动 banner 出现在 recent_output_window 中。
+        let mgr = PtyManager::new();
+        mgr.inject_banner_output(
+            1,
+            "╭──────────────────────────────╮\n│ \u{273b} Welcome to Claude Code! │\n╰──────────────────────────────╯\n",
+        );
+        // 模拟 process_monitor 调用 reconcile
+        mgr.try_reconcile_ai_from_banner(1);
+        assert!(mgr.is_ai_session(1), "banner 检测应恢复 AI 会话");
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn banner_reconcile_detects_codex_session() {
+        let mgr = PtyManager::new();
+        mgr.inject_banner_output(1, ">_ OpenAI Codex (v0.122.0)\n");
+        mgr.try_reconcile_ai_from_banner(1);
+        assert!(mgr.is_ai_session(1));
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn banner_reconcile_detects_gemini_session() {
+        let mgr = PtyManager::new();
+        mgr.inject_banner_output(1, "Welcome to Gemini CLI\n");
+        mgr.try_reconcile_ai_from_banner(1);
+        assert!(mgr.is_ai_session(1));
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("gemini"));
+    }
+
+    #[test]
+    fn banner_reconcile_no_false_positive_after_exit_command() {
+        // 用户通过 /exit 退出后，残留 banner 不应误触发重进 AI 会话
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "claude\r");
+        assert!(mgr.is_ai_session(1));
+        // 注入 banner（模拟 claude 启动输出）
+        mgr.inject_banner_output(1, "Welcome to Claude Code!\n");
+        // 通过 /exit 退出（Enter 触发，会清空 recent_output_window）
+        mgr.track_input(1, "/exit\r");
+        assert!(!mgr.is_ai_session(1));
+        // banner 已被清空，reconcile 不应误判
+        mgr.try_reconcile_ai_from_banner(1);
+        assert!(!mgr.is_ai_session(1), "退出后残留 banner 不应重新触发 AI 会话");
+    }
+
+    #[test]
+    fn banner_reconcile_no_false_positive_after_ctrl_d() {
+        // Ctrl+D 退出也应清空窗口
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "claude\r");
+        mgr.inject_banner_output(1, "Welcome to Claude Code!\n");
+        mgr.track_input(1, "\x04"); // Ctrl+D
+        assert!(!mgr.is_ai_session(1));
+        mgr.try_reconcile_ai_from_banner(1);
+        assert!(!mgr.is_ai_session(1), "Ctrl+D 退出后 banner 不应重新触发");
+    }
+
+    #[test]
+    fn banner_reconcile_no_false_positive_after_double_ctrl_c() {
+        // 双 Ctrl+C 退出也应清空窗口
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "claude\r");
+        mgr.inject_banner_output(1, "Welcome to Claude Code!\n");
+        mgr.track_input(1, "\x03");
+        mgr.track_input(1, "\x03"); // 双 Ctrl+C
+        assert!(!mgr.is_ai_session(1));
+        mgr.try_reconcile_ai_from_banner(1);
+        assert!(!mgr.is_ai_session(1), "双 Ctrl+C 退出后 banner 不应重新触发");
+    }
+
+    #[test]
+    fn banner_reconcile_no_op_when_provider_already_correct() {
+        // 已在 AI 会话中且 provider 正确时，reconcile 应为 no-op
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "codex\r");
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("codex"));
+        // 注入真实的 Codex 启动 banner（AI 启动后实际会输出的内容）
+        mgr.inject_banner_output(1, ">_ OpenAI Codex (v0.122.0)\n");
+        mgr.try_reconcile_ai_from_banner(1);
+        // provider 应保持不变
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("codex"),
+            "provider 已正确时 reconcile 应为 no-op");
+    }
+
+    #[test]
+    fn banner_reconcile_corrects_wrong_provider_via_startup_banner() {
+        // Layer 1 因 PSReadLine ghost text 误判 provider 为 "claude"，
+        // Layer 2 应在看到真实 Codex banner 后纠正为 "codex"。
+        let mgr = PtyManager::new();
+        // 模拟：Layer 1 错误地将 provider 设为 "claude"（ghost text 误判）
+        {
+            let mut sessions = mgr.ai_sessions.lock().unwrap();
+            let mut providers = mgr.ai_providers.lock().unwrap();
+            sessions.insert(1);
+            providers.insert(1, "claude".to_string());
+        }
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("claude"));
+        // 模拟：Codex 启动后将真实 banner 输出到 recent_output_window
+        mgr.inject_banner_output(1, ">_ OpenAI Codex (v0.122.0)\n");
+        // Layer 2 应纠正 provider
+        mgr.try_reconcile_ai_from_banner(1);
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("codex"),
+            "Layer 2 应通过 banner 纠正 Layer 1 的错误 provider");
     }
 }

@@ -42,7 +42,7 @@ const AWAITING_STRONG: &[&str] = &[
     "choose an option",
     "select an option",
     "pick one",
-    "use arrow keys",
+    // "use arrow keys" 已移除：TUI 导航菜单中频繁出现，会导致 awaiting-input 误判
     "space to preview",
     "esc to cancel",
     "ctrl+a to",
@@ -124,8 +124,24 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
             let pty_ids = pty_manager.get_pty_ids();
 
             for pty_id in &pty_ids {
-                let (status, provider) = if pty_manager.is_ai_session(*pty_id) {
-                    let prov = pty_manager.get_ai_provider(*pty_id);
+                // ── Layer 2：进程级 banner 兜底检测 ──────────────────────────
+                //
+                // AI 会话检测采用双层架构：
+                //   Layer 1（fast path）：pty.rs 中的命令 echo / output_since_enter 解析。
+                //     优点：快（毫秒级），能在 AI 响应前就更新状态。
+                //     弱点：依赖 shell echo 可被解析，上箭头/右箭头历史/自动补全
+                //           场景下 echo 格式可能无法命中任何已知模式。
+                //
+                //   Layer 2（durable fallback）：此处扫描 recent_output_window
+                //     中的 AI CLI 启动 banner（"Welcome to Claude Code" 等）。
+                //     优点：不依赖命令 echo，AI CLI 只要成功启动并输出 banner 就能被捕获。
+                //     代价：最多滞后 500ms（monitor 轮询间隔）。
+                //
+                // 两层缺一不可：Layer 1 保证快响应，Layer 2 保证最终一致性。
+                pty_manager.try_reconcile_ai_from_banner(*pty_id);
+
+                let (is_ai, prov) = pty_manager.get_ai_session_info(*pty_id);
+                let (status, provider) = if is_ai {
                     let raw_window = pty_manager.get_recent_output_window(*pty_id);
 
                     let status = if detect_awaiting_input(&raw_window) {
