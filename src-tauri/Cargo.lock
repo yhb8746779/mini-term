@@ -4738,6 +4738,7 @@ dependencies = [
 name = "tauri-app"
 version = "0.2.29"
 dependencies = [
+ "base64 0.22.1",
  "dirs",
  "git2",
  "ignore",

@@ -191,7 +191,7 @@ export async function restoreLayout(
   const activeTabId = tabs[savedLayout.activeTabIndex]?.id ?? tabs[0]?.id ?? '';
   useAppStore.setState((state) => {
     const newStates = new Map(state.projectStates);
-    newStates.set(projectId, { id: projectId, tabs, activeTabId });
+    newStates.set(projectId, { id: projectId, tabs, activeTabId, layoutHydrated: true });
     return { projectStates: newStates };
   });
 }
@@ -265,7 +265,7 @@ const saveLayoutTimers = new Map<string, ReturnType<typeof setTimeout>>();
 function applyLayoutToStore(projectId: string) {
   const { config, projectStates } = useAppStore.getState();
   const ps = projectStates.get(projectId);
-  if (!ps) return;
+  if (!ps || !ps.layoutHydrated) return;
   const savedLayout = serializeLayout(ps);
   const newConfig = {
     ...config,
@@ -357,6 +357,7 @@ export const useAppStore = create<AppStore>((set) => ({
     terminalFontSize: 14,
     theme: 'auto',
     terminalFollowTheme: true,
+    terminalDisableWebgl: false,
     aiCompletionPopup: true,
     aiCompletionTaskbarFlash: true,
   },
@@ -386,7 +387,7 @@ export const useAppStore = create<AppStore>((set) => ({
         projectTree: newTree,
       };
       const newStates = new Map(state.projectStates);
-      newStates.set(project.id, { id: project.id, tabs: [], activeTabId: '' });
+      newStates.set(project.id, { id: project.id, tabs: [], activeTabId: '', layoutHydrated: false });
       return {
         config: newConfig,
         projectStates: newStates,
@@ -440,6 +441,7 @@ export const useAppStore = create<AppStore>((set) => ({
         ...ps,
         tabs: [...ps.tabs, tab],
         activeTabId: tab.id,
+        layoutHydrated: true,
       });
       return { projectStates: newStates };
     }),
@@ -452,7 +454,7 @@ export const useAppStore = create<AppStore>((set) => ({
       const newTabs = ps.tabs.filter((t) => t.id !== tabId);
       const newActive =
         ps.activeTabId === tabId ? (newTabs[newTabs.length - 1]?.id ?? '') : ps.activeTabId;
-      newStates.set(projectId, { ...ps, tabs: newTabs, activeTabId: newActive });
+      newStates.set(projectId, { ...ps, tabs: newTabs, activeTabId: newActive, layoutHydrated: true });
       return { projectStates: newStates };
     }),
 
@@ -475,6 +477,7 @@ export const useAppStore = create<AppStore>((set) => ({
         tabs: ps.tabs.map((t) =>
           t.id === tabId ? { ...t, splitLayout: layout, status: getHighestStatus(layout) } : t
         ),
+        layoutHydrated: true,
       });
       return { projectStates: newStates };
     }),

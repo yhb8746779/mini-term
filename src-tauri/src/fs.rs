@@ -45,6 +45,7 @@ fn should_ignore(name: &str, full_path: &Path, is_dir: bool, gitignore: &Option<
 #[tauri::command]
 pub fn list_directory(app: AppHandle, project_root: String, path: String) -> Result<Vec<FileEntry>, String> {
     let t0 = Instant::now();
+    crate::path_access::ensure_path_access(&app, &project_root)?;
     let dir = Path::new(&path);
     if !dir.is_dir() {
         return Err(format!("Not a directory: {}", path));
@@ -111,6 +112,7 @@ pub fn watch_directory(
     path: String,
     project_path: String,
 ) -> Result<(), String> {
+    crate::path_access::ensure_path_access(&app, &project_path)?;
     let watch_path = PathBuf::from(&path);
     let project_path_clone = project_path.clone();
     let app_clone = app.clone();
@@ -156,7 +158,8 @@ pub struct FileContentResult {
 const MAX_FILE_VIEW_SIZE: u64 = 1_048_576; // 1MB
 
 #[tauri::command]
-pub fn read_file_content(path: String) -> Result<FileContentResult, String> {
+pub fn read_file_content(app: AppHandle, path: String) -> Result<FileContentResult, String> {
+    crate::path_access::ensure_path_access(&app, &path)?;
     let p = Path::new(&path);
     if !p.is_file() {
         return Err(format!("不是文件: {}", path));
@@ -173,7 +176,8 @@ pub fn read_file_content(path: String) -> Result<FileContentResult, String> {
 }
 
 #[tauri::command]
-pub fn create_file(path: String) -> Result<(), String> {
+pub fn create_file(app: AppHandle, path: String) -> Result<(), String> {
+    crate::path_access::ensure_path_access(&app, &path)?;
     let p = Path::new(&path);
     if p.exists() {
         return Err(format!("已存在: {}", path));
@@ -182,7 +186,8 @@ pub fn create_file(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn create_directory(path: String) -> Result<(), String> {
+pub fn create_directory(app: AppHandle, path: String) -> Result<(), String> {
+    crate::path_access::ensure_path_access(&app, &path)?;
     let p = Path::new(&path);
     if p.exists() {
         return Err(format!("已存在: {}", path));
@@ -198,7 +203,8 @@ pub fn unwatch_directory(state: tauri::State<'_, FsWatcherManager>, path: String
 }
 
 #[tauri::command]
-pub fn rename_entry(old_path: String, new_name: String) -> Result<String, String> {
+pub fn rename_entry(app: AppHandle, old_path: String, new_name: String) -> Result<String, String> {
+    crate::path_access::ensure_path_access(&app, &old_path)?;
     let p = Path::new(&old_path);
     if !p.exists() {
         return Err(format!("路径不存在: {}", old_path));

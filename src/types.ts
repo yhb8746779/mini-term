@@ -23,6 +23,7 @@ export interface AppConfig {
   middleColumnSizes?: number[];
   theme: 'auto' | 'light' | 'dark';
   terminalFollowTheme: boolean;
+  terminalDisableWebgl?: boolean;
   aiCompletionPopup: boolean;
   aiCompletionTaskbarFlash: boolean;
   vscodePath?: string;
@@ -32,6 +33,7 @@ export interface ProjectConfig {
   id: string;
   name: string;
   path: string;
+  macosBookmark?: string;
   savedLayout?: SavedProjectLayout;
   expandedDirs?: string[];
   lastConversationAt?: number;
@@ -73,6 +75,7 @@ export interface ProjectState {
   id: string;
   tabs: TerminalTab[];
   activeTabId: string;
+  layoutHydrated?: boolean;
   needsAttention?: boolean;
 }
 

@@ -53,6 +53,8 @@ pub struct AppConfig {
     pub theme: String,
     #[serde(default = "default_terminal_follow_theme")]
     pub terminal_follow_theme: bool,
+    #[serde(default)]
+    pub terminal_disable_webgl: bool,
     #[serde(default = "default_ai_completion_popup")]
     pub ai_completion_popup: bool,
     #[serde(default = "default_ai_completion_taskbar_flash")]
@@ -106,6 +108,8 @@ pub struct ProjectConfig {
     pub id: String,
     pub name: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_bookmark: Option<String>,
     #[serde(default)]
     pub saved_layout: Option<SavedProjectLayout>,
     #[serde(default)]
@@ -156,6 +160,7 @@ impl Default for AppConfig {
             middle_column_sizes: None,
             theme: default_theme(),
             terminal_follow_theme: default_terminal_follow_theme(),
+            terminal_disable_webgl: false,
             ai_completion_popup: default_ai_completion_popup(),
             ai_completion_taskbar_flash: default_ai_completion_taskbar_flash(),
             vscode_path: None,
@@ -250,7 +255,7 @@ fn default_shells() -> Vec<ShellConfig> {
     }]
 }
 
-fn config_path(app: &AppHandle) -> PathBuf {
+pub(crate) fn config_path(app: &AppHandle) -> PathBuf {
     let dir = app
         .path()
         .app_data_dir()
@@ -330,22 +335,84 @@ pub fn read_config(app: &AppHandle) -> AppConfig {
     }
 }
 
+pub(crate) fn write_config(app: &AppHandle, config: &AppConfig) -> Result<(), String> {
+    let path = config_path(app);
+    let json = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn load_config(app: AppHandle) -> AppConfig {
-    read_config(&app)
+    let config = read_config(&app);
+    crate::path_access::sync_project_accesses(&app, &config.projects);
+    config
 }
 
 #[tauri::command]
 pub fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
     let t0 = std::time::Instant::now();
     let projects_count = config.projects.len();
-    let path = config_path(&app);
-    let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    fs::write(&path, json).map_err(|e| e.to_string())?;
+    write_config(&app, &config)?;
+    crate::path_access::sync_project_accesses(&app, &config.projects);
     crate::perf_log::log_perf(&app, "save_config", &format!(
         "projects_count={} | cost_ms={}", projects_count, t0.elapsed().as_millis()
     ));
     Ok(())
+}
+
+pub fn persist_project_bookmark(
+    app: &AppHandle,
+    project_path: &str,
+    bookmark: String,
+) -> Result<(), String> {
+    let mut config = read_config(app);
+    let mut changed = false;
+    let target = normalize_project_path(project_path);
+
+    for project in config.projects.iter_mut() {
+        if normalize_project_path(&project.path) == target {
+            if project.macos_bookmark.as_deref() != Some(bookmark.as_str()) {
+                project.macos_bookmark = Some(bookmark.clone());
+                changed = true;
+            }
+            break;
+        }
+    }
+
+    if !changed {
+        return Ok(());
+    }
+
+    write_config(app, &config)?;
+    crate::path_access::sync_project_accesses(app, &config.projects);
+    Ok(())
+}
+
+fn normalize_project_path(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+
+    #[cfg(windows)]
+    {
+        let trimmed = path.trim_end_matches(['/', '\\']);
+        if trimmed.len() == 2 && trimmed.ends_with(':') {
+            format!("{trimmed}\\")
+        } else if trimmed.is_empty() {
+            path.to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if path == "/" {
+            "/".to_string()
+        } else {
+            path.trim_end_matches('/').to_string()
+        }
+    }
 }
 
 #[cfg(test)]

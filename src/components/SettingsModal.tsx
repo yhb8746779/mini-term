@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
-import { openUrl } from '@tauri-apps/plugin-opener';
+import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
 import { checkForUpdate, compareVersions, type ReleaseInfo } from '../utils/updateChecker';
@@ -14,7 +14,7 @@ interface Props {
   onClose: () => void;
 }
 
-type SettingsPage = 'terminal' | 'system' | 'shortcuts' | 'about';
+type SettingsPage = 'terminal' | 'system' | 'shortcuts' | 'diagnostics' | 'about';
 
 // ─── ShellRow（终端设置子组件）───
 
@@ -674,12 +674,153 @@ function ShortcutsSettings() {
   );
 }
 
+// ─── DiagnosticsSettings（诊断页）───
+
+function DiagnosticsSettings() {
+  const config = useAppStore((s) => s.config);
+  const setConfig = useAppStore((s) => s.setConfig);
+  const [status, setStatus] = useState('');
+  const [logPath, setLogPath] = useState('');
+
+  const loadLogPath = useCallback(async () => {
+    try {
+      const path = await invoke<string>('get_perf_log_path');
+      setLogPath(path);
+      return path;
+    } catch {
+      return '';
+    }
+  }, []);
+
+  useEffect(() => {
+    loadLogPath();
+  }, [loadLogPath]);
+
+  const handleCopyLog = useCallback(async () => {
+    try {
+      const content = await invoke<string>('read_perf_log');
+      await navigator.clipboard.writeText(content || '(empty perf.log)');
+      setStatus('已复制诊断日志到剪贴板');
+    } catch (err) {
+      setStatus(`复制失败：${String(err)}`);
+    }
+  }, []);
+
+  const handleClearLog = useCallback(async () => {
+    try {
+      await invoke('clear_perf_log');
+      setStatus('已清空诊断日志');
+    } catch (err) {
+      setStatus(`清空失败：${String(err)}`);
+    }
+  }, []);
+
+  const handleRevealLog = useCallback(async () => {
+    const path = logPath || await loadLogPath();
+    if (!path) return;
+    try {
+      await revealItemInDir(path);
+      setStatus('已在 Finder 中定位诊断日志');
+    } catch (err) {
+      setStatus(`打开失败：${String(err)}`);
+    }
+  }, [loadLogPath, logPath]);
+
+  const handleTerminalDisableWebglChange = useCallback((disabled: boolean) => {
+    const newConfig = { ...useAppStore.getState().config, terminalDisableWebgl: disabled };
+    setConfig(newConfig);
+    invoke('save_config', { config: newConfig });
+    setStatus(disabled
+      ? '已禁用 WebGL；新建终端标签页后会使用 Canvas 渲染'
+      : '已启用 WebGL；新建终端标签页后生效');
+  }, [setConfig]);
+
+  const handleSnapshot = useCallback(() => {
+    window.dispatchEvent(new CustomEvent('mini-term-terminal-snapshot', { detail: { reason: 'manual-diagnostics' } }));
+    setStatus('已记录当前终端渲染快照，请复制日志发给我');
+  }, []);
+
+  return (
+    <div className="space-y-6">
+      <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
+        诊断日志
+      </div>
+
+      <div className="px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] space-y-3">
+        <div>
+          <div className="text-base text-[var(--text-primary)]">终端渲染诊断</div>
+          <div className="text-sm text-[var(--text-muted)]">
+            正式版会记录低频摘要：PTY 输出批次、UTF-8 边界、xterm 写入、WebGL/Canvas、字体、fit 尺寸等；不会记录终端正文内容。
+          </div>
+        </div>
+
+        <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-elevated)] border border-[var(--border-subtle)]">
+          <div>
+            <div className="text-base text-[var(--text-primary)]">禁用 WebGL 终端渲染</div>
+            <div className="text-sm text-[var(--text-muted)]">
+              复制正常但屏幕乱码时优先打开；对新建终端标签页生效，用 Canvas 避开 GPU 字形纹理问题。
+            </div>
+          </div>
+          <button
+            className={`relative w-9 h-5 rounded-full transition-colors ${
+              config.terminalDisableWebgl ? 'bg-[var(--accent)]' : 'bg-[var(--border-strong)]'
+            }`}
+            onClick={() => handleTerminalDisableWebglChange(!config.terminalDisableWebgl)}
+          >
+            <span
+              className={`absolute top-0.5 left-0 w-4 h-4 rounded-full bg-white transition-transform ${
+                config.terminalDisableWebgl ? 'translate-x-[18px]' : 'translate-x-0.5'
+              }`}
+            />
+          </button>
+        </div>
+
+        <div className="text-xs font-mono text-[var(--text-muted)] break-all">
+          {logPath || '正在读取日志路径…'}
+        </div>
+
+        <div className="flex gap-2">
+          <button
+            className="px-3 py-1 text-base bg-[var(--bg-elevated)] text-[var(--text-secondary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all"
+            onClick={handleSnapshot}
+          >
+            记录当前快照
+          </button>
+          <button
+            className="px-3 py-1 text-base bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90 transition-opacity"
+            onClick={handleCopyLog}
+          >
+            复制日志
+          </button>
+          <button
+            className="px-3 py-1 text-base bg-[var(--bg-elevated)] text-[var(--text-secondary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all"
+            onClick={handleRevealLog}
+          >
+            在 Finder 中显示
+          </button>
+          <button
+            className="px-3 py-1 text-base bg-[var(--bg-elevated)] text-[var(--text-secondary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] hover:border-[var(--color-error)] hover:text-[var(--color-error)] transition-all"
+            onClick={handleClearLog}
+          >
+            清空日志
+          </button>
+        </div>
+
+        {status && (
+          <div className="text-sm text-[var(--text-muted)]">{status}</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── SettingsModal（主弹窗）───
 
 const MENU_ITEMS: { key: SettingsPage; label: string }[] = [
   { key: 'terminal', label: '终端设置' },
   { key: 'system', label: '系统设置' },
   { key: 'shortcuts', label: '快捷键' },
+  { key: 'diagnostics', label: '诊断日志' },
   { key: 'about', label: '关于' },
 ];
 
@@ -737,6 +878,7 @@ export function SettingsModal({ open, onClose }: Props) {
             {activePage === 'terminal' && <TerminalSettings />}
             {activePage === 'system' && <SystemSettings />}
             {activePage === 'shortcuts' && <ShortcutsSettings />}
+            {activePage === 'diagnostics' && <DiagnosticsSettings />}
             {activePage === 'about' && <AboutSettings />}
           </div>
         </div>

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
-fn perf_log_path(app: &AppHandle) -> PathBuf {
+pub fn perf_log_path(app: &AppHandle) -> PathBuf {
     let dir = app.path().app_data_dir().expect("app data dir");
     std::fs::create_dir_all(&dir).ok();
     dir.join("perf.log")
@@ -75,6 +75,11 @@ pub fn read_perf_log(app: AppHandle) -> Result<String, String> {
         return Ok(String::new());
     }
     std::fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_perf_log_path(app: AppHandle) -> Result<String, String> {
+    Ok(perf_log_path(&app).to_string_lossy().into_owned())
 }
 
 /// 前端打点入口（switch_start / switch_paint_done 等客户端事件）

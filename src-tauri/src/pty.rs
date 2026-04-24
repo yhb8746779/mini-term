@@ -700,6 +700,7 @@ pub fn create_pty(
     args: Vec<String>,
     cwd: String,
 ) -> Result<u32, String> {
+    crate::path_access::ensure_path_access(&app, &cwd)?;
     let pty_system = native_pty_system();
     let pair = pty_system
         // 先以较宽的初始尺寸启动 shell，避免 UI 首屏布局未稳定时 banner/prompt 被硬换行。
@@ -786,13 +787,25 @@ pub fn create_pty(
     let pty_state_for_output = state.inner().clone();
     thread::spawn(move || {
         let mut pending = Vec::new();
+        let mut diag_reads: u64 = 0;
+        let mut diag_bytes: u64 = 0;
+        let mut diag_flushes: u64 = 0;
+        let mut diag_lossy_flushes: u64 = 0;
+        let mut diag_max_pending: usize = 0;
+        let mut diag_last = Instant::now();
 
         loop {
             match rx.recv_timeout(Duration::from_millis(16)) {
                 Ok(data) => {
+                    diag_reads += 1;
+                    diag_bytes += data.len() as u64;
                     pending.extend(data);
+                    diag_max_pending = diag_max_pending.max(pending.len());
                     while let Ok(more) = rx.try_recv() {
+                        diag_reads += 1;
+                        diag_bytes += more.len() as u64;
                         pending.extend(more);
+                        diag_max_pending = diag_max_pending.max(pending.len());
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -833,6 +846,10 @@ pub fn create_pty(
                 let valid_len = find_valid_utf8_prefix_len(&pending);
 
                 if valid_len > 0 {
+                    diag_flushes += 1;
+                    if valid_len < pending.len() {
+                        diag_lossy_flushes += 1;
+                    }
                     let data = String::from_utf8_lossy(&pending[..valid_len]).into_owned();
 
                     // 将本批输出追加到 output_since_enter，供 track_input 在 Enter 时检测
@@ -867,6 +884,28 @@ pub fn create_pty(
                             map.insert(pty_id_for_reader, Instant::now());
                         }
                     }
+                }
+
+                if diag_last.elapsed() >= Duration::from_secs(5) || diag_lossy_flushes > 0 {
+                    crate::perf_log::log_perf(
+                        &app_flush,
+                        "pty_output_diag",
+                        &format!(
+                            "pty_id={} | reads={} | bytes={} | flushes={} | utf8_leftover_flushes={} | max_pending={}",
+                            pty_id_for_reader,
+                            diag_reads,
+                            diag_bytes,
+                            diag_flushes,
+                            diag_lossy_flushes,
+                            diag_max_pending
+                        ),
+                    );
+                    diag_reads = 0;
+                    diag_bytes = 0;
+                    diag_flushes = 0;
+                    diag_lossy_flushes = 0;
+                    diag_max_pending = 0;
+                    diag_last = Instant::now();
                 }
 
                 // 保留不完整的 UTF-8 字节到下次刷新

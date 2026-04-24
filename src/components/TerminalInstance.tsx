@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
-import { getOrCreateTerminal, getCachedTerminal, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTextToClipboard, pasteToTerminal, getAnySelectedText, _isWindows, _isMacOS } from '../utils/terminalCache';
+import { getOrCreateTerminal, getCachedTerminal, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTextToClipboard, pasteToTerminal, getAnySelectedText, logTerminalDiag, logTerminalSnapshot, _isWindows, _isMacOS } from '../utils/terminalCache';
 import { getResolvedTheme } from '../utils/themeManager';
 import { showContextMenu } from '../utils/contextMenu';
 import '@xterm/xterm/css/xterm.css';
@@ -35,17 +35,43 @@ export function TerminalInstance({ ptyId }: Props) {
 
     const syncTerminalSize = (forcePtyResize = false) => {
       if (container.clientWidth <= 0 || container.clientHeight <= 0) return;
+      const beforeCols = term.cols;
+      const beforeRows = term.rows;
       fitAddon.fit();
       term.refresh(0, Math.max(term.rows - 1, 0));
 
       const startupWindow = performance.now() - mountAt < INITIAL_PTY_RESIZE_DELAY;
       const shouldDelayPtyResize = !forcePtyResize && startupWindow && term.cols < INITIAL_PTY_RESIZE_MIN_COLS;
+      if (forcePtyResize || beforeCols !== term.cols || beforeRows !== term.rows || shouldDelayPtyResize) {
+        logTerminalDiag('terminal_fit', {
+          ptyId,
+          width: container.clientWidth,
+          height: container.clientHeight,
+          beforeCols,
+          beforeRows,
+          cols: term.cols,
+          rows: term.rows,
+          forcePtyResize,
+          startupWindow,
+          delayed: shouldDelayPtyResize,
+          dpr: window.devicePixelRatio,
+        });
+      }
       if (!shouldDelayPtyResize) {
         invoke('resize_pty', { ptyId, cols: term.cols, rows: term.rows });
       }
     };
 
     container.appendChild(wrapper);
+    logTerminalDiag('terminal_mount', {
+      ptyId,
+      width: container.clientWidth,
+      height: container.clientHeight,
+      cols: term.cols,
+      rows: term.rows,
+      fontSize: term.options.fontSize,
+      dpr: window.devicePixelRatio,
+    });
 
     // 双层 rAF：让 Allotment 完成布局计算后再测量容器尺寸，避免在过渡尺寸时 fit() 得到错误的 cols
     requestAnimationFrame(() => {
@@ -75,7 +101,17 @@ export function TerminalInstance({ ptyId }: Props) {
       observer.disconnect();
       visibilityObserver.disconnect();
       wrapper.remove();
+      logTerminalDiag('terminal_unmount', { ptyId });
     };
+  }, [ptyId]);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<{ reason?: string }>).detail;
+      logTerminalSnapshot(ptyId, detail?.reason ?? 'manual');
+    };
+    window.addEventListener('mini-term-terminal-snapshot', handler);
+    return () => window.removeEventListener('mini-term-terminal-snapshot', handler);
   }, [ptyId]);
 
   useEffect(() => {
@@ -84,6 +120,12 @@ export function TerminalInstance({ ptyId }: Props) {
       cached.term.options.fontSize = terminalFontSize;
       cached.fitAddon.fit();
       cached.term.refresh(0, Math.max(cached.term.rows - 1, 0));
+      logTerminalDiag('terminal_font_size', {
+        ptyId,
+        fontSize: terminalFontSize,
+        cols: cached.term.cols,
+        rows: cached.term.rows,
+      });
       invoke('resize_pty', { ptyId, cols: cached.term.cols, rows: cached.term.rows });
     }
   }, [terminalFontSize, ptyId]);
@@ -94,6 +136,11 @@ export function TerminalInstance({ ptyId }: Props) {
       if (cached) {
         const { config } = useAppStore.getState();
         cached.term.options.theme = getTerminalTheme(config.terminalFollowTheme ?? true);
+        logTerminalDiag('terminal_theme', {
+          ptyId,
+          followTheme: config.terminalFollowTheme ?? true,
+          resolvedTheme: getResolvedTheme(),
+        });
       }
     };
     window.addEventListener('theme-changed', handler);

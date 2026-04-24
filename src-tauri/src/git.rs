@@ -371,6 +371,7 @@ pub fn get_git_status(
     project_path: String,
     force: Option<bool>,
 ) -> Result<Vec<GitFileStatus>, String> {
+    crate::path_access::ensure_path_access(&app, &project_path)?;
     let t0 = Instant::now();
     let is_force = force.unwrap_or(false);
 
@@ -494,6 +495,7 @@ pub fn discover_git_repos(
     project_path: String,
     force: Option<bool>,
 ) -> Result<Vec<GitRepoInfo>, String> {
+    crate::path_access::ensure_path_access(&app, &project_path)?;
     let t0 = Instant::now();
     let is_force = force.unwrap_or(false);
 
@@ -544,10 +546,12 @@ pub fn discover_git_repos(
 
 #[tauri::command]
 pub fn get_git_log(
+    app: AppHandle,
     repo_path: String,
     before_commit: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<GitCommitInfo>, String> {
+    crate::path_access::ensure_path_access(&app, &repo_path)?;
     let path = Path::new(&repo_path);
     let repo = Repository::open(path).map_err(|e| e.to_string())?;
     let limit = limit.unwrap_or(30);
@@ -592,7 +596,8 @@ pub fn get_git_log(
 }
 
 #[tauri::command]
-pub fn get_repo_branches(repo_path: String) -> Result<Vec<BranchInfo>, String> {
+pub fn get_repo_branches(app: AppHandle, repo_path: String) -> Result<Vec<BranchInfo>, String> {
+    crate::path_access::ensure_path_access(&app, &repo_path)?;
     let path = Path::new(&repo_path);
     let repo = Repository::open(path).map_err(|e| e.to_string())?;
 
@@ -637,9 +642,11 @@ pub fn get_repo_branches(repo_path: String) -> Result<Vec<BranchInfo>, String> {
 
 #[tauri::command]
 pub fn get_commit_files(
+    app: AppHandle,
     repo_path: String,
     commit_hash: String,
 ) -> Result<Vec<CommitFileInfo>, String> {
+    crate::path_access::ensure_path_access(&app, &repo_path)?;
     let repo = Repository::open(Path::new(&repo_path)).map_err(|e| e.to_string())?;
     let oid = git2::Oid::from_str(&commit_hash).map_err(|e| e.to_string())?;
     let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
@@ -685,11 +692,13 @@ pub fn get_commit_files(
 
 #[tauri::command]
 pub fn get_commit_file_diff(
+    app: AppHandle,
     repo_path: String,
     commit_hash: String,
     file_path: String,
     old_file_path: Option<String>,
 ) -> Result<GitDiffResult, String> {
+    crate::path_access::ensure_path_access(&app, &repo_path)?;
     let repo = Repository::open(Path::new(&repo_path)).map_err(|e| e.to_string())?;
     let oid = git2::Oid::from_str(&commit_hash).map_err(|e| e.to_string())?;
     let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
@@ -981,7 +990,8 @@ fn full_replace_diff(old_content: &str, new_content: &str) -> Vec<DiffHunk> {
 }
 
 #[tauri::command]
-pub fn get_git_diff(project_path: String, file_path: String) -> Result<GitDiffResult, String> {
+pub fn get_git_diff(app: AppHandle, project_path: String, file_path: String) -> Result<GitDiffResult, String> {
+    crate::path_access::ensure_path_access(&app, &project_path)?;
     let project = Path::new(&project_path);
     let abs_file = project.join(&file_path);
 
@@ -1102,12 +1112,14 @@ fn run_git_network_command(repo_path: &str, op: &'static str) -> Result<String, 
 // 两个 command 故意是 sync fn:内部 `recv_timeout(30s)` 是阻塞调用,
 // sync command 在 Tauri 的 blocking 池运行,不会占用 async runtime 的 worker。
 #[tauri::command]
-pub fn git_pull(repo_path: String) -> Result<String, String> {
+pub fn git_pull(app: AppHandle, repo_path: String) -> Result<String, String> {
+    crate::path_access::ensure_path_access(&app, &repo_path)?;
     run_git_network_command(&repo_path, "pull")
 }
 
 #[tauri::command]
-pub fn git_push(repo_path: String) -> Result<String, String> {
+pub fn git_push(app: AppHandle, repo_path: String) -> Result<String, String> {
+    crate::path_access::ensure_path_access(&app, &repo_path)?;
     run_git_network_command(&repo_path, "push")
 }
 

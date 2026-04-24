@@ -78,15 +78,20 @@ export function ProjectList() {
 
   const orderedItems = getOrderedTree(config);
   const allGroups = collectAllGroups(config.projectTree ?? []);
+  const isMac = navigator.userAgent.includes('Mac');
 
   const handleAddProject = useCallback(async () => {
-    const selected = await open({ directory: true, multiple: false });
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      ...(isMac ? { recursive: true, fileAccessMode: 'scoped' as const } : {}),
+    });
     if (!selected) return;
     const path = selected as string;
     const name = path.split(/[/\\]/).pop() || path;
     addProject({ id: genId(), name, path });
     saveConfig();
-  }, [addProject]);
+  }, [addProject, isMac]);
 
   const handleRemoveProject = useCallback(
     (e: React.MouseEvent, id: string) => {

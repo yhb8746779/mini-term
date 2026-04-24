@@ -28,10 +28,14 @@ export function App() {
   const [configOpen, setConfigOpen] = useState(false);
   const [currentVersion, setCurrentVersion] = useState('');
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
+  const [accessReadyProjectId, setAccessReadyProjectId] = useState<string | null>(null);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
   const updatePaneStatusByPty = useAppStore((s) => s.updatePaneStatusByPty);
+  const restoredProjectsRef = useRef(new Set<string>());
+  const activeProject = config.projects.find((p) => p.id === activeProjectId) ?? null;
+  const activeProjectReady = !activeProjectId || accessReadyProjectId === activeProjectId;
 
   useEffect(() => {
     invoke<AppConfig>('load_config').then((cfg) => {
@@ -44,7 +48,7 @@ export function App() {
       const newStates = new Map(projectStates);
       for (const p of cfg.projects) {
         if (!newStates.has(p.id)) {
-          newStates.set(p.id, { id: p.id, tabs: [], activeTabId: '' });
+          newStates.set(p.id, { id: p.id, tabs: [], activeTabId: '', layoutHydrated: false });
         }
       }
       useAppStore.setState({
@@ -57,17 +61,56 @@ export function App() {
         initExpandedDirs(p.id, p.expandedDirs ?? []);
       }
 
-      // 异步恢复各项目的终端布局（不阻塞 UI，恢复完成后 store 自动更新）
-      Promise.all(
-        cfg.projects
-          .filter((p) => p.savedLayout && p.savedLayout.tabs.length > 0)
-          .map((p) => restoreLayout(p.id, p.savedLayout!, p.path, cfg))
-      ).catch(console.error);
-
       applyTheme(cfg.theme ?? 'auto');
       setConfigLoaded(true);
     });
   }, []);
+
+  useEffect(() => {
+    if (!configLoaded) return;
+    if (!activeProject) {
+      setAccessReadyProjectId(null);
+      return;
+    }
+
+    let cancelled = false;
+    setAccessReadyProjectId(null);
+
+    (async () => {
+      try {
+        await invoke('prepare_project_access', { path: activeProject.path });
+      } catch (err) {
+        console.error('prepare_project_access failed:', err);
+      }
+
+      if (!cancelled) {
+        setAccessReadyProjectId(activeProject.id);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [configLoaded, activeProject?.id, activeProject?.path]);
+
+  useEffect(() => {
+    if (!configLoaded || !activeProjectReady || !activeProject) return;
+    if (!activeProject.savedLayout || activeProject.savedLayout.tabs.length === 0) return;
+    if (restoredProjectsRef.current.has(activeProject.id)) return;
+
+    restoredProjectsRef.current.add(activeProject.id);
+    restoreLayout(activeProject.id, activeProject.savedLayout, activeProject.path, config)
+      .catch((err) => {
+        console.error('restoreLayout failed:', err);
+      });
+  }, [
+    configLoaded,
+    activeProjectReady,
+    activeProject?.id,
+    activeProject?.path,
+    activeProject?.savedLayout,
+    config,
+  ]);
 
   // 主题变化时应用新主题
   useEffect(() => {
@@ -207,18 +250,24 @@ export function App() {
           </Allotment.Pane>
 
           <Allotment.Pane minSize={180}>
-            <Allotment
-              vertical
-              defaultSizes={config.middleColumnSizes ?? [300, 200]}
-              onChange={saveMiddleColumnSizes}
-            >
-              <Allotment.Pane minSize={150}>
-                <FileTree key={activeProjectId} />
-              </Allotment.Pane>
-              <Allotment.Pane minSize={36}>
-                <GitHistory key={activeProjectId} />
-              </Allotment.Pane>
-            </Allotment>
+            {activeProject && !activeProjectReady ? (
+              <div className="h-full flex items-center justify-center bg-[var(--bg-surface)] text-sm text-[var(--text-muted)]">
+                正在准备项目访问权限…
+              </div>
+            ) : (
+              <Allotment
+                vertical
+                defaultSizes={config.middleColumnSizes ?? [300, 200]}
+                onChange={saveMiddleColumnSizes}
+              >
+                <Allotment.Pane minSize={150}>
+                  <FileTree key={activeProjectId} />
+                </Allotment.Pane>
+                <Allotment.Pane minSize={36}>
+                  <GitHistory key={activeProjectId} />
+                </Allotment.Pane>
+              </Allotment>
+            )}
           </Allotment.Pane>
 
           <Allotment.Pane>
@@ -237,12 +286,17 @@ export function App() {
                     <div
                       key={project.id}
                       className="absolute inset-0"
-                      style={{ display: project.id === activeProjectId ? 'block' : 'none' }}
+                      style={{ display: project.id === activeProjectId && activeProjectReady ? 'block' : 'none' }}
                     >
                       <TerminalArea projectId={project.id} projectPath={project.path} />
                     </div>
                   ))
               }
+              {activeProject && !activeProjectReady && (
+                <div className="absolute inset-0 bg-[var(--bg-terminal)] flex items-center justify-center text-[var(--text-muted)] text-sm">
+                  正在准备项目访问权限…
+                </div>
+              )}
               {config.projects.length === 0 && (
                 <div className="h-full bg-[var(--bg-terminal)] flex items-center justify-center text-[var(--text-muted)] text-sm">
                   请先在左栏添加项目

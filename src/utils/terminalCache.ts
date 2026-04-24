@@ -30,6 +30,25 @@ interface CachedEntry extends CachedTerminal {
   cleanup: () => void;
 }
 
+interface TerminalDiagnostics {
+  renderer: 'webgl' | 'canvas';
+  writes: number;
+  chars: number;
+  cjk: number;
+  emojiLike: number;
+  ansiEsc: number;
+  csi: number;
+  osc: number;
+  cr: number;
+  lf: number;
+  backspace: number;
+  replacement: number;
+  maxChunk: number;
+  hash: number;
+  startedAt: number;
+  lastFlushedAt: number;
+}
+
 export const DARK_TERMINAL_THEME = {
   background: '#100f0d',
   foreground: '#d8d4cc',
@@ -88,6 +107,7 @@ export function getTerminalTheme(terminalFollowTheme: boolean): typeof DARK_TERM
 }
 
 const cache = new Map<number, CachedEntry>();
+const diagnostics = new Map<number, TerminalDiagnostics>();
 const enqueuePtyWrite = createPtyWriteQueue((ptyId, data) =>
   invoke('write_pty', { ptyId, data })
 );
@@ -96,12 +116,142 @@ const enqueuePtyWrite = createPtyWriteQueue((ptyId, data) =>
 // 用法：DevTools Console → localStorage.setItem('mini-term-debug', '1')
 //       调试完 → localStorage.removeItem('mini-term-debug')
 const TERM_DEBUG = localStorage.getItem('mini-term-debug') === '1';
-const FORCE_DISABLE_WEBGL = localStorage.getItem('mini-term-disable-webgl') === '1';
+function shouldDisableWebgl(): boolean {
+  return (
+    localStorage.getItem('mini-term-disable-webgl') === '1' ||
+    useAppStore.getState().config.terminalDisableWebgl === true
+  );
+}
 const FORCE_MONO_ONLY = localStorage.getItem('mini-term-mono-only') === '1';
 
 function debugTerm(scope: string, payload: Record<string, unknown>) {
   if (!TERM_DEBUG) return;
   console.info(`[mini-term-debug] ${scope}`, payload);
+}
+
+function stableDetails(payload: Record<string, unknown>): string {
+  return Object.entries(payload)
+    .map(([key, value]) => `${key}=${String(value).replace(/\s+/g, ' ').slice(0, 240)}`)
+    .join(' | ');
+}
+
+export function logTerminalDiag(scope: string, payload: Record<string, unknown>) {
+  invoke('log_perf_from_frontend', {
+    scope,
+    details: stableDetails(payload),
+  }).catch(() => {});
+}
+
+function initDiagnostics(ptyId: number, renderer: TerminalDiagnostics['renderer']) {
+  diagnostics.set(ptyId, {
+    renderer,
+    writes: 0,
+    chars: 0,
+    cjk: 0,
+    emojiLike: 0,
+    ansiEsc: 0,
+    csi: 0,
+    osc: 0,
+    cr: 0,
+    lf: 0,
+    backspace: 0,
+    replacement: 0,
+    maxChunk: 0,
+    hash: 2166136261,
+    startedAt: performance.now(),
+    lastFlushedAt: performance.now(),
+  });
+}
+
+function updateOutputDiagnostics(ptyId: number, data: string, term: Terminal) {
+  let diag = diagnostics.get(ptyId);
+  if (!diag) {
+    initDiagnostics(ptyId, 'canvas');
+    diag = diagnostics.get(ptyId)!;
+  }
+
+  diag.writes += 1;
+  diag.chars += data.length;
+  diag.maxChunk = Math.max(diag.maxChunk, data.length);
+
+  for (let i = 0; i < data.length; i += 1) {
+    const code = data.charCodeAt(i);
+    diag.hash ^= code;
+    diag.hash = Math.imul(diag.hash, 16777619) >>> 0;
+
+    if (code === 0x1b) {
+      diag.ansiEsc += 1;
+      const next = data.charCodeAt(i + 1);
+      if (next === 0x5b) diag.csi += 1; // ESC [
+      if (next === 0x5d) diag.osc += 1; // ESC ]
+    } else if (code === 0x0d) {
+      diag.cr += 1;
+    } else if (code === 0x0a) {
+      diag.lf += 1;
+    } else if (code === 0x08) {
+      diag.backspace += 1;
+    } else if (code === 0xfffd) {
+      diag.replacement += 1;
+    } else if (
+      (code >= 0x2e80 && code <= 0x9fff) ||
+      (code >= 0xf900 && code <= 0xfaff)
+    ) {
+      diag.cjk += 1;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      diag.emojiLike += 1;
+    }
+  }
+
+  const now = performance.now();
+  const elapsed = now - diag.lastFlushedAt;
+  const suspicious = diag.replacement > 0 || data.includes('\u001b[?2026');
+  if (!suspicious && elapsed < 2500) return;
+
+  logTerminalDiag('terminal_write', {
+    ptyId,
+    renderer: diag.renderer,
+    writes: diag.writes,
+    chars: diag.chars,
+    cjk: diag.cjk,
+    emojiLike: diag.emojiLike,
+    ansiEsc: diag.ansiEsc,
+    csi: diag.csi,
+    osc: diag.osc,
+    cr: diag.cr,
+    lf: diag.lf,
+    backspace: diag.backspace,
+    replacement: diag.replacement,
+    maxChunk: diag.maxChunk,
+    hash: diag.hash.toString(16),
+    cols: term.cols,
+    rows: term.rows,
+    cursorX: term.buffer.active.cursorX,
+    cursorY: term.buffer.active.cursorY,
+    baseY: term.buffer.active.baseY,
+    viewportY: term.buffer.active.viewportY,
+    dpr: window.devicePixelRatio,
+    ms: Math.round(now - diag.startedAt),
+    suspicious,
+  });
+
+  diagnostics.set(ptyId, {
+    renderer: diag.renderer,
+    writes: 0,
+    chars: 0,
+    cjk: 0,
+    emojiLike: 0,
+    ansiEsc: 0,
+    csi: 0,
+    osc: 0,
+    cr: 0,
+    lf: 0,
+    backspace: 0,
+    replacement: 0,
+    maxChunk: 0,
+    hash: 2166136261,
+    startedAt: now,
+    lastFlushedAt: now,
+  });
 }
 
 export function getOrCreateTerminal(ptyId: number): CachedTerminal {
@@ -153,8 +303,12 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     // Unicode 11 不支持
   }
 
+  let renderer: TerminalDiagnostics['renderer'] = 'canvas';
+
   // WebGL 渲染，降级时回退到 Canvas
-  if (FORCE_DISABLE_WEBGL) {
+  const disableWebgl = shouldDisableWebgl();
+
+  if (disableWebgl) {
     debugTerm('terminal:webgl_skipped', { ptyId, reason: 'FORCE_DISABLE_WEBGL' });
   } else {
     try {
@@ -165,11 +319,14 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
         term.refresh(0, term.rows - 1);
       });
       term.loadAddon(webgl);
+      renderer = 'webgl';
       debugTerm('terminal:webgl_loaded', { ptyId });
     } catch (err) {
       debugTerm('terminal:webgl_failed', { ptyId, error: String(err) });
     }
   }
+
+  initDiagnostics(ptyId, renderer);
 
   debugTerm('terminal:create', {
     ptyId,
@@ -177,7 +334,21 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     fontSize: term.options.fontSize,
     lineHeight: term.options.lineHeight,
     letterSpacing: term.options.letterSpacing,
-    webgl: !FORCE_DISABLE_WEBGL,
+    webgl: !disableWebgl,
+    monoOnly: FORCE_MONO_ONLY,
+  });
+  logTerminalDiag('terminal_create', {
+    ptyId,
+    renderer,
+    fontFamily: term.options.fontFamily,
+    fontSize: term.options.fontSize,
+    lineHeight: term.options.lineHeight,
+    letterSpacing: term.options.letterSpacing,
+    unicode: term.unicode.activeVersion,
+    dpr: window.devicePixelRatio,
+    ua: navigator.userAgent,
+    platform: navigator.platform,
+    webglDisabled: disableWebgl,
     monoOnly: FORCE_MONO_ONLY,
   });
 
@@ -233,6 +404,7 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   let unlisten: (() => void) | undefined;
   listen<PtyOutputPayload>('pty-output', (event) => {
     if (event.payload.ptyId === ptyId) {
+      updateOutputDiagnostics(ptyId, event.payload.data, term);
       term.write(event.payload.data);
     }
   }).then((fn) => {
@@ -245,6 +417,7 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     unlisten?.();
     onDataDisp.dispose();
     onResizeDisp.dispose();
+    diagnostics.delete(ptyId);
     term.dispose();
   };
 
@@ -272,6 +445,31 @@ export function updateAllTerminalThemes(terminalFollowTheme: boolean): void {
   for (const entry of cache.values()) {
     entry.term.options.theme = theme;
   }
+}
+
+export function logTerminalSnapshot(ptyId: number, reason = 'manual') {
+  const entry = cache.get(ptyId);
+  if (!entry) return;
+  const diag = diagnostics.get(ptyId);
+  logTerminalDiag('terminal_snapshot', {
+    reason,
+    ptyId,
+    renderer: diag?.renderer ?? 'unknown',
+    cols: entry.term.cols,
+    rows: entry.term.rows,
+    cursorX: entry.term.buffer.active.cursorX,
+    cursorY: entry.term.buffer.active.cursorY,
+    baseY: entry.term.buffer.active.baseY,
+    viewportY: entry.term.buffer.active.viewportY,
+    bufferLength: entry.term.buffer.active.length,
+    hasSelection: entry.term.hasSelection(),
+    fontFamily: entry.term.options.fontFamily,
+    fontSize: entry.term.options.fontSize,
+    lineHeight: entry.term.options.lineHeight,
+    dpr: window.devicePixelRatio,
+    webglDisabled: shouldDisableWebgl(),
+    monoOnly: FORCE_MONO_ONLY,
+  });
 }
 
 export function writePtyInput(ptyId: number, data: string): Promise<void> {
@@ -389,22 +587,29 @@ function getAiProviderForPty(ptyId: number): AiProvider | null {
 //   - explorer-image-files 与 explorer-files 共用同一函数 → 无法针对图片文件做独立优化
 
 /**
- * AI pane 文本粘贴路径。
+ * 通用文本粘贴路径。
  *
- * term.paste() 内部包装 bracketed-paste 序列 \x1b[200~...\x1b[201~，
- * 让 Claude/Codex/Gemini CLI 识别为粘贴块（[Pasted text #1 +N lines]）。
+ * 统一走 xterm 的 term.paste()：
+ *   - 支持 bracketed paste 的 shell/TUI（bash/zsh/readline/vim/tmux 等）会把多行内容
+ *     当成"整块粘贴"，避免第一行被当成回车直接执行
+ *   - 不支持 bracketed paste 的场景会退回普通文本注入
  *
- * 为什么不用 enqueuePtyWrite 直接注入 bracketed-paste 字符串：
- *   直接注入绕过 xterm paste 管道，TUI CLI 不会识别为"粘贴事件"。
+ * 为什么不用 enqueuePtyWrite 直接写文本：
+ *   直接写入 PTY 等价于用户逐字输入；多行命令中的 `\n` 会被 shell 当成立即回车执行，
+ *   就会出现"第一行被截断直接执行"的问题。
  *
  * 为什么要先 focus：
  *   右键等操作可能使焦点从 xterm 漂移，term.paste() 在失焦时静默失败。
  */
-function sendAiTextPaste(ptyId: number, text: string): void {
+function sendTextPaste(ptyId: number, text: string): void {
   const entry = cache.get(ptyId);
   if (!entry) return;
   entry.term.focus();
   entry.term.paste(text);
+}
+
+function sendAiTextPaste(ptyId: number, text: string): void {
+  sendTextPaste(ptyId, text);
 }
 
 /**
@@ -810,7 +1015,7 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
 
   // 非 AI pane
   if (clipboard.kind === 'plain-text' && clipboard.text) {
-    await enqueuePtyWrite(ptyId, clipboard.text);
+    sendTextPaste(ptyId, clipboard.text);
     return;
   }
 
@@ -838,7 +1043,7 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
 
   // rich-object / unknown / 图片落盘全失败：先尝试文本，最后 Alt+V 保险
   if (clipboard.text) {
-    await enqueuePtyWrite(ptyId, clipboard.text);
+    sendTextPaste(ptyId, clipboard.text);
     return;
   }
   await enqueuePtyWrite(ptyId, '\x1bv');
