@@ -242,15 +242,6 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
             let proc_snapshot = snapshot_processes();
 
             for pty_id in &pty_ids {
-                // Layer 3：子进程名兜底（优先级最高，覆盖所有输出依赖场景）
-                if let Some(ref snapshot) = proc_snapshot {
-                    if let Some(shell_pid) = pty_manager.get_child_pid(*pty_id) {
-                        if let Some(provider) = detect_ai_in_subtree(snapshot, shell_pid) {
-                            pty_manager.force_ai_session(*pty_id, provider);
-                        }
-                    }
-                }
-
                 // ── Layer 2：进程级 banner 兜底检测 ──────────────────────────
                 //
                 // AI 会话检测采用三层架构：
@@ -263,9 +254,25 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
                 //     中的 AI CLI 启动 banner（"Welcome to Claude Code" 等）。
                 //     优点：不依赖命令 echo，AI CLI 只要成功启动并输出 banner 就能被捕获。
                 //     代价：最多滞后 500ms（monitor 轮询间隔）。
+                //     弱点：长历史/大输出里若出现其他 provider 的关键词可能误判。
                 //
-                //   Layer 3（process truth，见上）：子进程树扫描。最稳，但仅 Unix。
+                //   Layer 3（process truth，下方）：PTY 子进程树扫 AI 可执行名。
+                //     最强真相源：不依赖任何终端输出。Unix 使用 `ps -A`。
+                //
+                // 顺序：Layer 2 先跑，Layer 3 后跑并覆盖。 Layer 3 永远是最终裁判——
+                // Layer 2 若被长历史里的异构 provider 关键词误判（例如 claude --resume
+                // 回放到提及 grok/xAI 的旧对话），Layer 3 看到实际子进程是 claude 后
+                // 立刻把 provider 纠正回来。
                 pty_manager.try_reconcile_ai_from_banner(*pty_id);
+
+                // Layer 3：子进程名真相源，最后生效，覆盖 Layer 1/2 可能的误判
+                if let Some(ref snapshot) = proc_snapshot {
+                    if let Some(shell_pid) = pty_manager.get_child_pid(*pty_id) {
+                        if let Some(provider) = detect_ai_in_subtree(snapshot, shell_pid) {
+                            pty_manager.force_ai_session(*pty_id, provider);
+                        }
+                    }
+                }
 
                 let (is_ai, prov) = pty_manager.get_ai_session_info(*pty_id);
                 let (status, provider) = if is_ai {

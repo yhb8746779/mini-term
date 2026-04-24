@@ -61,11 +61,9 @@ fn detect_provider_from_banner(raw_output: &str) -> Option<&'static str> {
         if lower.contains("welcome to gemini") {
             return Some("gemini");
         }
-        // Grok CLI (xAI) 启动 banner — 暂以通用关键词占位，拿到实际 banner 后再收紧。
-        // Layer 3（子进程名扫描）通常会先于 banner 检测生效，即使此处漏判也不影响识别。
-        if lower.contains("welcome to grok") || lower.contains("xai grok") {
-            return Some("grok");
-        }
+        // 注意：Grok 没有加 banner 模式。拿不到高置信度短语时硬加会误伤 —
+        // 用户 claude --resume 回放长历史里提到 "xAI" / "grok" 会把 provider 错判为 grok。
+        // Grok 依靠 Layer 3 子进程名扫描识别（pty 子进程树里出现 `grok` 可执行时）。
     }
     None
 }
