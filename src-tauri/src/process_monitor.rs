@@ -136,7 +136,7 @@ fn detect_awaiting_input(raw_output: &str) -> bool {
 /// 系统进程快照条目：(pid, ppid, 去路径的 comm 名)
 type ProcEntry = (u32, u32, String);
 
-/// 抓一次系统进程列表。Unix 调 `ps`，Windows 暂不实现（返回 None，Layer 3 退化为 no-op）。
+/// 抓一次系统进程列表。Unix 调 `ps -A`，Windows 调 ToolHelp32 快照 API。
 #[cfg(unix)]
 fn snapshot_processes() -> Option<Vec<ProcEntry>> {
     use std::process::Command;
@@ -171,7 +171,58 @@ fn snapshot_processes() -> Option<Vec<ProcEntry>> {
     Some(result)
 }
 
-#[cfg(not(unix))]
+/// Windows 实现：用 ToolHelp32 API 枚举全系统进程，返回 (pid, ppid, exe_name)。
+/// 代价与 Unix `ps -A` 相当，几 ms 级。
+#[cfg(windows)]
+fn snapshot_processes() -> Option<Vec<ProcEntry>> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
+        PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+
+    let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.ok()?;
+
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+
+    let mut result = Vec::with_capacity(256);
+
+    unsafe {
+        if Process32FirstW(handle, &mut entry).is_err() {
+            let _ = CloseHandle(handle);
+            return None;
+        }
+
+        loop {
+            let pid = entry.th32ProcessID;
+            let ppid = entry.th32ParentProcessID;
+            // szExeFile 是 null-terminated UTF-16，只含文件名（如 "claude.exe"），不含路径
+            let nul_pos = entry.szExeFile.iter().position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let exe_name = String::from_utf16_lossy(&entry.szExeFile[..nul_pos]);
+
+            if !exe_name.is_empty() {
+                // 与 Unix 版保持一致：取 basename（szExeFile 通常已经是纯文件名）
+                let base = exe_name.rsplit(&['/', '\\'][..])
+                    .next().unwrap_or(&exe_name).to_string();
+                result.push((pid, ppid, base));
+            }
+
+            if Process32NextW(handle, &mut entry).is_err() {
+                break;
+            }
+        }
+
+        let _ = CloseHandle(handle);
+    }
+
+    Some(result)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn snapshot_processes() -> Option<Vec<ProcEntry>> {
     None
 }
@@ -238,7 +289,7 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
             //   - 用户通过 shell wrapper、history 召回等路径启动 AI，
             //     Layer 1 keystroke 缓冲未命中
             //
-            // 代价：每 500ms 一次 `ps -A`，在典型桌面环境几 ms 级。
+            // 代价：每 500ms 一次快照（Unix `ps -A` / Windows ToolHelp32），几 ms 级。
             let proc_snapshot = snapshot_processes();
 
             for pty_id in &pty_ids {
@@ -257,7 +308,7 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
                 //     弱点：长历史/大输出里若出现其他 provider 的关键词可能误判。
                 //
                 //   Layer 3（process truth，下方）：PTY 子进程树扫 AI 可执行名。
-                //     最强真相源：不依赖任何终端输出。Unix 使用 `ps -A`。
+                //     最强真相源：不依赖任何终端输出。Unix 用 `ps -A`，Windows 用 ToolHelp32。
                 //
                 // 顺序：Layer 2 先跑，Layer 3 后跑并覆盖。 Layer 3 永远是最终裁判——
                 // Layer 2 若被长历史里的异构 provider 关键词误判（例如 claude --resume
