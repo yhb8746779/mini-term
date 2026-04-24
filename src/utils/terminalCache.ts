@@ -113,9 +113,15 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   wrapper.style.width = '100%';
   wrapper.style.height = '100%';
 
+  // 字体栈策略：
+  //   1) 系统自带的等宽字体放在最前（macOS=Menlo/SF Mono，Windows=Consolas，Linux=Liberation/DejaVu）。
+  //      这样 xterm 首次测量 cell-width 一定命中 Latin 等宽字体，避免回退到 CJK 全角
+  //      字体（PingFang SC 等）导致 cell 偏宽、字符间留大空隙的"丑字距"现象。
+  //   2) 用户装了第三方等宽字体（JetBrains Mono / Cascadia Code）作为可选升级。
+  //   3) CJK 回退字体放在最后，仅在遇到中文时生效，不参与 cell-width 测量。
   const fontFamily = FORCE_MONO_ONLY
-    ? "'JetBrains Mono', 'Cascadia Code', Consolas, monospace"
-    : "'JetBrains Mono', 'Cascadia Code', Consolas, 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans Mono CJK SC', 'Microsoft YaHei Mono', monospace";
+    ? "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Cascadia Code', 'JetBrains Mono', 'Liberation Mono', monospace"
+    : "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Cascadia Code', 'JetBrains Mono', 'Liberation Mono', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans Mono CJK SC', 'Microsoft YaHei Mono', monospace";
 
   const term = new Terminal({
     fontSize: useAppStore.getState().config.terminalFontSize ?? 14,
@@ -180,6 +186,24 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     webgl: !FORCE_DISABLE_WEBGL,
     monoOnly: FORCE_MONO_ONLY,
   });
+
+  // 字体加载稳定兜底：首次测量 cell-width 可能发生在字体还没完全就绪时，
+  // xterm/WebGL 会把测到的（偏大的）cell 尺寸烧进纹理图集，造成字符间距突兀。
+  // document.fonts.ready 在所有 @font-face 解析完成后触发；此时再跑一次
+  // fit + refresh，WebGL 纹理图集会按当前生效的字体重建，字距恢复正常。
+  if (typeof document !== 'undefined' && document.fonts && document.fonts.ready) {
+    document.fonts.ready
+      .then(() => {
+        try {
+          fitAddon.fit();
+          term.refresh(0, Math.max(term.rows - 1, 0));
+          invoke('resize_pty', { ptyId, cols: term.cols, rows: term.rows }).catch(() => {});
+        } catch {
+          // terminal 可能已被 dispose（pty 关闭）；忽略
+        }
+      })
+      .catch(() => {});
+  }
 
   // 剪贴板快捷键 + macOS WKWebView Ctrl 键修复
   // macOS 的 WKWebView 对 Ctrl+A/E/K/U/W 等有系统级文本编辑绑定（继承自 NeXTSTEP），
