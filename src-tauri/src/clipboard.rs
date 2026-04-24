@@ -519,11 +519,11 @@ mod mac {
 
             // NSData from bytes
             let ns_data: Retained<AnyObject> = msg_send![data_cls,
-                dataWithBytes: tiff_data.as_ptr() as *const c_void
+                dataWithBytes: tiff_data.as_ptr() as *const c_void,
                 length: tiff_data.len()];
 
             // setData:forType: returns BOOL
-            let ok: i8 = msg_send![&pb, setData: &*ns_data forType: &*ns_tiff_type];
+            let ok: i8 = msg_send![&pb, setData: &*ns_data, forType: &*ns_tiff_type];
             if ok == 0 {
                 return Err("NSPasteboard setData:forType: 写入失败".into());
             }

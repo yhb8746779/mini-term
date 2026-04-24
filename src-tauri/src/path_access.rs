@@ -116,7 +116,8 @@ pub fn prepare_project_access(app: AppHandle, path: String) -> Result<(), String
 fn ensure_path_access_macos(app: &AppHandle, requested_path: &str) -> Result<(), String> {
     let requested_norm = normalize_project_path(requested_path);
     let root = {
-        let guard = app.state::<PathAccessManager>().inner.lock().unwrap();
+        let state = app.state::<PathAccessManager>();
+        let guard = state.inner.lock().unwrap();
         let root = if guard.projects.contains_key(&requested_norm) {
             Some(requested_norm.clone())
         } else {
@@ -135,7 +136,8 @@ fn ensure_path_access_macos(app: &AppHandle, requested_path: &str) -> Result<(),
     };
 
     let bookmark = {
-        let guard = app.state::<PathAccessManager>().inner.lock().unwrap();
+        let state = app.state::<PathAccessManager>();
+        let guard = state.inner.lock().unwrap();
         guard.projects.get(&root).cloned().flatten()
     };
 
@@ -208,7 +210,7 @@ mod mac {
             let data_cls = AnyClass::get(c"NSData")
                 .ok_or_else(|| "NSData class not found".to_string())?;
             Ok(msg_send![data_cls,
-                dataWithBytes: bytes.as_ptr() as *const c_void
+                dataWithBytes: bytes.as_ptr() as *const c_void,
                 length: bytes.len()
             ])
         }
@@ -248,9 +250,9 @@ mod mac {
             let mut error: *mut AnyObject = std::ptr::null_mut();
             let data_opt: Option<Retained<AnyObject>> = msg_send![
                 &url,
-                bookmarkDataWithOptions: NSURL_BOOKMARK_CREATION_WITH_SECURITY_SCOPE
-                includingResourceValuesForKeys: std::ptr::null::<AnyObject>()
-                relativeToURL: std::ptr::null::<AnyObject>()
+                bookmarkDataWithOptions: NSURL_BOOKMARK_CREATION_WITH_SECURITY_SCOPE,
+                includingResourceValuesForKeys: std::ptr::null::<AnyObject>(),
+                relativeToURL: std::ptr::null::<AnyObject>(),
                 error: &mut error
             ];
 
@@ -281,10 +283,10 @@ mod mac {
 
             let url_opt: Option<Retained<AnyObject>> = msg_send![
                 url_cls,
-                URLByResolvingBookmarkData: &*data
-                options: NSURL_BOOKMARK_RESOLUTION_WITH_SECURITY_SCOPE
-                relativeToURL: std::ptr::null::<AnyObject>()
-                bookmarkDataIsStale: &mut stale
+                URLByResolvingBookmarkData: &*data,
+                options: NSURL_BOOKMARK_RESOLUTION_WITH_SECURITY_SCOPE,
+                relativeToURL: std::ptr::null::<AnyObject>(),
+                bookmarkDataIsStale: &mut stale,
                 error: &mut error
             ];
 
