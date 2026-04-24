@@ -17,7 +17,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_window_state::Builder::new().build())
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(tauri_plugin_window_state::StateFlags::MAXIMIZED)
+                .build(),
+        )
         .manage(pty::PtyManager::new())
         .manage(fs::FsWatcherManager::new())
         .manage(ai_sessions::SessionCache::new())
