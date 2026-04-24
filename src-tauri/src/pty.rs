@@ -361,7 +361,9 @@ impl PtyManager {
         let mut map = self.recent_output_window.lock().unwrap();
         let entry = map.entry(pty_id).or_default();
         entry.push_str(data);
-        const ROW_CAP: usize = 8 * 1024;
+        // 64KB 容量：Codex MCP 失败会吐出带 base64 图片的 HTML 错误页（>20KB），
+        // 原 8KB 上限会把 codex 启动 banner 挤出窗口，Layer 2 兜底识别失效。
+        const ROW_CAP: usize = 64 * 1024;
         if entry.len() > ROW_CAP {
             let excess = entry.len() - ROW_CAP;
             let boundary = (excess..=entry.len())
@@ -375,7 +377,9 @@ impl PtyManager {
         let mut ose = self.output_since_enter.lock().unwrap();
         let entry = ose.entry(pty_id).or_default();
         entry.push_str(data);
-        const OSE_CAP: usize = 16 * 1024;
+        // 64KB 容量：claude --resume / codex --resume 会回放长历史，老 16KB 上限
+        // 会让 Layer 1 fallback 的 shell echo 行被冲出 OSE，provider 补偿路径失效。
+        const OSE_CAP: usize = 64 * 1024;
         if entry.len() > OSE_CAP {
             let excess = entry.len() - OSE_CAP;
             let boundary = (excess..=entry.len())
