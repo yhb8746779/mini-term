@@ -4,6 +4,9 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
+/// Layer 3 检测的 AI CLI 命令名（与 pty.rs AI_COMMANDS 保持同步）
+const AI_SUBPROCESS_NAMES: &[&str] = &["claude", "codex", "gemini", "grok"];
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PtyStatusChangePayload {
@@ -130,6 +133,94 @@ fn detect_awaiting_input(raw_output: &str) -> bool {
     false
 }
 
+/// 系统进程快照条目：(pid, ppid, 去路径的 comm 名)
+type ProcEntry = (u32, u32, String);
+
+/// 抓一次系统进程列表。Unix 调 `ps`，Windows 暂不实现（返回 None，Layer 3 退化为 no-op）。
+#[cfg(unix)]
+fn snapshot_processes() -> Option<Vec<ProcEntry>> {
+    use std::process::Command;
+    let output = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,comm="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut result = Vec::with_capacity(256);
+    for line in stdout.lines() {
+        let line = line.trim_start();
+        if line.is_empty() {
+            continue;
+        }
+        let mut iter = line.split_whitespace();
+        let Some(pid_s) = iter.next() else { continue };
+        let Some(ppid_s) = iter.next() else { continue };
+        let Ok(pid) = pid_s.parse::<u32>() else { continue };
+        let Ok(ppid) = ppid_s.parse::<u32>() else { continue };
+        // comm 可能含空格（"Google Chrome Helper"），把剩余部分合并
+        let comm: String = iter.collect::<Vec<_>>().join(" ");
+        if comm.is_empty() {
+            continue;
+        }
+        // ps 在部分系统上输出含路径（如 "/usr/bin/node"），取 basename
+        let base = comm.rsplit(&['/', '\\'][..]).next().unwrap_or(&comm).to_string();
+        result.push((pid, ppid, base));
+    }
+    Some(result)
+}
+
+#[cfg(not(unix))]
+fn snapshot_processes() -> Option<Vec<ProcEntry>> {
+    None
+}
+
+/// 在进程快照中，从 root_pid 做 BFS，找到任意 comm 匹配 AI CLI 名字的后代。
+/// 返回第一个匹配的 provider 名（稳定字符串切片）。
+fn detect_ai_in_subtree(snapshot: &[ProcEntry], root_pid: u32) -> Option<&'static str> {
+    // 构建 ppid -> children 索引
+    let mut by_ppid: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (idx, entry) in snapshot.iter().enumerate() {
+        by_ppid.entry(entry.1).or_default().push(idx);
+    }
+
+    let mut queue: Vec<u32> = vec![root_pid];
+    // 深度保护：终端进程树一般很浅（shell → AI CLI → maybe node/python helper）
+    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    while let Some(pid) = queue.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        if let Some(child_idxs) = by_ppid.get(&pid) {
+            for &idx in child_idxs {
+                let (child_pid, _, comm) = &snapshot[idx];
+                let lower = comm.to_lowercase();
+                // 去掉常见扩展名，如 windows 上的 .exe
+                let stem = lower.trim_end_matches(".exe");
+                for &ai in AI_SUBPROCESS_NAMES {
+                    if stem == ai {
+                        return Some(ai_to_static(ai));
+                    }
+                }
+                queue.push(*child_pid);
+            }
+        }
+    }
+    None
+}
+
+/// 把动态 &str 映射到固定 &'static str，避免 lifetime 泄漏
+fn ai_to_static(name: &str) -> &'static str {
+    match name {
+        "claude" => "claude",
+        "codex" => "codex",
+        "gemini" => "gemini",
+        "grok" => "grok",
+        _ => "unknown",
+    }
+}
+
 pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
     thread::spawn(move || {
         // 存储上一次发送的 (status, provider) 对，避免重复 emit 相同状态
@@ -138,10 +229,31 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
         loop {
             let pty_ids = pty_manager.get_pty_ids();
 
+            // ── Layer 3：系统进程快照（每轮一次，供所有 pty 共用） ─────────
+            //
+            // 不依赖终端输出，直接读 OS 进程表，扫 PTY 子进程树中是否跑着
+            // claude / codex / gemini / grok。对以下场景免疫：
+            //   - codex 启动时 MCP 错误刷屏把 banner 挤出窗口
+            //   - claude --resume / codex --resume 长历史回放冲掉 shell echo
+            //   - 用户通过 shell wrapper、history 召回等路径启动 AI，
+            //     Layer 1 keystroke 缓冲未命中
+            //
+            // 代价：每 500ms 一次 `ps -A`，在典型桌面环境几 ms 级。
+            let proc_snapshot = snapshot_processes();
+
             for pty_id in &pty_ids {
+                // Layer 3：子进程名兜底（优先级最高，覆盖所有输出依赖场景）
+                if let Some(ref snapshot) = proc_snapshot {
+                    if let Some(shell_pid) = pty_manager.get_child_pid(*pty_id) {
+                        if let Some(provider) = detect_ai_in_subtree(snapshot, shell_pid) {
+                            pty_manager.force_ai_session(*pty_id, provider);
+                        }
+                    }
+                }
+
                 // ── Layer 2：进程级 banner 兜底检测 ──────────────────────────
                 //
-                // AI 会话检测采用双层架构：
+                // AI 会话检测采用三层架构：
                 //   Layer 1（fast path）：pty.rs 中的命令 echo / output_since_enter 解析。
                 //     优点：快（毫秒级），能在 AI 响应前就更新状态。
                 //     弱点：依赖 shell echo 可被解析，上箭头/右箭头历史/自动补全
@@ -152,7 +264,7 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
                 //     优点：不依赖命令 echo，AI CLI 只要成功启动并输出 banner 就能被捕获。
                 //     代价：最多滞后 500ms（monitor 轮询间隔）。
                 //
-                // 两层缺一不可：Layer 1 保证快响应，Layer 2 保证最终一致性。
+                //   Layer 3（process truth，见上）：子进程树扫描。最稳，但仅 Unix。
                 pty_manager.try_reconcile_ai_from_banner(*pty_id);
 
                 let (is_ai, prov) = pty_manager.get_ai_session_info(*pty_id);

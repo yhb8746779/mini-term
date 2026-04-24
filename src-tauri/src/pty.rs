@@ -349,6 +349,34 @@ impl PtyManager {
         self.ai_providers.lock().unwrap().get(&pty_id).cloned()
     }
 
+    /// PTY 直接子进程（shell）的 OS 级 PID，供 Layer 3 子进程扫描使用。
+    /// 返回 None 表示 PTY 已销毁或底层 Child 未暴露 pid。
+    pub fn get_child_pid(&self, pty_id: u32) -> Option<u32> {
+        let instances = self.instances.lock().unwrap();
+        instances.get(&pty_id).and_then(|inst| inst.child.process_id())
+    }
+
+    /// Layer 3（进程级真相）：由 process_monitor 调用，一旦在 PTY 子进程树里
+    /// 发现了 AI CLI 进程（claude / codex / gemini / grok），强制建立/纠正会话。
+    ///
+    /// 与 Layer 1/2 的关系：
+    /// - 不依赖终端输出，对 MCP 错误刷屏、--resume 长历史回放等场景免疫；
+    /// - 优先级最高：provider 不一致时直接覆盖（OS 级进程是最强真相）。
+    pub fn force_ai_session(&self, pty_id: u32, provider: &str) {
+        let need_update = {
+            let sessions = self.ai_sessions.lock().unwrap();
+            let providers = self.ai_providers.lock().unwrap();
+            !sessions.contains(&pty_id)
+                || providers.get(&pty_id).map(|s| s.as_str()) != Some(provider)
+        };
+        if need_update {
+            let mut sessions = self.ai_sessions.lock().unwrap();
+            let mut providers = self.ai_providers.lock().unwrap();
+            sessions.insert(pty_id);
+            providers.insert(pty_id, provider.to_string());
+        }
+    }
+
     /// 返回近期输出窗口的原始内容（含 ANSI 转义），供 process_monitor 做 awaiting-input 检测
     pub fn get_recent_output_window(&self, pty_id: u32) -> String {
         self.recent_output_window.lock().unwrap()
