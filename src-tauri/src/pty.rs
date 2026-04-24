@@ -61,6 +61,11 @@ fn detect_provider_from_banner(raw_output: &str) -> Option<&'static str> {
         if lower.contains("welcome to gemini") {
             return Some("gemini");
         }
+        // Grok CLI (xAI) 启动 banner — 暂以通用关键词占位，拿到实际 banner 后再收紧。
+        // Layer 3（子进程名扫描）通常会先于 banner 检测生效，即使此处漏判也不影响识别。
+        if lower.contains("welcome to grok") || lower.contains("xai grok") {
+            return Some("grok");
+        }
     }
     None
 }
@@ -168,7 +173,7 @@ struct PtyInstance {
     child: Box<dyn Child + Send + Sync>,
 }
 
-const AI_COMMANDS: &[&str] = &["claude", "codex", "gemini"];
+const AI_COMMANDS: &[&str] = &["claude", "codex", "gemini", "grok"];
 
 /// 这些标志表示非交互命令（仅输出信息后退出），不应触发 AI 会话状态
 const NON_INTERACTIVE_FLAGS: &[&str] = &[

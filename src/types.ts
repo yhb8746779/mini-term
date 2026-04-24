@@ -67,7 +67,7 @@ export interface SavedProjectLayout {
 
 // === 运行时状态 ===
 
-export type AiProvider = 'claude' | 'codex' | 'gemini';
+export type AiProvider = 'claude' | 'codex' | 'gemini' | 'grok';
 
 export type PaneStatus = 'idle' | 'ai-complete' | 'ai-thinking' | 'ai-generating' | 'ai-awaiting-input' | 'error';
 

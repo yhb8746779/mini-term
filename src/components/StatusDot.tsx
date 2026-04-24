@@ -5,6 +5,7 @@ const PROVIDER_COLORS: Record<AiProvider, { complete: string; generating: string
   claude: { complete: '#d98b3a', generating: '#f2a65a' },
   codex:  { complete: '#2f89c5', generating: '#4db6ff' },
   gemini: { complete: '#2ea56b', generating: '#45c486' },
+  grok:   { complete: '#a855f7', generating: '#c084fc' },
 };
 
 const WARN_COLOR = '#f5c518';

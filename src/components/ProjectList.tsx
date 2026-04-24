@@ -113,9 +113,9 @@ export function ProjectList() {
   const PROVIDER_STATUS_PRIORITY: Record<PaneStatus, number> = {
     error: 5, 'ai-awaiting-input': 4, 'ai-generating': 3, 'ai-thinking': 2, 'ai-complete': 1, idle: 0,
   };
-  const PROVIDER_ORDER: AiProvider[] = ['claude', 'codex', 'gemini'];
+  const PROVIDER_ORDER: AiProvider[] = ['claude', 'codex', 'gemini', 'grok'];
 
-  // 返回项目内各 provider 的最高优先级状态（固定顺序：claude > codex > gemini）
+  // 返回项目内各 provider 的最高优先级状态（固定顺序：claude > codex > gemini > grok）
   const getProjectStatusSummary = (projectId: string): { provider: AiProvider; status: Exclude<PaneStatus, 'idle'> }[] => {
     const ps = projectStates.get(projectId);
     if (!ps || ps.tabs.length === 0) return [];

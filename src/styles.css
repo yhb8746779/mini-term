@@ -49,6 +49,8 @@
   --color-codex-generating: #4db6ff;
   --color-gemini-complete: #2ea56b;
   --color-gemini-generating: #45c486;
+  --color-grok-complete: #a855f7;
+  --color-grok-generating: #c084fc;
   --color-warn: #f5c518;
 
   /* Sizing */
