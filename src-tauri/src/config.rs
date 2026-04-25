@@ -61,6 +61,10 @@ pub struct AppConfig {
     pub ai_completion_taskbar_flash: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vscode_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_font_preset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_custom_font_family: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +168,8 @@ impl Default for AppConfig {
             ai_completion_popup: default_ai_completion_popup(),
             ai_completion_taskbar_flash: default_ai_completion_taskbar_flash(),
             vscode_path: None,
+            terminal_font_preset: None,
+            terminal_custom_font_family: None,
         }
     }
 }

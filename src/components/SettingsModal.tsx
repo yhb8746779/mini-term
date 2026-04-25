@@ -6,7 +6,7 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
 import { checkForUpdate, compareVersions, type ReleaseInfo } from '../utils/updateChecker';
 import { applyTheme } from '../utils/themeManager';
-import { updateAllTerminalThemes } from '../utils/terminalCache';
+import { updateAllTerminalThemes, updateAllTerminalFonts, FONT_PRESET_OPTIONS } from '../utils/terminalCache';
 import type { ShellConfig } from '../types';
 
 interface Props {
@@ -390,6 +390,24 @@ function SystemSettings() {
     invoke('save_config', { config: newConfig });
   }, [setConfig]);
 
+  const handleTerminalFontPresetChange = useCallback((preset: string) => {
+    const cur = useAppStore.getState().config;
+    const newConfig = { ...cur, terminalFontPreset: preset };
+    setConfig(newConfig);
+    updateAllTerminalFonts(preset, newConfig.terminalCustomFontFamily);
+    invoke('save_config', { config: newConfig });
+  }, [setConfig]);
+
+  const handleTerminalCustomFontChange = useCallback((value: string) => {
+    const cur = useAppStore.getState().config;
+    const newConfig = { ...cur, terminalCustomFontFamily: value };
+    setConfig(newConfig);
+    if ((cur.terminalFontPreset ?? 'system') === 'custom') {
+      updateAllTerminalFonts('custom', value);
+    }
+    invoke('save_config', { config: newConfig });
+  }, [setConfig]);
+
   return (
     <div className="space-y-6">
       {/* 主题模式 */}
@@ -534,6 +552,42 @@ function SystemSettings() {
       <div className="pt-3 text-sm text-[var(--text-muted)]">
         界面字体影响侧栏、标签页等 UI 元素 · 终端字体影响终端内文字显示
       </div>
+
+      <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2 mt-6">
+        终端字体
+      </div>
+
+      <div className="px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] mb-3 space-y-2">
+        <div className="text-base text-[var(--text-primary)]">字体方案</div>
+        <div className="text-sm text-[var(--text-muted)]">
+          切换主字体；本机未安装的字体会自动回退。Powerline / 状态栏图标的 Nerd Font 兜底始终生效。
+        </div>
+        <select
+          className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1.5 text-base outline-none focus:border-[var(--accent)]"
+          value={config.terminalFontPreset ?? 'system'}
+          onChange={(e) => handleTerminalFontPresetChange(e.target.value)}
+        >
+          {FONT_PRESET_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>{opt.label}</option>
+          ))}
+        </select>
+      </div>
+
+      {(config.terminalFontPreset ?? 'system') === 'custom' && (
+        <div className="px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] mb-3 space-y-2">
+          <div className="text-base text-[var(--text-primary)]">自定义字体</div>
+          <div className="text-sm text-[var(--text-muted)]">
+            可填多个字体（逗号分隔），按顺序回退。例如：<span className="font-mono">Cascadia Mono, JetBrains Mono</span>
+          </div>
+          <input
+            type="text"
+            className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono"
+            placeholder="Cascadia Mono, JetBrains Mono"
+            value={config.terminalCustomFontFamily ?? ''}
+            onChange={(e) => handleTerminalCustomFontChange(e.target.value)}
+          />
+        </div>
+      )}
     </div>
   );
 }

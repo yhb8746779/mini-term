@@ -360,6 +360,8 @@ export const useAppStore = create<AppStore>((set) => ({
     terminalDisableWebgl: false,
     aiCompletionPopup: true,
     aiCompletionTaskbarFlash: true,
+    terminalFontPreset: 'system',
+    terminalCustomFontFamily: '',
   },
   setConfig: (config) => set({ config }),
 

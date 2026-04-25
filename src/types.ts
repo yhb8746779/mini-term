@@ -27,6 +27,8 @@ export interface AppConfig {
   aiCompletionPopup: boolean;
   aiCompletionTaskbarFlash: boolean;
   vscodePath?: string;
+  terminalFontPreset?: string;
+  terminalCustomFontFamily?: string;
 }
 
 export interface ProjectConfig {

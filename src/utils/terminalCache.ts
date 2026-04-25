@@ -104,6 +104,80 @@ function debugTerm(scope: string, payload: Record<string, unknown>) {
   console.info(`[mini-term-debug] ${scope}`, payload);
 }
 
+// 字体栈策略：
+//   1) 主字体（preset 决定）放在最前，xterm 首次测量 cell-width 一定命中 Latin 等宽字体，
+//      避免回退到 CJK 全角字体（PingFang SC 等）导致 cell 偏宽的"丑字距"现象。
+//   2) 系统等宽兜底：mac 优先 SFMono/Menlo、Win 优先 Consolas、Linux 优先 Liberation Mono。
+//   3) Nerd Font 兜底层：覆盖 Powerline/Devicons/Codicons 等 PUA 区图标
+//      （U+E000-U+F8FF, U+F0000+），用于 Powerlevel10k、claude/codex 状态栏等。
+//   4) CJK 回退字体放在最后，仅在遇到中文时生效，不参与 cell-width 测量。
+const SYSTEM_MONO = "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Cascadia Code', 'JetBrains Mono', 'Liberation Mono'";
+const NERD_FONTS = "'JetBrainsMono Nerd Font Mono', 'JetBrainsMonoNL Nerd Font Mono', 'JetBrainsMono Nerd Font', 'MesloLGS NF', 'FiraCode Nerd Font Mono', 'Hack Nerd Font Mono', 'CaskaydiaCove Nerd Font Mono', 'Symbols Nerd Font Mono'";
+const CJK_FALLBACK = "'PingFang SC', 'Hiragino Sans GB', 'Noto Sans Mono CJK SC', 'Microsoft YaHei Mono'";
+
+/** preset → 主字体（CSS family list 片段），不含 fallback */
+const FONT_PRESET_HEADS: Record<string, string> = {
+  system: '', // 不加额外主字体，直接走系统等宽栈
+  'cascadia-mono': "'Cascadia Mono', 'Cascadia Code'",
+  'cascadia-code': "'Cascadia Code', 'Cascadia Mono'",
+  'jetbrains-mono': "'JetBrains Mono'",
+  'jetbrains-mono-nf': "'JetBrainsMono Nerd Font Mono', 'JetBrainsMono Nerd Font'",
+  'fira-code': "'Fira Code', 'FiraCode Nerd Font Mono'",
+  'fira-mono': "'Fira Mono'",
+  'meslo-nf': "'MesloLGS NF', 'Meslo LG M'",
+  'hack': "'Hack', 'Hack Nerd Font Mono'",
+  'source-code-pro': "'Source Code Pro'",
+  'ibm-plex-mono': "'IBM Plex Mono'",
+  'consolas': "Consolas",
+  'menlo': "Menlo",
+  'sf-mono': "'SF Mono', SFMono-Regular",
+};
+
+export const FONT_PRESET_OPTIONS: { value: string; label: string }[] = [
+  { value: 'system', label: '系统默认（跨平台）' },
+  { value: 'cascadia-mono', label: 'Cascadia Mono（Windows Terminal 默认）' },
+  { value: 'cascadia-code', label: 'Cascadia Code（连字版）' },
+  { value: 'jetbrains-mono', label: 'JetBrains Mono' },
+  { value: 'jetbrains-mono-nf', label: 'JetBrainsMono Nerd Font' },
+  { value: 'fira-code', label: 'Fira Code' },
+  { value: 'fira-mono', label: 'Fira Mono' },
+  { value: 'meslo-nf', label: 'MesloLGS NF' },
+  { value: 'hack', label: 'Hack' },
+  { value: 'source-code-pro', label: 'Source Code Pro' },
+  { value: 'ibm-plex-mono', label: 'IBM Plex Mono' },
+  { value: 'consolas', label: 'Consolas' },
+  { value: 'menlo', label: 'Menlo（macOS）' },
+  { value: 'sf-mono', label: 'SF Mono（macOS）' },
+  { value: 'custom', label: '自定义…' },
+];
+
+/** 解析最终 fontFamily，组装 [head, system_mono, nerd, cjk?, monospace] */
+export function resolveFontFamily(preset?: string, custom?: string): string {
+  const key = preset ?? 'system';
+  let head = '';
+  if (key === 'custom') {
+    const c = (custom ?? '').trim();
+    if (c) {
+      // 用户输入按逗号切分，自动加单引号（多字未加引号时）
+      head = c.split(',').map(s => {
+        const t = s.trim().replace(/^['"]|['"]$/g, '');
+        if (!t) return '';
+        return /\s/.test(t) && !/^['"]/.test(t) ? `'${t}'` : t;
+      }).filter(Boolean).join(', ');
+    }
+  } else {
+    head = FONT_PRESET_HEADS[key] ?? '';
+  }
+
+  const parts: string[] = [];
+  if (head) parts.push(head);
+  parts.push(SYSTEM_MONO);
+  parts.push(NERD_FONTS);
+  if (!FORCE_MONO_ONLY) parts.push(CJK_FALLBACK);
+  parts.push('monospace');
+  return parts.join(', ');
+}
+
 export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   const existing = cache.get(ptyId);
   if (existing) return existing;
@@ -113,22 +187,11 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   wrapper.style.width = '100%';
   wrapper.style.height = '100%';
 
-  // 字体栈策略：
-  //   1) 系统自带的等宽字体放在最前（macOS=Menlo/SF Mono，Windows=Consolas，Linux=Liberation/DejaVu）。
-  //      这样 xterm 首次测量 cell-width 一定命中 Latin 等宽字体，避免回退到 CJK 全角
-  //      字体（PingFang SC 等）导致 cell 偏宽、字符间留大空隙的"丑字距"现象。
-  //   2) 用户装了第三方等宽字体（JetBrains Mono / Cascadia Code）作为可选升级。
-  //   3) Nerd Font 兜底层：覆盖 Powerline/Devicons/Codicons 等 PUA 区图标
-  //      （U+E000-U+F8FF, U+F0000+），用于 Powerlevel10k、claude/codex 状态栏等。
-  //      放在常规等宽字体之后，Latin 仍走系统字体保持 cell-width 稳定，仅 PUA fallback。
-  //   4) CJK 回退字体放在最后，仅在遇到中文时生效，不参与 cell-width 测量。
-  const NERD_FONTS = "'JetBrainsMono Nerd Font Mono', 'JetBrainsMonoNL Nerd Font Mono', 'JetBrainsMono Nerd Font', 'MesloLGS NF', 'FiraCode Nerd Font Mono', 'Hack Nerd Font Mono', 'CaskaydiaCove Nerd Font Mono', 'Symbols Nerd Font Mono'";
-  const fontFamily = FORCE_MONO_ONLY
-    ? `ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Cascadia Code', 'JetBrains Mono', 'Liberation Mono', ${NERD_FONTS}, monospace`
-    : `ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Cascadia Code', 'JetBrains Mono', 'Liberation Mono', ${NERD_FONTS}, 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans Mono CJK SC', 'Microsoft YaHei Mono', monospace`;
+  const cfg = useAppStore.getState().config;
+  const fontFamily = resolveFontFamily(cfg.terminalFontPreset, cfg.terminalCustomFontFamily);
 
   const term = new Terminal({
-    fontSize: useAppStore.getState().config.terminalFontSize ?? 14,
+    fontSize: cfg.terminalFontSize ?? 14,
     // CJK 备用字体：PingFang SC（macOS）/ Noto Sans Mono CJK SC（Linux）/ Microsoft YaHei（Windows）
     // 确保中文字符有合适的字形，避免宽度计算与实际渲染不一致导致乱码
     fontFamily,
@@ -299,6 +362,20 @@ export function updateAllTerminalThemes(terminalFollowTheme: boolean): void {
   const theme = getTerminalTheme(terminalFollowTheme);
   for (const entry of cache.values()) {
     entry.term.options.theme = theme;
+  }
+}
+
+/** 切换终端字体 preset / 自定义字体后，刷新所有已开启终端 */
+export function updateAllTerminalFonts(preset?: string, custom?: string): void {
+  const fontFamily = resolveFontFamily(preset, custom);
+  for (const entry of cache.values()) {
+    entry.term.options.fontFamily = fontFamily;
+    // 字体变更后字符宽高重新测量，必须重新 fit 一次保证 row/col 正确
+    try {
+      entry.fitAddon.fit();
+    } catch {
+      // 某些情况下 wrapper 还未挂载到 DOM，忽略
+    }
   }
 }
 
