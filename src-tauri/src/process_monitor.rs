@@ -133,10 +133,13 @@ fn detect_awaiting_input(raw_output: &str) -> bool {
     false
 }
 
-/// 系统进程快照条目：(pid, ppid, 去路径的 comm 名)
-type ProcEntry = (u32, u32, String);
+/// 系统进程快照条目：(pid, ppid, 去路径的 comm 名, 可选的小写命令行)
+/// - 命令行：Windows 用 sysinfo 填充（小写化，argv 以空格 join），用于识别
+///   node.exe 这类启动器进程里跑的具体 AI CLI（gemini-cli / codex.js 等）；
+///   Unix 上保持 None，进程名本身就足够精确（gemini / codex 都是原生二进制）。
+type ProcEntry = (u32, u32, String, Option<String>);
 
-/// 抓一次系统进程列表。Unix 调 `ps -A`，Windows 调 ToolHelp32 快照 API。
+/// 抓一次系统进程列表。Unix 调 `ps -A`，Windows 用 sysinfo（含命令行）。
 #[cfg(unix)]
 fn snapshot_processes() -> Option<Vec<ProcEntry>> {
     use std::process::Command;
@@ -166,59 +169,60 @@ fn snapshot_processes() -> Option<Vec<ProcEntry>> {
         }
         // ps 在部分系统上输出含路径（如 "/usr/bin/node"），取 basename
         let base = comm.rsplit(&['/', '\\'][..]).next().unwrap_or(&comm).to_string();
-        result.push((pid, ppid, base));
+        result.push((pid, ppid, base, None));
     }
     Some(result)
 }
 
-/// Windows 实现：用 ToolHelp32 API 枚举全系统进程，返回 (pid, ppid, exe_name)。
-/// 代价与 Unix `ps -A` 相当，几 ms 级。
+/// Windows 实现：用 sysinfo 枚举所有进程，并收集每个进程的命令行。
+///
+/// 为什么不用 ToolHelp32：ToolHelp32 只给 szExeFile（进程名），无法识别
+/// `node.exe` 这种启动器进程里跑的具体脚本（如 gemini-cli）。gemini CLI
+/// 是纯 npm 包，Windows 上进程表里只有 node.exe，必须读命令行 argv 才能
+/// 判断它跑的是 gemini 还是其他任意 node 程序。
+///
+/// 代价：sysinfo 内部对每个进程读 PEB + ReadProcessMemory 取命令行，
+/// 大约 10-30ms 一次全量扫描；每 500ms 一次，对 CPU 压力很小。
 #[cfg(windows)]
 fn snapshot_processes() -> Option<Vec<ProcEntry>> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
-        PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-    };
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-    let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.ok()?;
+    let mut sys = System::new();
+    // 显式启用 cmd / exe 字段刷新。sysinfo 0.32 默认 refresh_processes 不一定拉命令行
+    // （实测 Windows 下 process.cmd() 返回空），必须用 specifics + UpdateKind::Always。
+    let refresh_kind = ProcessRefreshKind::new()
+        .with_cmd(UpdateKind::Always)
+        .with_exe(UpdateKind::Always);
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
 
-    let mut entry = PROCESSENTRY32W {
-        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-        ..Default::default()
-    };
+    let mut result: Vec<ProcEntry> = Vec::with_capacity(sys.processes().len());
+    for (pid, process) in sys.processes() {
+        let pid_u32 = pid.as_u32();
+        let ppid = process.parent().map(|p| p.as_u32()).unwrap_or(0);
 
-    let mut result = Vec::with_capacity(256);
-
-    unsafe {
-        if Process32FirstW(handle, &mut entry).is_err() {
-            let _ = CloseHandle(handle);
-            return None;
+        let name = process.name().to_string_lossy();
+        if name.is_empty() {
+            continue;
         }
+        // 取 basename，对齐 Unix 版
+        let base = name.rsplit(&['/', '\\'][..]).next().unwrap_or(&name).to_string();
 
-        loop {
-            let pid = entry.th32ProcessID;
-            let ppid = entry.th32ParentProcessID;
-            // szExeFile 是 null-terminated UTF-16，只含文件名（如 "claude.exe"），不含路径
-            let nul_pos = entry.szExeFile.iter().position(|&c| c == 0)
-                .unwrap_or(entry.szExeFile.len());
-            let exe_name = String::from_utf16_lossy(&entry.szExeFile[..nul_pos]);
+        // 收集命令行：argv 以空格 join，整体转小写便于匹配
+        let cmd = process.cmd();
+        let cmdline = if cmd.is_empty() {
+            None
+        } else {
+            let joined: String = cmd
+                .iter()
+                .map(|s| s.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            Some(joined)
+        };
 
-            if !exe_name.is_empty() {
-                // 与 Unix 版保持一致：取 basename（szExeFile 通常已经是纯文件名）
-                let base = exe_name.rsplit(&['/', '\\'][..])
-                    .next().unwrap_or(&exe_name).to_string();
-                result.push((pid, ppid, base));
-            }
-
-            if Process32NextW(handle, &mut entry).is_err() {
-                break;
-            }
-        }
-
-        let _ = CloseHandle(handle);
+        result.push((pid_u32, ppid, base, cmdline));
     }
-
     Some(result)
 }
 
@@ -227,8 +231,52 @@ fn snapshot_processes() -> Option<Vec<ProcEntry>> {
     None
 }
 
+/// 从 node.exe / cmd.exe / pwsh.exe 等启动器进程的命令行中识别跑的是哪家 AI CLI。
+/// 参数 `cmdline` 必须已是小写（snapshot 已做），用裸 `contains` 匹配即可。
+///
+/// 匹配的是 npm 包路径特征，而非随意字符串，避免 "我提到 gemini" 之类的误触发。
+fn detect_ai_from_cmdline(cmdline: &str) -> Option<&'static str> {
+    // Gemini：Windows 下只有这条路径可达（无原生 gemini.exe）
+    if cmdline.contains("@google/gemini-cli")
+        || cmdline.contains("/gemini-cli/")
+        || cmdline.contains("\\gemini-cli\\")
+        || cmdline.contains("/gemini.js")
+        || cmdline.contains("\\gemini.js")
+    {
+        return Some("gemini");
+    }
+    // Codex：虽然 Windows 有原生 codex.exe，但启动链中的 node wrapper 阶段仍需兜底
+    if cmdline.contains("@openai/codex")
+        || cmdline.contains("/codex.js")
+        || cmdline.contains("\\codex.js")
+    {
+        return Some("codex");
+    }
+    // Claude Code：Windows 有原生 claude.exe shim，但 npm 全局某些版本仍走 node 路径
+    if cmdline.contains("@anthropic-ai/claude-code")
+        || cmdline.contains("/claude-code/")
+        || cmdline.contains("\\claude-code\\")
+    {
+        return Some("claude");
+    }
+    // Grok 预留：目前 grok CLI 形态未定，先留命令行兜底钩子
+    if cmdline.contains("/grok-cli")
+        || cmdline.contains("\\grok-cli")
+        || cmdline.contains("/grok.js")
+        || cmdline.contains("\\grok.js")
+    {
+        return Some("grok");
+    }
+    None
+}
+
 /// 在进程快照中，从 root_pid 做 BFS，找到任意 comm 匹配 AI CLI 名字的后代。
 /// 返回第一个匹配的 provider 名（稳定字符串切片）。
+///
+/// 两级匹配：
+/// 1. 进程名直接匹配（claude.exe / codex.exe / gemini / grok）—— 覆盖原生二进制
+/// 2. node.exe / cmd.exe / pwsh.exe 等启动器进程 + 命令行参数匹配 npm 包名 ——
+///    覆盖 Windows 下 gemini-cli 这类"只有 node.exe 没有原生 exe"的场景
 fn detect_ai_in_subtree(snapshot: &[ProcEntry], root_pid: u32) -> Option<&'static str> {
     // 构建 ppid -> children 索引
     let mut by_ppid: HashMap<u32, Vec<usize>> = HashMap::new();
@@ -245,13 +293,20 @@ fn detect_ai_in_subtree(snapshot: &[ProcEntry], root_pid: u32) -> Option<&'stati
         }
         if let Some(child_idxs) = by_ppid.get(&pid) {
             for &idx in child_idxs {
-                let (child_pid, _, comm) = &snapshot[idx];
+                let (child_pid, _, comm, cmdline) = &snapshot[idx];
                 let lower = comm.to_lowercase();
                 // 去掉常见扩展名，如 windows 上的 .exe
                 let stem = lower.trim_end_matches(".exe");
                 for &ai in AI_SUBPROCESS_NAMES {
                     if stem == ai {
                         return Some(ai_to_static(ai));
+                    }
+                }
+                // 命令行兜底：进程名没直接命中时（node.exe / cmd.exe / pwsh.exe 等），
+                // 检查命令行参数是否含 npm 包路径特征。Unix 上 cmdline=None，跳过。
+                if let Some(cmd) = cmdline {
+                    if let Some(provider) = detect_ai_from_cmdline(cmd) {
+                        return Some(provider);
                     }
                 }
                 queue.push(*child_pid);

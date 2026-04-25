@@ -1,6 +1,6 @@
 [package]
 name = "tauri-app"
-version = "0.2.35"
+version = "0.2.36"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -46,3 +46,7 @@ windows = { version = "0.58", features = [
   "Win32_System_Memory",
   "Win32_Graphics_Gdi",
 ] }
+# Layer 3 需要读 node.exe 这类启动器的命令行来识别 gemini / node 版 codex / claude-code 等
+# npm 包型 AI CLI（进程名是 node.exe，无法靠 szExeFile 匹配）。sysinfo 封装了 NtQueryInformationProcess
+# + PEB ReadProcessMemory 读 CommandLine 的所有细节，省去手写非公开 API。
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }

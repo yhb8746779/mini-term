@@ -57,9 +57,19 @@ fn detect_provider_from_banner(raw_output: &str) -> Option<&'static str> {
         if lower.contains(">_ openai codex") {
             return Some("codex");
         }
-        // Gemini CLI (Google) 启动 banner
-        if lower.contains("welcome to gemini") {
+        // Gemini CLI (Google) 启动 banner：
+        // - v0.x 新版："Gemini CLI v0.39.1" / "Gemini CLI v1.x"
+        // - 旧版："Welcome to Gemini"
+        // 用 "gemini cli v" 覆盖 0.x/1.x 所有版本，比 "welcome to gemini" 更稳定。
+        if lower.contains("gemini cli v") || lower.contains("welcome to gemini") {
             return Some("gemini");
+        }
+        // 无空格形式：ANSI 光标定位可能让 "Gemini CLI v0.39" 变成 "geminicliv..."
+        {
+            let no_space: String = lower.split_whitespace().collect();
+            if no_space.contains("geminicliv") || no_space.contains("welcometogemini") {
+                return Some("gemini");
+            }
         }
         // 注意：Grok 没有加 banner 模式。拿不到高置信度短语时硬加会误伤 —
         // 用户 claude --resume 回放长历史里提到 "xAI" / "grok" 会把 provider 错判为 grok。
@@ -1556,6 +1566,25 @@ mod tests {
         mgr.inject_banner_output(1, "Welcome to Gemini CLI\n");
         mgr.try_reconcile_ai_from_banner(1);
         assert!(mgr.is_ai_session(1));
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("gemini"));
+    }
+
+    #[test]
+    fn banner_reconcile_detects_gemini_cli_v039_new_banner() {
+        // Gemini CLI v0.39 启动 banner 不再含 "Welcome to Gemini"，改成 "Gemini CLI v0.39.1"
+        let mgr = PtyManager::new();
+        mgr.inject_banner_output(1, " \u{25DD}\u{25DC}\u{25C4}     Gemini CLI v0.39.1\n");
+        mgr.try_reconcile_ai_from_banner(1);
+        assert!(mgr.is_ai_session(1));
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("gemini"));
+    }
+
+    #[test]
+    fn banner_reconcile_detects_gemini_cli_future_versions() {
+        // "Gemini CLI v" 前缀应覆盖 0.x / 1.x / 2.x 等后续版本
+        let mgr = PtyManager::new();
+        mgr.inject_banner_output(1, "Gemini CLI v1.2.3\n");
+        mgr.try_reconcile_ai_from_banner(1);
         assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("gemini"));
     }
 
