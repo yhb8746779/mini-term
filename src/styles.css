@@ -42,16 +42,17 @@
   --color-error-muted: rgba(212, 96, 90, 0.15);
   --shadow-overlay: 0 8px 32px rgba(0,0,0,0.5), 0 0 1px rgba(255,255,255,0.05);
 
-  /* AI Provider 状态颜色 */
-  --color-claude-complete: #d98b3a;
-  --color-claude-generating: #f2a65a;
-  --color-codex-complete: #2f89c5;
-  --color-codex-generating: #4db6ff;
-  --color-gemini-complete: #2ea56b;
-  --color-gemini-generating: #45c486;
-  --color-grok-complete: #a855f7;
-  --color-grok-generating: #c084fc;
-  --color-warn: #f5c518;
+  /* AI Provider 身份色（每个 provider 一个颜色，不再区分 complete/generating）。
+     status 通过动效 + 亮度 (color-mix) 表达，与身份解耦。
+     渲染规则在 StatusDot.tsx：
+       - ai-complete / ai-thinking：直接用 base 色
+       - ai-generating：base 色加白 25%（亮度替代显式 generating 色）
+       - ai-awaiting-input：base 色 ↔ 警告黄交替闪烁 */
+  --color-claude: #d98b3a;
+  --color-codex:  #2f89c5;
+  --color-gemini: #2ea56b;
+  --color-grok:   #a855f7;
+  --color-warn:   #f5c518;
 
   /* Sizing */
   --radius-sm: 4px;
@@ -182,6 +183,13 @@ html, body, #root {
   50% { opacity: 0.2; transform: scale(0.75); }
 }
 
+/* StatusDot 的 ai-thinking 用：温和的呼吸节奏，比 alertBlink 不抢眼，
+   表达"AI 在思考/工具调用，仍在工作"的稳态。 */
+@keyframes pulseSlow {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+
 @keyframes slideIn {
   from { opacity: 0; transform: scale(0.96); }
   to { opacity: 1; transform: scale(1); }
@@ -195,8 +203,8 @@ html, body, #root {
   animation: alertBlink 0.8s ease-in-out infinite;
 }
 
-.animate-blink-slow {
-  animation: alertBlink 1.4s ease-in-out infinite;
+.animate-pulse-slow {
+  animation: pulseSlow 1.8s ease-in-out infinite;
 }
 
 .animate-slide-in {

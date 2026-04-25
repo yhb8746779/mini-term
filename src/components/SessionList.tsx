@@ -39,12 +39,12 @@ function formatTime(iso: string): string {
 }
 
 // 与 StatusDot 保持一致：claude=橙、codex=蓝、gemini=绿、grok=紫。
-// 旧版曾用 --color-ai/--color-success 作为 badge 色，和状态点对不上，现已对齐。
+// Provider 身份色现在是 status-无关的单值变量（--color-{provider}），与 StatusDot 共用同一组源。
 const TYPE_BADGE: Record<string, { label: string; color: string }> = {
-  claude: { label: 'C', color: 'var(--color-claude-complete)' },
-  codex:  { label: 'X', color: 'var(--color-codex-complete)' },
-  gemini: { label: 'G', color: 'var(--color-gemini-complete)' },
-  grok:   { label: 'K', color: 'var(--color-grok-complete)' },
+  claude: { label: 'C', color: 'var(--color-claude)' },
+  codex:  { label: 'X', color: 'var(--color-codex)' },
+  gemini: { label: 'G', color: 'var(--color-gemini)' },
+  grok:   { label: 'K', color: 'var(--color-grok)' },
 };
 
 export function SessionList() {
