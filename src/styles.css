@@ -190,6 +190,13 @@ html, body, #root {
   50%      { opacity: 0.55; }
 }
 
+/* StatusDot 的 ai-generating 用：节奏比 pulseSlow 快一倍，无 scale 跳动，
+   表达"AI 正在输出 token，节奏明显"。 */
+@keyframes pulseFast {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.4; }
+}
+
 @keyframes slideIn {
   from { opacity: 0; transform: scale(0.96); }
   to { opacity: 1; transform: scale(1); }
@@ -205,6 +212,10 @@ html, body, #root {
 
 .animate-pulse-slow {
   animation: pulseSlow 1.8s ease-in-out infinite;
+}
+
+.animate-pulse-fast {
+  animation: pulseFast 0.8s ease-in-out infinite;
 }
 
 .animate-slide-in {

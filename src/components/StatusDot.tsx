@@ -10,8 +10,10 @@ import type { PaneStatus, AiProvider } from '../types';
  * 维度 B — Status 活动，三种独立机制叠加在 base 色上：
  *   1) STATUS_OVERRIDES：idle/error 直接覆盖 base（脱离 provider 语义）
  *   2) GENERATING_BRIGHTEN：ai-generating 时把 base 色加白 25%（亮度替代动效）
- *   3) STATUS_ANIMATIONS：ai-thinking 用 pulse-slow 慢呼吸；
- *      ai-awaiting-input 走 React 定时器在 base 色 ↔ WARN 黄之间切换
+ *   3) STATUS_ANIMATIONS：
+ *      - ai-generating 用 pulse-fast 0.8s 快闪（节奏明显，表达正在输出 token）
+ *      - ai-thinking 用 pulse-slow 1.8s 慢呼吸（温和，表达稳态思考）
+ *      - ai-awaiting-input 走 React 定时器在 base 色 ↔ WARN 黄之间切换
  *
  * 任何 provider 改色只动 PROVIDER_COLORS（实际是动 styles.css 的 4 个变量）；
  * 任何状态改动效只动 STATUS_OVERRIDES / STATUS_ANIMATIONS / GENERATING_BRIGHTEN。
@@ -31,9 +33,10 @@ const STATUS_OVERRIDES: Partial<Record<PaneStatus, string>> = {
   error: 'var(--color-error)',
 };
 
-/** 仅 ai-thinking 走 CSS 动效（呼吸节奏）；其他 ai-* 状态用颜色/亮度变化表达 */
+/** 三档动效区分活动状态：generating=快闪 / thinking=慢呼吸 / awaiting=黄色切换（在组件内 React 定时器） */
 const STATUS_ANIMATIONS: Partial<Record<PaneStatus, string>> = {
-  'ai-thinking': 'animate-pulse-slow',
+  'ai-generating': 'animate-pulse-fast',
+  'ai-thinking':   'animate-pulse-slow',
 };
 
 /** ai-generating 时把 provider 色加白 25%，亮度替代动效，凸显"正在输出" */
