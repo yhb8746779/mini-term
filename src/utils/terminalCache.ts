@@ -118,10 +118,14 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   //      这样 xterm 首次测量 cell-width 一定命中 Latin 等宽字体，避免回退到 CJK 全角
   //      字体（PingFang SC 等）导致 cell 偏宽、字符间留大空隙的"丑字距"现象。
   //   2) 用户装了第三方等宽字体（JetBrains Mono / Cascadia Code）作为可选升级。
-  //   3) CJK 回退字体放在最后，仅在遇到中文时生效，不参与 cell-width 测量。
+  //   3) Nerd Font 兜底层：覆盖 Powerline/Devicons/Codicons 等 PUA 区图标
+  //      （U+E000-U+F8FF, U+F0000+），用于 Powerlevel10k、claude/codex 状态栏等。
+  //      放在常规等宽字体之后，Latin 仍走系统字体保持 cell-width 稳定，仅 PUA fallback。
+  //   4) CJK 回退字体放在最后，仅在遇到中文时生效，不参与 cell-width 测量。
+  const NERD_FONTS = "'JetBrainsMono Nerd Font Mono', 'JetBrainsMonoNL Nerd Font Mono', 'JetBrainsMono Nerd Font', 'MesloLGS NF', 'FiraCode Nerd Font Mono', 'Hack Nerd Font Mono', 'CaskaydiaCove Nerd Font Mono', 'Symbols Nerd Font Mono'";
   const fontFamily = FORCE_MONO_ONLY
-    ? "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Cascadia Code', 'JetBrains Mono', 'Liberation Mono', monospace"
-    : "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Cascadia Code', 'JetBrains Mono', 'Liberation Mono', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans Mono CJK SC', 'Microsoft YaHei Mono', monospace";
+    ? `ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Cascadia Code', 'JetBrains Mono', 'Liberation Mono', ${NERD_FONTS}, monospace`
+    : `ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Cascadia Code', 'JetBrains Mono', 'Liberation Mono', ${NERD_FONTS}, 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans Mono CJK SC', 'Microsoft YaHei Mono', monospace`;
 
   const term = new Terminal({
     fontSize: useAppStore.getState().config.terminalFontSize ?? 14,
