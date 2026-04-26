@@ -15,16 +15,13 @@ pub struct PtyStatusChangePayload {
     pub provider: Option<String>,
 }
 
-/// AI 流式输出的活跃窗口：距上次输出不超过此时间视为"正在输出"
+/// AI 在产出 token 的活跃窗口：与 busy signal 共同满足才视为 ai-generating
 const AI_GENERATING_WINDOW: Duration = Duration::from_secs(2);
-/// AI 静止超过此时间才视为"已完成"（避免将思考/工具调用/网络等待误判为完成）
-const AI_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
 /// AI TUI busy 信号（spinner 时长括号 / `esc to xxx`）的有效窗口。
 /// pty.rs reader 在每个 chunk 里实时扫，命中即刷新时间戳。
 /// 三家 spinner 计时器都至少每秒刷新一次（codex `Working (Ns)`、claude
 /// `Contemplating (Ns)`、gemini `(esc to cancel, Ns)` 的 N 都是秒级递增），
-/// 所以 5s 窗口足够维持"AI 仍在工作"判定；同时让 AI 完成回答后蓝点能快速
-/// 回归静止，避免长达数十秒的虚假呼吸。
+/// 5s 窗口足够维持"AI 仍在工作"判定；spinner 一旦从屏幕消失就立即视为 complete。
 const AI_BUSY_SIGNAL_WINDOW: Duration = Duration::from_secs(5);
 
 /// 强交互短语：出现即触发 ai-awaiting-input
@@ -393,21 +390,22 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
                 let (status, provider) = if is_ai {
                     let raw_window = pty_manager.get_recent_output_window(*pty_id);
 
+                    // 状态判定：以"屏幕上的 spinner busy 信号"为唯一 working 真相源，
+                    // 不再用单纯的字节流活跃度兜底。原因：gemini 等 CLI 在 idle 时
+                    // 仍会持续每秒重绘整个屏幕（cursor blink + footer 状态栏），
+                    // 让 has_recent_output(30s) 永远命中导致状态点常驻慢呼吸。
+                    let busy = pty_manager.has_recent_busy_signal(*pty_id, AI_BUSY_SIGNAL_WINDOW);
+                    let active = pty_manager.has_recent_output(*pty_id, AI_GENERATING_WINDOW);
                     let status = if detect_awaiting_input(&raw_window) {
-                        // 明确的用户交互提示 → awaiting-input（优先于 generating）
                         "ai-awaiting-input"
-                    } else if pty_manager.has_recent_output(*pty_id, AI_GENERATING_WINDOW) {
-                        // 2s 内有输出 → 正在流式输出
+                    } else if busy && active {
+                        // spinner 在屏幕上 + 2s 内 PTY 还在吐字节 → 真在输出 token
                         "ai-generating"
-                    } else if pty_manager.has_recent_busy_signal(*pty_id, AI_BUSY_SIGNAL_WINDOW) {
-                        // 屏幕仍在显示 spinner 时长括号 / `esc to xxx` → AI 仍在工作。
-                        // 用结构信号绕开 30s 字节静默阈值，三家通用（codex/claude/gemini）。
-                        "ai-thinking"
-                    } else if pty_manager.has_recent_output(*pty_id, AI_COMPLETE_TIMEOUT) {
-                        // 2~30s 静默 + 无 busy 信号 → 思考/工具调用/网络等待，仍在工作
+                    } else if busy {
+                        // spinner 在屏幕上 + 字节流暂停 → 思考/工具调用/网络等待
                         "ai-thinking"
                     } else {
-                        // 超过 30s 无输出且无 busy 信号 → AI 完成一轮，等待下一条指令
+                        // spinner 已不在屏幕（或从未出现）→ 完成一轮，等待下一条指令
                         "ai-complete"
                     };
                     (status, prov)

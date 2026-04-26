@@ -1004,22 +1004,8 @@ pub fn create_pty(
                     pty_state_for_output
                         .append_recent_output_window(pty_id_for_reader, &data);
 
-                    // AI busy 信号检测：spinner 时长括号 / `esc to xxx`
-                    // 命中即刷新时间戳，让 process_monitor 把状态保持在 ai-thinking
-                    // 即便后续字节流静默也不会被 30s 阈值错判为 ai-complete。
-                    // 须在 emit 之前做（emit 会 move data）。
+                    // AI busy 信号检测 + cooldown 判定（emit 前完成，否则 data 会被 move）
                     let busy_hit = chunk_has_busy_signal(&data);
-
-                    let _ = app_flush.emit("pty-output", PtyOutputPayload {
-                        pty_id: pty_id_for_reader, data,
-                    });
-
-                    // 冷却窗口内（刚 resize 过）的输出不刷新任何活跃时间戳。
-                    // TUI 在 resize/SIGWINCH 后会全屏重绘 alternate screen buffer，
-                    // 重绘字节里可能含 idle 屏幕底部的 `esc to xxx` 快捷键 hint，
-                    // 若不拦截会被 busy signal 误判为 AI 仍在工作。
-                    // 真在 working 时 spinner 字节会在 cooldown(800ms) 后继续刷新，
-                    // 不会丢失活跃状态。
                     let in_cooldown = pty_state_for_output
                         .resize_cooldown_until
                         .lock()
@@ -1036,6 +1022,10 @@ pub fn create_pty(
                             }
                         }
                     }
+
+                    let _ = app_flush.emit("pty-output", PtyOutputPayload {
+                        pty_id: pty_id_for_reader, data,
+                    });
                 }
 
                 if diag_last.elapsed() >= Duration::from_secs(5) || diag_lossy_flushes > 0 {
