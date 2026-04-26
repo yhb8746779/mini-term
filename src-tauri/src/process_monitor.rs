@@ -19,6 +19,13 @@ pub struct PtyStatusChangePayload {
 const AI_GENERATING_WINDOW: Duration = Duration::from_secs(2);
 /// AI 静止超过此时间才视为"已完成"（避免将思考/工具调用/网络等待误判为完成）
 const AI_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
+/// AI TUI busy 信号（spinner 时长括号 / `esc to xxx`）的有效窗口。
+/// pty.rs reader 在每个 chunk 里实时扫，命中即刷新时间戳。
+/// 三家 spinner 计时器都至少每秒刷新一次（codex `Working (Ns)`、claude
+/// `Contemplating (Ns)`、gemini `(esc to cancel, Ns)` 的 N 都是秒级递增），
+/// 所以 5s 窗口足够维持"AI 仍在工作"判定；同时让 AI 完成回答后蓝点能快速
+/// 回归静止，避免长达数十秒的虚假呼吸。
+const AI_BUSY_SIGNAL_WINDOW: Duration = Duration::from_secs(5);
 
 /// 强交互短语：出现即触发 ai-awaiting-input
 ///
@@ -47,7 +54,9 @@ const AWAITING_STRONG: &[&str] = &[
     "pick one",
     // "use arrow keys" 已移除：TUI 导航菜单中频繁出现，会导致 awaiting-input 误判
     "space to preview",
-    "esc to cancel",
+    // "esc to cancel" 已移除：gemini 在 working 态会显示 "(esc to cancel, 10s)"
+    // 表示"按 esc 中断当前思考"（与 codex 的 esc to interrupt 同义），
+    // 是 busy 提示而非等待用户输入；交给 chunk_has_busy_signal 处理为 ai-thinking。
     "ctrl+a to",
     "ctrl+b to",
     // 布尔选择提示
@@ -390,11 +399,15 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
                     } else if pty_manager.has_recent_output(*pty_id, AI_GENERATING_WINDOW) {
                         // 2s 内有输出 → 正在流式输出
                         "ai-generating"
+                    } else if pty_manager.has_recent_busy_signal(*pty_id, AI_BUSY_SIGNAL_WINDOW) {
+                        // 屏幕仍在显示 spinner 时长括号 / `esc to xxx` → AI 仍在工作。
+                        // 用结构信号绕开 30s 字节静默阈值，三家通用（codex/claude/gemini）。
+                        "ai-thinking"
                     } else if pty_manager.has_recent_output(*pty_id, AI_COMPLETE_TIMEOUT) {
-                        // 2~30s 静默 → 思考/工具调用/网络等待，仍在工作
+                        // 2~30s 静默 + 无 busy 信号 → 思考/工具调用/网络等待，仍在工作
                         "ai-thinking"
                     } else {
-                        // 超过 30s 无输出 → AI 完成一轮，等待下一条指令
+                        // 超过 30s 无输出且无 busy 信号 → AI 完成一轮，等待下一条指令
                         "ai-complete"
                     };
                     (status, prov)
@@ -421,3 +434,4 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
         }
     });
 }
+

@@ -307,6 +307,87 @@ fn output_contains_ai_command(output: &str) -> bool {
     detect_provider_from_output(output).is_some()
 }
 
+/// 检测 PTY chunk 中是否含 AI TUI 的 "busy" 结构信号。
+///
+/// 用于解决 `ai-complete` 误判：codex/claude 在长网络等待时 PTY 字节流可能
+/// 静默 >30s，但屏幕上仍显示 "Working (Ns • esc to interrupt)" 类提示。
+/// 用结构特征（不依赖具体动词词典），覆盖三家：
+///   - Codex   `Working (2s • esc to interrupt)`
+///   - Claude  `Contemplating… (24s · ↑ 1.1k tokens · still thinking)`
+///   - Gemini  `⋮ Defining the Constraints (esc to cancel, 10s)`
+///
+/// 信号 1 — 时长括号：`(...Ns...)`，前/后允许空白和 `( , · • )` 任一分隔符
+/// 信号 2 — 中断提示：`esc to <字母>`（不区分大小写），覆盖 interrupt/cancel/abort/...
+fn chunk_has_busy_signal(data: &str) -> bool {
+    has_esc_to_pattern(data) || has_seconds_marker(data)
+}
+
+fn has_esc_to_pattern(data: &str) -> bool {
+    let bytes = data.as_bytes();
+    let needle = b"esc to ";
+    if bytes.len() <= needle.len() { return false; }
+    let max = bytes.len() - needle.len();
+    'outer: for i in 0..=max {
+        for j in 0..needle.len() {
+            let c = bytes[i + j];
+            let lc = if c.is_ascii_uppercase() { c | 0x20 } else { c };
+            if lc != needle[j] { continue 'outer; }
+        }
+        // 后面紧跟 ASCII 字母（防止 "esc to " 后接标点空字符串误命中）
+        if let Some(&next) = bytes.get(i + needle.len()) {
+            if next.is_ascii_alphabetic() { return true; }
+        }
+    }
+    false
+}
+
+/// 找形如 `(2s •` / `(24s ·` / `, 10s)` 的时长标记。
+/// 数字前后必须紧靠分隔符（避免 `tools` 里的 `s` 或随机数字串误匹配）。
+/// 分隔符候选：`(` `,` `·` (UTF-8 0xC2 0xB7) `•` (UTF-8 0xE2 0x80 0xA2) 空白 行首/末
+fn has_seconds_marker(data: &str) -> bool {
+    let bytes = data.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let num_start = i;
+        while i < len && bytes[i].is_ascii_digit() { i += 1; }
+        // 数字后必须紧跟 's'
+        if i >= len || bytes[i] != b's' { continue; }
+        let s_pos = i;
+        i = s_pos + 1;
+        // 's' 后必须是分隔符或 chunk 末尾
+        let after_ok = match bytes.get(s_pos + 1) {
+            None => true,
+            Some(&c) => is_break_byte(c)
+                || (c == 0xC2 && bytes.get(s_pos + 2) == Some(&0xB7))
+                || (c == 0xE2 && bytes.get(s_pos + 2) == Some(&0x80) && bytes.get(s_pos + 3) == Some(&0xA2)),
+        };
+        if !after_ok { continue; }
+        // 数字前（跳过空白后）必须是分隔符或 chunk 开头
+        let mut k = num_start;
+        while k > 0 && (bytes[k - 1] == b' ' || bytes[k - 1] == b'\t') { k -= 1; }
+        let before_ok = if k == 0 {
+            true
+        } else {
+            let pc = bytes[k - 1];
+            matches!(pc, b'(' | b',' | b'\n' | b'\r')
+                || (k >= 2 && bytes[k - 2] == 0xC2 && pc == 0xB7)
+                || (k >= 3 && bytes[k - 3] == 0xE2 && bytes[k - 2] == 0x80 && pc == 0xA2)
+        };
+        if before_ok { return true; }
+    }
+    false
+}
+
+#[inline]
+fn is_break_byte(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b')' | b',' | b'\n' | b'\r')
+}
+
 #[derive(Clone)]
 pub struct PtyManager {
     instances: Arc<Mutex<HashMap<u32, PtyInstance>>>,
@@ -326,6 +407,10 @@ pub struct PtyManager {
     resize_cooldown_until: Arc<Mutex<HashMap<u32, Instant>>>,
     /// 近期输出滚动窗口（上限 8KB），供 process_monitor 检测 awaiting-input 短语
     recent_output_window: Arc<Mutex<HashMap<u32, String>>>,
+    /// 最近一次在 PTY chunk 中检测到 AI TUI busy 信号的时间。
+    /// 用于补救 ai-complete 误判：spinner 在转 / `esc to interrupt` 在屏幕上时
+    /// 即便字节流稀疏，状态也保持在 ai-thinking。
+    last_busy_signal_at: Arc<Mutex<HashMap<u32, Instant>>>,
 }
 
 impl PtyManager {
@@ -342,6 +427,7 @@ impl PtyManager {
             output_since_enter: Arc::new(Mutex::new(HashMap::new())),
             resize_cooldown_until: Arc::new(Mutex::new(HashMap::new())),
             recent_output_window: Arc::new(Mutex::new(HashMap::new())),
+            last_busy_signal_at: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -351,6 +437,13 @@ impl PtyManager {
 
     pub fn has_recent_output(&self, pty_id: u32, within: Duration) -> bool {
         let map = self.last_output.lock().unwrap();
+        map.get(&pty_id).map_or(false, |t| t.elapsed() < within)
+    }
+
+    /// 距上次在 PTY chunk 中看到 AI busy 信号（spinner 时长 / `esc to xxx`）
+    /// 不超过 within，则视为 AI 仍在工作；用于覆盖纯字节流频率判定的盲区。
+    pub fn has_recent_busy_signal(&self, pty_id: u32, within: Duration) -> bool {
+        let map = self.last_busy_signal_at.lock().unwrap();
         map.get(&pty_id).map_or(false, |t| t.elapsed() < within)
     }
 
@@ -911,13 +1004,22 @@ pub fn create_pty(
                     pty_state_for_output
                         .append_recent_output_window(pty_id_for_reader, &data);
 
+                    // AI busy 信号检测：spinner 时长括号 / `esc to xxx`
+                    // 命中即刷新时间戳，让 process_monitor 把状态保持在 ai-thinking
+                    // 即便后续字节流静默也不会被 30s 阈值错判为 ai-complete。
+                    // 须在 emit 之前做（emit 会 move data）。
+                    let busy_hit = chunk_has_busy_signal(&data);
+
                     let _ = app_flush.emit("pty-output", PtyOutputPayload {
                         pty_id: pty_id_for_reader, data,
                     });
 
-                    // 冷却窗口内（刚 resize 过）的输出不刷新 last_output。
-                    // Claude/Codex 等 TUI 在 ConPTY resize 后会全屏重绘，
-                    // 这些重绘数据不应被 process_monitor 当作 AI 活跃信号。
+                    // 冷却窗口内（刚 resize 过）的输出不刷新任何活跃时间戳。
+                    // TUI 在 resize/SIGWINCH 后会全屏重绘 alternate screen buffer，
+                    // 重绘字节里可能含 idle 屏幕底部的 `esc to xxx` 快捷键 hint，
+                    // 若不拦截会被 busy signal 误判为 AI 仍在工作。
+                    // 真在 working 时 spinner 字节会在 cooldown(800ms) 后继续刷新，
+                    // 不会丢失活跃状态。
                     let in_cooldown = pty_state_for_output
                         .resize_cooldown_until
                         .lock()
@@ -927,6 +1029,11 @@ pub fn create_pty(
                     if !in_cooldown {
                         if let Ok(mut map) = last_output.lock() {
                             map.insert(pty_id_for_reader, Instant::now());
+                        }
+                        if busy_hit {
+                            if let Ok(mut map) = pty_state_for_output.last_busy_signal_at.lock() {
+                                map.insert(pty_id_for_reader, Instant::now());
+                            }
                         }
                     }
                 }
@@ -1020,6 +1127,7 @@ pub fn kill_pty(state: tauri::State<'_, PtyManager>, pty_id: u32) -> Result<(), 
     state.output_since_enter.lock().unwrap().remove(&pty_id);
     state.resize_cooldown_until.lock().unwrap().remove(&pty_id);
     state.recent_output_window.lock().unwrap().remove(&pty_id);
+    state.last_busy_signal_at.lock().unwrap().remove(&pty_id);
 
     // Drop the PTY instance on a background thread.
     //
@@ -1731,6 +1839,60 @@ mod tests {
         let input = "before\x1b]0;codex title\x1b\\after";
         let result = strip_ansi_codes(input);
         assert_eq!(result, "beforeafter", "OSC (ST 终结) 应被完整剥离");
+    }
+
+    // ── AI busy 信号检测（chunk_has_busy_signal）─────────────────────
+    // 三家 TUI 实测样本，均应命中：
+
+    #[test]
+    fn busy_signal_codex_working() {
+        // Codex: `● Working (2s • esc to interrupt)`
+        assert!(chunk_has_busy_signal("● Working (2s • esc to interrupt)"));
+    }
+
+    #[test]
+    fn busy_signal_claude_contemplating() {
+        // Claude: `Contemplating… (24s · ↑ 1.1k tokens · still thinking with xhigh effort)`
+        assert!(chunk_has_busy_signal(
+            "Contemplating… (24s · ↑ 1.1k tokens · still thinking with xhigh effort)"
+        ));
+    }
+
+    #[test]
+    fn busy_signal_claude_sauteing() {
+        // Claude 词池里随便一个动词都不应影响命中（结构信号兜底）
+        assert!(chunk_has_busy_signal("Sautéing… (3s · ↑ 200 tokens)"));
+    }
+
+    #[test]
+    fn busy_signal_gemini_defining() {
+        // Gemini: `⋮ Defining the Constraints (esc to cancel, 10s)`
+        assert!(chunk_has_busy_signal("⋮ Defining the Constraints (esc to cancel, 10s)"));
+    }
+
+    #[test]
+    fn busy_signal_esc_to_case_insensitive() {
+        assert!(chunk_has_busy_signal("Press ESC to abort"));
+        assert!(chunk_has_busy_signal("press Esc to stop"));
+    }
+
+    #[test]
+    fn busy_signal_no_match_for_random_text() {
+        // 普通终端输出不应误触发
+        assert!(!chunk_has_busy_signal("npm install tools"));
+        assert!(!chunk_has_busy_signal("function getUsersByEmail()"));
+        assert!(!chunk_has_busy_signal("commit 5847b30 fix: ..."));
+        // 数字+s 但不在标点边界内（"vars" 里的 s 等）
+        assert!(!chunk_has_busy_signal("123seconds"));
+        // "esc to" 后面不是字母（少见，但保险）
+        assert!(!chunk_has_busy_signal("esc to "));
+    }
+
+    #[test]
+    fn busy_signal_seconds_at_chunk_edges() {
+        // 数字+s 在 chunk 开头/末尾应仍能识别
+        assert!(chunk_has_busy_signal("5s "));
+        assert!(chunk_has_busy_signal("(2s"));
     }
 
     #[test]
