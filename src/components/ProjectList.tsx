@@ -3,6 +3,7 @@ import { Allotment } from 'allotment';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
+import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useAppStore, genId } from '../store';
 import { StatusDot } from './StatusDot';
 import { DoneTag } from './DoneTag';
@@ -351,7 +352,7 @@ export function ProjectList() {
           const menuItems: Parameters<typeof showContextMenu>[2] = [
             { label: '重命名', onClick: () => startRenameProject(project.id, project.name) },
             { label: '在文件夹中打开', onClick: () => revealItemInDir(project.path) },
-            { label: '复制绝对路径', onClick: () => navigator.clipboard.writeText(project.path) },
+            { label: '复制绝对路径', onClick: () => writeText(project.path) },
           ];
           // 添加分组相关菜单
           if (allGroups.length > 0) {

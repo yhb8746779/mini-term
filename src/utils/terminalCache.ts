@@ -28,6 +28,14 @@ export interface CachedTerminal {
 
 interface CachedEntry extends CachedTerminal {
   cleanup: () => void;
+  renderer: 'webgl' | 'dom';
+  webglAddon?: WebglAddon;
+  outputDiag: {
+    writes: number;
+    bytes: number;
+    maxChunk: number;
+    lastLogAt: number;
+  };
 }
 
 export const DARK_TERMINAL_THEME = {
@@ -98,10 +106,81 @@ const enqueuePtyWrite = createPtyWriteQueue((ptyId, data) =>
 const TERM_DEBUG = localStorage.getItem('mini-term-debug') === '1';
 const FORCE_DISABLE_WEBGL = localStorage.getItem('mini-term-disable-webgl') === '1';
 const FORCE_MONO_ONLY = localStorage.getItem('mini-term-mono-only') === '1';
+const UTF8_ENCODER = new TextEncoder();
+let snapshotListenerInstalled = false;
 
 function debugTerm(scope: string, payload: Record<string, unknown>) {
   if (!TERM_DEBUG) return;
   console.info(`[mini-term-debug] ${scope}`, payload);
+}
+
+function logTerminalPerf(scope: string, details: string): void {
+  invoke('log_perf_from_frontend', { scope, details }).catch(() => {});
+}
+
+function shouldDisableWebgl(): boolean {
+  return FORCE_DISABLE_WEBGL || (useAppStore.getState().config.terminalDisableWebgl ?? false);
+}
+
+function loadWebglRenderer(term: Terminal, ptyId: number): WebglAddon | null {
+  try {
+    const webgl = new WebglAddon();
+    webgl.onContextLoss(() => {
+      debugTerm('terminal:webgl_context_loss', { ptyId });
+      logTerminalPerf('terminal_webgl_context_loss', `pty_id=${ptyId}`);
+      webgl.dispose();
+      const cached = cache.get(ptyId);
+      if (cached) {
+        cached.renderer = 'dom';
+        cached.webglAddon = undefined;
+      }
+      term.refresh(0, Math.max(term.rows - 1, 0));
+    });
+    term.loadAddon(webgl);
+    debugTerm('terminal:webgl_loaded', { ptyId });
+    return webgl;
+  } catch (err) {
+    debugTerm('terminal:webgl_failed', { ptyId, error: String(err) });
+    logTerminalPerf('terminal_webgl_failed', `pty_id=${ptyId} | error=${String(err)}`);
+    return null;
+  }
+}
+
+function installSnapshotListener(): void {
+  if (snapshotListenerInstalled || typeof window === 'undefined') return;
+  snapshotListenerInstalled = true;
+
+  window.addEventListener('mini-term-terminal-snapshot', (event) => {
+    const reason = event instanceof CustomEvent ? event.detail?.reason ?? 'unknown' : 'unknown';
+    const cfg = useAppStore.getState().config;
+    if (cache.size === 0) {
+      logTerminalPerf('terminal_snapshot', `reason=${reason} | terminals=0`);
+      return;
+    }
+
+    for (const [ptyId, entry] of cache.entries()) {
+      const wrapperRect = entry.wrapper.getBoundingClientRect();
+      const mounted = document.body.contains(entry.wrapper);
+      logTerminalPerf(
+        'terminal_snapshot',
+        [
+          `reason=${reason}`,
+          `pty_id=${ptyId}`,
+          `renderer=${entry.renderer}`,
+          `mounted=${mounted}`,
+          `cols=${entry.term.cols}`,
+          `rows=${entry.term.rows}`,
+          `wrapper=${Math.round(wrapperRect.width)}x${Math.round(wrapperRect.height)}`,
+          `client=${entry.wrapper.clientWidth}x${entry.wrapper.clientHeight}`,
+          `font_size=${entry.term.options.fontSize}`,
+          `font_family=${String(entry.term.options.fontFamily).replace(/\|/g, '/')}`,
+          `line_height=${entry.term.options.lineHeight}`,
+          `config_disable_webgl=${cfg.terminalDisableWebgl ?? false}`,
+          `local_disable_webgl=${FORCE_DISABLE_WEBGL}`,
+        ].join(' | '),
+      );
+    }
+  });
 }
 
 // 字体栈策略：
@@ -181,6 +260,7 @@ export function resolveFontFamily(preset?: string, custom?: string): string {
 export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   const existing = cache.get(ptyId);
   if (existing) return existing;
+  installSnapshotListener();
 
   // 创建 wrapper 容器，xterm.js 会在其中渲染
   const wrapper = document.createElement('div');
@@ -226,21 +306,17 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     // Unicode 11 不支持
   }
 
-  // WebGL 渲染，降级时回退到 Canvas
-  if (FORCE_DISABLE_WEBGL) {
-    debugTerm('terminal:webgl_skipped', { ptyId, reason: 'FORCE_DISABLE_WEBGL' });
+  // WebGL 渲染；禁用或加载失败时使用 xterm 默认 DOM 渲染器。
+  let renderer: CachedEntry['renderer'] = 'dom';
+  let webglAddon: WebglAddon | undefined;
+  const webglDisabled = shouldDisableWebgl();
+  if (webglDisabled) {
+    debugTerm('terminal:webgl_skipped', { ptyId, reason: FORCE_DISABLE_WEBGL ? 'localStorage' : 'config' });
   } else {
-    try {
-      const webgl = new WebglAddon();
-      webgl.onContextLoss(() => {
-        debugTerm('terminal:webgl_context_loss', { ptyId });
-        webgl.dispose();
-        term.refresh(0, term.rows - 1);
-      });
-      term.loadAddon(webgl);
-      debugTerm('terminal:webgl_loaded', { ptyId });
-    } catch (err) {
-      debugTerm('terminal:webgl_failed', { ptyId, error: String(err) });
+    const loaded = loadWebglRenderer(term, ptyId);
+    if (loaded) {
+      renderer = 'webgl';
+      webglAddon = loaded;
     }
   }
 
@@ -250,9 +326,21 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     fontSize: term.options.fontSize,
     lineHeight: term.options.lineHeight,
     letterSpacing: term.options.letterSpacing,
-    webgl: !FORCE_DISABLE_WEBGL,
+    renderer,
+    webglDisabled,
     monoOnly: FORCE_MONO_ONLY,
   });
+  logTerminalPerf(
+    'terminal_create',
+    [
+      `pty_id=${ptyId}`,
+      `renderer=${renderer}`,
+      `webgl_disabled=${webglDisabled}`,
+      `font_size=${term.options.fontSize}`,
+      `line_height=${term.options.lineHeight}`,
+      `font_family=${String(term.options.fontFamily).replace(/\|/g, '/')}`,
+    ].join(' | '),
+  );
 
   // 字体加载稳定兜底：首次测量 cell-width 可能发生在字体还没完全就绪时，
   // xterm/WebGL 会把测到的（偏大的）cell 尺寸烧进纹理图集，造成字符间距突兀。
@@ -324,6 +412,32 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   let unlisten: (() => void) | undefined;
   listen<PtyOutputPayload>('pty-output', (event) => {
     if (event.payload.ptyId === ptyId) {
+      const entry = cache.get(ptyId);
+      if (entry) {
+        const byteLen = UTF8_ENCODER.encode(event.payload.data).length;
+        entry.outputDiag.writes += 1;
+        entry.outputDiag.bytes += byteLen;
+        entry.outputDiag.maxChunk = Math.max(entry.outputDiag.maxChunk, byteLen);
+        const now = performance.now();
+        if (now - entry.outputDiag.lastLogAt >= 5000) {
+          logTerminalPerf(
+            'terminal_write_diag',
+            [
+              `pty_id=${ptyId}`,
+              `renderer=${entry.renderer}`,
+              `writes=${entry.outputDiag.writes}`,
+              `bytes=${entry.outputDiag.bytes}`,
+              `max_chunk=${entry.outputDiag.maxChunk}`,
+              `cols=${term.cols}`,
+              `rows=${term.rows}`,
+            ].join(' | '),
+          );
+          entry.outputDiag.writes = 0;
+          entry.outputDiag.bytes = 0;
+          entry.outputDiag.maxChunk = 0;
+          entry.outputDiag.lastLogAt = now;
+        }
+      }
       term.write(event.payload.data);
     }
   }).then((fn) => {
@@ -339,7 +453,15 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     term.dispose();
   };
 
-  const entry: CachedEntry = { term, fitAddon, wrapper, cleanup };
+  const entry: CachedEntry = {
+    term,
+    fitAddon,
+    wrapper,
+    cleanup,
+    renderer,
+    webglAddon,
+    outputDiag: { writes: 0, bytes: 0, maxChunk: 0, lastLogAt: performance.now() },
+  };
   cache.set(ptyId, entry);
   return entry;
 }
@@ -362,6 +484,34 @@ export function updateAllTerminalThemes(terminalFollowTheme: boolean): void {
   const theme = getTerminalTheme(terminalFollowTheme);
   for (const entry of cache.values()) {
     entry.term.options.theme = theme;
+  }
+}
+
+/** 切换所有已开启终端的 WebGL 渲染模式 */
+export function updateAllTerminalWebgl(disabled: boolean): void {
+  for (const [ptyId, entry] of cache.entries()) {
+    if (disabled) {
+      if (entry.webglAddon) {
+        entry.webglAddon.dispose();
+        entry.webglAddon = undefined;
+        entry.renderer = 'dom';
+        entry.term.refresh(0, Math.max(entry.term.rows - 1, 0));
+        logTerminalPerf('terminal_webgl_disabled', `pty_id=${ptyId} | renderer=dom`);
+      }
+      continue;
+    }
+
+    if (FORCE_DISABLE_WEBGL || entry.webglAddon) {
+      continue;
+    }
+
+    const loaded = loadWebglRenderer(entry.term, ptyId);
+    if (loaded) {
+      entry.webglAddon = loaded;
+      entry.renderer = 'webgl';
+      entry.term.refresh(0, Math.max(entry.term.rows - 1, 0));
+      logTerminalPerf('terminal_webgl_enabled', `pty_id=${ptyId} | renderer=webgl`);
+    }
   }
 }
 

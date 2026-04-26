@@ -3,10 +3,11 @@ import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useAppStore } from '../store';
 import { checkForUpdate, compareVersions, type ReleaseInfo } from '../utils/updateChecker';
 import { applyTheme } from '../utils/themeManager';
-import { updateAllTerminalThemes, updateAllTerminalFonts, FONT_PRESET_OPTIONS } from '../utils/terminalCache';
+import { updateAllTerminalThemes, updateAllTerminalFonts, updateAllTerminalWebgl, FONT_PRESET_OPTIONS } from '../utils/terminalCache';
 import type { ShellConfig } from '../types';
 
 interface Props {
@@ -753,7 +754,7 @@ function DiagnosticsSettings() {
   const handleCopyLog = useCallback(async () => {
     try {
       const content = await invoke<string>('read_perf_log');
-      await navigator.clipboard.writeText(content || '(empty perf.log)');
+      await writeText(content || '(empty perf.log)');
       setStatus('已复制诊断日志到剪贴板');
     } catch (err) {
       setStatus(`复制失败：${String(err)}`);
@@ -783,10 +784,11 @@ function DiagnosticsSettings() {
   const handleTerminalDisableWebglChange = useCallback((disabled: boolean) => {
     const newConfig = { ...useAppStore.getState().config, terminalDisableWebgl: disabled };
     setConfig(newConfig);
+    updateAllTerminalWebgl(disabled);
     invoke('save_config', { config: newConfig });
     setStatus(disabled
-      ? '已禁用 WebGL；新建终端标签页后会使用 Canvas 渲染'
-      : '已启用 WebGL；新建终端标签页后生效');
+      ? '已禁用 WebGL；现有和新建终端都会使用非 WebGL 渲染'
+      : '已启用 WebGL；现有和新建终端都会优先使用 WebGL');
   }, [setConfig]);
 
   const handleSnapshot = useCallback(() => {
@@ -804,7 +806,7 @@ function DiagnosticsSettings() {
         <div>
           <div className="text-base text-[var(--text-primary)]">终端渲染诊断</div>
           <div className="text-sm text-[var(--text-muted)]">
-            正式版会记录低频摘要：PTY 输出批次、UTF-8 边界、xterm 写入、WebGL/Canvas、字体、fit 尺寸等；不会记录终端正文内容。
+            正式版会记录低频摘要：PTY 输出批次、UTF-8 边界、xterm 写入、WebGL/DOM、字体、fit 尺寸等；不会记录终端正文内容。
           </div>
         </div>
 
@@ -812,7 +814,7 @@ function DiagnosticsSettings() {
           <div>
             <div className="text-base text-[var(--text-primary)]">禁用 WebGL 终端渲染</div>
             <div className="text-sm text-[var(--text-muted)]">
-              复制正常但屏幕乱码时优先打开；对新建终端标签页生效，用 Canvas 避开 GPU 字形纹理问题。
+              复制正常但屏幕乱码时优先打开；用非 WebGL 渲染避开 GPU 字形纹理问题。
             </div>
           </div>
           <button

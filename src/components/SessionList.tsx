@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useAppStore } from '../store';
 import { showContextMenu } from '../utils/contextMenu';
 import type { AiSession } from '../types';
@@ -136,7 +137,7 @@ export function SessionList() {
                 showContextMenu(e.clientX, e.clientY, [
                   {
                     label: '复制恢复命令',
-                    onClick: () => navigator.clipboard.writeText(cmd),
+                    onClick: () => writeText(cmd),
                   },
                 ]);
               }}
