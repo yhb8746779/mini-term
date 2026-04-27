@@ -26,7 +26,7 @@ fn build_gitignore(project_root: &Path) -> Option<Gitignore> {
     Some(gi)
 }
 
-const ALWAYS_IGNORE: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "__pycache__", ".superpowers"];
+pub const ALWAYS_IGNORE: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "__pycache__", ".superpowers"];
 
 /// 同一路径的文件变更事件，150ms 内只向前端 emit 一次，防止驱动器根目录等高频场景卡死
 const FS_EVENT_DEBOUNCE: Duration = Duration::from_millis(150);

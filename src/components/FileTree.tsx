@@ -271,6 +271,7 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
 export function FileTree() {
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const config = useAppStore((s) => s.config);
+  const setSearchModalOpen = useAppStore((s) => s.setSearchModalOpen);
   const project = config.projects.find((p) => p.id === activeProjectId);
 
   const handleOpenInVscode = useCallback(async () => {
@@ -429,29 +430,38 @@ export function FileTree() {
         <span className="text-sm text-[var(--text-muted)] uppercase tracking-[0.12em] font-medium truncate">
           Files — {project.name}
         </span>
-        <button
-          type="button"
-          onClick={handleOpenInVscode}
-          title="使用 VS Code 打开该文件夹"
-          className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors flex-shrink-0 leading-none"
-        >
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 16 16"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
+        <div className="flex items-center flex-shrink-0 gap-1">
+          <button
+            type="button"
+            onClick={() => setSearchModalOpen(true)}
+            title="搜索文件 (Ctrl+Shift+F)"
+            className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-sm leading-none px-1.5 py-0.5 rounded-[var(--radius-sm)] hover:bg-[var(--border-subtle)]"
           >
-            <path d="M10 2h4v4" />
-            <path d="M14 2L7 9" />
-            <path d="M12 9v4a1 1 0 01-1 1H3a1 1 0 01-1-1V5a1 1 0 011-1h4" />
-          </svg>
-        </button>
-      </div>
+            ⌕
+          </button>
+          <button
+            type="button"
+            onClick={handleOpenInVscode}
+            title="使用 VS Code 打开该文件夹"
+            className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors leading-none"
+          >
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M10 2h4v4" />
+              <path d="M14 2L7 9" />
+              <path d="M12 9v4a1 1 0 01-1 1H3a1 1 0 01-1-1V5a1 1 0 011-1h4" />
+            </svg>
+          </button>
+        </div>
       <div className="flex-1 px-1" onContextMenu={handleRootContextMenu}>
         {rootEntries.map((entry) => (
           <TreeNode

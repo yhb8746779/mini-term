@@ -6,6 +6,7 @@ mod fs;
 mod git;
 mod path_access;
 mod perf_log;
+mod search;
 mod process_monitor;
 mod pty;
 
@@ -27,6 +28,7 @@ pub fn run() {
         .manage(ai_sessions::SessionCache::new())
         .manage(git::GitRepoCache::new())
         .manage(path_access::PathAccessManager::new())
+        .manage(search::SearchManager::new())
         .setup(|app| {
             clipboard::cleanup_old_clipboard_images();
             let handle = app.handle().clone();
@@ -73,6 +75,8 @@ pub fn run() {
             clipboard::read_clipboard_file_paths,
             clipboard::read_clipboard_file_paths_macos,
             clipboard::load_image_to_clipboard,
+            search::start_search,
+            search::cancel_search,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

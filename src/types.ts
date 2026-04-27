@@ -151,6 +151,27 @@ export interface FsChangePayload {
   kind: string;
 }
 
+// === 搜索 ===
+
+export interface SearchResultItem {
+  filePath: string;
+  fileName: string;
+  lineNumber?: number;
+  lineContent?: string;
+  matchRanges: [number, number][];
+}
+
+export interface SearchResultsPayload {
+  searchId: string;
+  items: SearchResultItem[];
+}
+
+export interface SearchCompletePayload {
+  searchId: string;
+  totalCount: number;
+  cancelled: boolean;
+}
+
 // === Git 状态 ===
 
 export type GitStatusType = 'modified' | 'added' | 'deleted' | 'renamed' | 'untracked' | 'conflicted';

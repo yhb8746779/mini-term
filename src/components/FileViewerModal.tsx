@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { FileContentResult } from '../types';
 
@@ -6,12 +6,17 @@ interface FileViewerModalProps {
   open: boolean;
   onClose: () => void;
   filePath: string;
+  /** 搜索结果点击预览时使用；本地基础版未做 markdown 相对路径解析，可选。 */
+  projectRoot?: string;
+  /** 搜索结果定位行号，渲染后自动滚动到该行。 */
+  highlightLine?: number;
 }
 
-export function FileViewerModal({ open, onClose, filePath }: FileViewerModalProps) {
+export function FileViewerModal({ open, onClose, filePath, highlightLine }: FileViewerModalProps) {
   const [result, setResult] = useState<FileContentResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const highlightRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -33,6 +38,12 @@ export function FileViewerModal({ open, onClose, filePath }: FileViewerModalProp
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [open, onClose]);
+
+  useEffect(() => {
+    if (result && highlightLine && highlightRef.current) {
+      highlightRef.current.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }, [result, highlightLine]);
 
   if (!open) return null;
 
@@ -87,7 +98,11 @@ export function FileViewerModal({ open, onClose, filePath }: FileViewerModalProp
           {result && !result.isBinary && !result.tooLarge && (
             <div className="font-mono text-sm leading-6">
               {result.content.split('\n').map((line, i) => (
-                <div key={i} className="flex hover:bg-[var(--border-subtle)]">
+                <div
+                  key={i}
+                  ref={i + 1 === highlightLine ? highlightRef : undefined}
+                  className={`flex hover:bg-[var(--border-subtle)] ${i + 1 === highlightLine ? 'bg-[var(--accent-muted)]' : ''}`}
+                >
                   <span className="w-12 text-right pr-3 text-[var(--text-muted)] select-none flex-shrink-0 opacity-40">
                     {i + 1}
                   </span>
