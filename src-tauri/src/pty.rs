@@ -885,6 +885,10 @@ pub fn create_pty(
                 .unwrap_or(fallback_locale);
             cmd.env("LC_CTYPE", lc_ctype_val);
         }
+
+        // LESSCHARSET 告诉 git 默认 pager (less) 直接输出 UTF-8 字节，
+        // 不再把非 ASCII 字符转义成 <XX> 序列（git log 中文乱码常见原因）。
+        cmd.env("LESSCHARSET", "utf-8");
     }
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
