@@ -308,6 +308,19 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   // 跳过默认（清空 scrollback）行为；其余 Ps 值（0/1/2）走默认逻辑。
   term.parser.registerCsiHandler({ final: 'J' }, (params) => params[0] === 3);
 
+  // 拦截 alternate screen 切换（DECSET/DECRST 47, 1047, 1049）：
+  // 阻止 TUI 程序进入备用缓冲区，让所有输出留在主缓冲区，
+  // 保持 scrollback 和滚动条可用。codex 等 TUI 的清屏/重绘
+  // 仅影响可视区域，scrollback 历史不受影响。
+  const isAltScreenMode = (p: number | number[]) => {
+    const v = typeof p === 'number' ? p : p[0];
+    return v === 47 || v === 1047 || v === 1049;
+  };
+  term.parser.registerCsiHandler({ final: 'h', prefix: '?' }, (params) =>
+    params.some(isAltScreenMode));
+  term.parser.registerCsiHandler({ final: 'l', prefix: '?' }, (params) =>
+    params.some(isAltScreenMode));
+
   term.open(wrapper);
 
   // Unicode 11 addon：修正 CJK / Emoji 双宽字符的列宽计算，避免中文乱码
