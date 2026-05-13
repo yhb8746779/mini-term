@@ -462,6 +462,7 @@ export function FileTree() {
             </svg>
           </button>
         </div>
+      </div>
       <div className="flex-1 px-1" onContextMenu={handleRootContextMenu}>
         {rootEntries.map((entry) => (
           <TreeNode

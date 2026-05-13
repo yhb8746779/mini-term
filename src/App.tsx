@@ -146,7 +146,7 @@ export function App() {
 
   useTauriEvent<PtyStatusChangePayload>('pty-status-change', useCallback((payload) => {
     console.log('[fe-status]', payload.ptyId, payload.status, payload.provider ?? '(no provider)');
-    markAiPty(payload.ptyId, payload.status === 'ai-working' || payload.status === 'ai-idle');
+    markAiPty(payload.ptyId, typeof payload.status === 'string' && payload.status.startsWith('ai-'));
     updatePaneStatusByPty(
       payload.ptyId,
       payload.status as PaneStatus,

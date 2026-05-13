@@ -199,7 +199,7 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
     (item: SearchResultItem) => {
       if (!project) return;
       const sep = project.path.includes('\\') ? '\\' : '/';
-      invoke('open_in_editor', {
+      invoke('open_in_vscode', {
         path: project.path + sep + item.filePath,
       }).catch(() => {});
     },
