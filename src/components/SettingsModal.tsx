@@ -15,7 +15,7 @@ interface Props {
   onClose: () => void;
 }
 
-type SettingsPage = 'terminal' | 'system' | 'shortcuts' | 'diagnostics' | 'about';
+type SettingsPage = 'terminal' | 'system' | 'hook' | 'shortcuts' | 'diagnostics' | 'about';
 
 // ─── ShellRow（终端设置子组件）───
 
@@ -729,6 +729,273 @@ function ShortcutsSettings() {
   );
 }
 
+// ─── HookSettings（AI Hook 集成页）───
+//
+// 让 mini-term 通过 Claude Code / Codex / Gemini CLI 官方 hook 系统接收事件，
+// 实现"事件级"精确状态感知（PreToolUse → ai-thinking、Stop → ai-complete 等），
+// 取代纯启发式（spinner 检测 + 字节流活跃度）的偶尔误判和冷启动延迟。
+
+type HookProvider = 'claude' | 'codex' | 'gemini';
+
+interface HookSnippet {
+  claude: { file: string; content: string };
+  codex: { files: Array<{ file: string; content: string; note?: string }> };
+  gemini: { file: string; content: string };
+}
+
+function HookSettings() {
+  const config = useAppStore((s) => s.config);
+  const setConfig = useAppStore((s) => s.setConfig);
+  const enabled = config.hookEnabled ?? false;
+
+  const [status, setStatus] = useState<{ port: number; running: boolean } | null>(null);
+  const [snippet, setSnippet] = useState<HookSnippet | null>(null);
+  const [activeTab, setActiveTab] = useState<HookProvider>('claude');
+  const [pending, setPending] = useState(false);
+  const [log, setLog] = useState('');
+
+  const refreshStatus = useCallback(async () => {
+    try {
+      const info = await invoke<{ port: number; running: boolean }>('get_hook_status');
+      setStatus(info);
+    } catch (e) {
+      setStatus(null);
+    }
+  }, []);
+
+  const refreshSnippet = useCallback(async () => {
+    try {
+      const snip = await invoke<HookSnippet>('get_hook_config_snippet');
+      setSnippet(snip);
+    } catch (e) {
+      setLog(`获取配置片段失败: ${String(e)}`);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshStatus();
+    void refreshSnippet();
+  }, [refreshStatus, refreshSnippet]);
+
+  const handleToggleEnabled = useCallback(async (next: boolean) => {
+    setPending(true);
+    try {
+      await invoke('toggle_hook_server', { enabled: next });
+      const cur = useAppStore.getState().config;
+      const newConfig = { ...cur, hookEnabled: next };
+      setConfig(newConfig);
+      await invoke('save_config', { config: newConfig });
+      await refreshStatus();
+      setLog(next ? 'Hook server 已启动' : 'Hook server 已停止');
+    } catch (e) {
+      setLog(`切换 Hook server 失败: ${String(e)}`);
+    } finally {
+      setPending(false);
+    }
+  }, [setConfig, refreshStatus]);
+
+  const handleRegister = useCallback(async () => {
+    setPending(true);
+    try {
+      const msg = await invoke<string>('register_ai_hooks');
+      setLog(msg);
+    } catch (e) {
+      setLog(`注册失败: ${String(e)}`);
+    } finally {
+      setPending(false);
+    }
+  }, []);
+
+  const handleUnregister = useCallback(async () => {
+    setPending(true);
+    try {
+      const msg = await invoke<string>('unregister_ai_hooks');
+      setLog(msg);
+    } catch (e) {
+      setLog(`卸载失败: ${String(e)}`);
+    } finally {
+      setPending(false);
+    }
+  }, []);
+
+  const handleCopy = useCallback(async (text: string) => {
+    try {
+      await writeText(text);
+      setLog('已复制到剪贴板');
+    } catch (e) {
+      setLog(`复制失败: ${String(e)}`);
+    }
+  }, []);
+
+  const tabBtn = (key: HookProvider, label: string) => (
+    <button
+      type="button"
+      onClick={() => setActiveTab(key)}
+      className={`px-3 py-1.5 text-sm rounded-[var(--radius-sm)] transition-colors ${
+        activeTab === key
+          ? 'bg-[var(--accent)] text-[var(--bg-base)]'
+          : 'bg-[var(--bg-base)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+      }`}
+    >
+      {label}
+    </button>
+  );
+
+  const dimmed = enabled ? '' : 'opacity-40 pointer-events-none';
+
+  return (
+    <div className="space-y-6">
+      {/* 启用开关 */}
+      <div>
+        <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
+          Hook Server
+        </div>
+        <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+          <div className="flex flex-col">
+            <span className="text-base text-[var(--text-primary)]">启用 AI Hook 事件接收</span>
+            <span className="text-sm text-[var(--text-muted)] mt-0.5">
+              开启后绑定 127.0.0.1:23456 接收 Claude/Codex/Gemini hook 事件。Windows 首次启动会弹出防火墙授权。
+            </span>
+          </div>
+          <button
+            type="button"
+            disabled={pending}
+            onClick={() => handleToggleEnabled(!enabled)}
+            className={`relative w-10 h-5 rounded-full transition-colors flex-shrink-0 ${
+              enabled ? 'bg-[var(--accent)]' : 'bg-[var(--border-strong)]'
+            } ${pending ? 'opacity-50' : ''}`}
+          >
+            <span
+              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                enabled ? 'translate-x-[18px]' : 'translate-x-0.5'
+              }`}
+            />
+          </button>
+        </div>
+        {status && (
+          <div className="mt-2 text-sm text-[var(--text-muted)]">
+            服务器状态: {status.running ? <span className="text-green-400">运行中</span> : <span>未启动</span>}
+            {status.running && status.port > 0 && <span>，监听端口 {status.port}</span>}
+          </div>
+        )}
+      </div>
+
+      {/* 注册/卸载按钮 */}
+      <div className={dimmed}>
+        <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
+          一键管理 Hook 配置
+        </div>
+        <div className="flex gap-3">
+          <button
+            type="button"
+            disabled={pending}
+            onClick={handleRegister}
+            className="px-3 py-1.5 rounded-[var(--radius-sm)] bg-[var(--accent)] text-[var(--bg-base)] text-base hover:opacity-90 transition-opacity disabled:opacity-50"
+          >
+            注册到 Claude / Codex / Gemini
+          </button>
+          <button
+            type="button"
+            disabled={pending}
+            onClick={handleUnregister}
+            className="px-3 py-1.5 rounded-[var(--radius-sm)] bg-[var(--bg-base)] border border-[var(--border-default)] text-[var(--text-primary)] text-base hover:bg-[var(--border-subtle)] transition-colors disabled:opacity-50"
+          >
+            卸载所有
+          </button>
+        </div>
+        <div className="mt-2 text-sm text-[var(--text-muted)]">
+          注册会写入 ~/.claude/settings.json、~/.codex/hooks.json、~/.gemini/settings.json，已有 hook 会被保留，仅替换 mini-term 自己的条目。
+        </div>
+      </div>
+
+      {/* 配置片段展示 */}
+      {snippet && (
+        <div className={dimmed}>
+          <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
+            手动粘贴片段（高级）
+          </div>
+          <div className="flex gap-2 mb-2">
+            {tabBtn('claude', 'Claude Code')}
+            {tabBtn('codex', 'Codex')}
+            {tabBtn('gemini', 'Gemini CLI')}
+          </div>
+
+          {activeTab === 'claude' && (
+            <SnippetBlock
+              file={snippet.claude.file}
+              content={snippet.claude.content}
+              onCopy={handleCopy}
+            />
+          )}
+
+          {activeTab === 'codex' && (
+            <div className="space-y-3">
+              {snippet.codex.files.map((f) => (
+                <SnippetBlock
+                  key={f.file}
+                  file={f.file}
+                  content={f.content}
+                  note={f.note}
+                  onCopy={handleCopy}
+                />
+              ))}
+            </div>
+          )}
+
+          {activeTab === 'gemini' && (
+            <SnippetBlock
+              file={snippet.gemini.file}
+              content={snippet.gemini.content}
+              onCopy={handleCopy}
+            />
+          )}
+        </div>
+      )}
+
+      {log && (
+        <div className="text-sm text-[var(--text-muted)] px-3 py-2 rounded-[var(--radius-sm)] bg-[var(--bg-base)] border border-[var(--border-subtle)] whitespace-pre-wrap font-mono">
+          {log}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SnippetBlock({
+  file,
+  content,
+  note,
+  onCopy,
+}: {
+  file: string;
+  content: string;
+  note?: string;
+  onCopy: (text: string) => void;
+}) {
+  return (
+    <div className="rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] overflow-hidden">
+      <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--border-subtle)]">
+        <code className="text-sm text-[var(--text-primary)]">{file}</code>
+        <button
+          type="button"
+          onClick={() => onCopy(content)}
+          className="text-sm text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+        >
+          复制
+        </button>
+      </div>
+      {note && (
+        <div className="px-3 py-1.5 text-sm text-[var(--text-muted)] border-b border-[var(--border-subtle)] bg-[var(--bg-elevated)]">
+          {note}
+        </div>
+      )}
+      <pre className="px-3 py-2 text-sm font-mono text-[var(--text-secondary)] overflow-x-auto max-h-64 overflow-y-auto whitespace-pre">
+        {content}
+      </pre>
+    </div>
+  );
+}
+
 // ─── DiagnosticsSettings（诊断页）───
 
 function DiagnosticsSettings() {
@@ -875,6 +1142,7 @@ function DiagnosticsSettings() {
 const MENU_ITEMS: { key: SettingsPage; label: string }[] = [
   { key: 'terminal', label: '终端设置' },
   { key: 'system', label: '系统设置' },
+  { key: 'hook', label: 'AI Hook 集成' },
   { key: 'shortcuts', label: '快捷键' },
   { key: 'diagnostics', label: '诊断日志' },
   { key: 'about', label: '关于' },
@@ -933,6 +1201,7 @@ export function SettingsModal({ open, onClose }: Props) {
           <div className="flex-1 overflow-y-auto px-5 py-4">
             {activePage === 'terminal' && <TerminalSettings />}
             {activePage === 'system' && <SystemSettings />}
+            {activePage === 'hook' && <HookSettings />}
             {activePage === 'shortcuts' && <ShortcutsSettings />}
             {activePage === 'diagnostics' && <DiagnosticsSettings />}
             {activePage === 'about' && <AboutSettings />}

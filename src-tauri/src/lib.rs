@@ -4,6 +4,8 @@ mod config;
 mod editor;
 mod fs;
 mod git;
+mod hook_registry;
+mod hook_server;
 mod path_access;
 mod perf_log;
 mod search;
@@ -29,6 +31,7 @@ pub fn run() {
         .manage(git::GitRepoCache::new())
         .manage(path_access::PathAccessManager::new())
         .manage(search::SearchManager::new())
+        .manage(hook_server::HookState::new())
         .setup(|app| {
             clipboard::cleanup_old_clipboard_images();
             let handle = app.handle().clone();
@@ -36,7 +39,19 @@ pub fn run() {
             crate::path_access::sync_project_accesses(&handle, &config.projects);
             let pty_manager = app.state::<crate::pty::PtyManager>();
             let pty_clone = pty_manager.inner().clone();
-            process_monitor::start_monitor(handle, pty_clone);
+            process_monitor::start_monitor(handle.clone(), pty_clone);
+
+            // Hook server 按需启动：仅在用户开启 hookEnabled 时绑端口，
+            // 避免 Windows 防火墙在首次启动时无条件弹出授权请求。
+            if config.hook_enabled.unwrap_or(false) {
+                let hook_state = app.state::<crate::hook_server::HookState>();
+                if let Err(e) = crate::hook_server::start_hook_server(
+                    handle.clone(),
+                    hook_state.inner().clone(),
+                ) {
+                    eprintln!("[hook-server] 启动失败: {}", e);
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -77,6 +92,11 @@ pub fn run() {
             clipboard::load_image_to_clipboard,
             search::start_search,
             search::cancel_search,
+            hook_registry::register_ai_hooks,
+            hook_registry::unregister_ai_hooks,
+            hook_registry::get_hook_config_snippet,
+            hook_registry::get_hook_status,
+            hook_server::toggle_hook_server,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

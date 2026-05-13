@@ -29,6 +29,21 @@ export interface AppConfig {
   vscodePath?: string;
   terminalFontPreset?: string;
   terminalCustomFontFamily?: string;
+  /** Hook server 开关：开启后启动时绑定 127.0.0.1:23456 接收 Claude/Codex/Gemini hook 事件。默认 undefined（关闭）。 */
+  hookEnabled?: boolean;
+}
+
+/** Hook server 运行状态（前端通过 get_hook_status 命令查询） */
+export interface HookStatusInfo {
+  port: number;
+  running: boolean;
+}
+
+/** Hook 配置片段（前端通过 get_hook_config_snippet 查询，展示在设置页供用户手动粘贴） */
+export interface HookConfigSnippet {
+  claude: { file: string; content: string };
+  codex: { files: Array<{ file: string; content: string; note?: string }> };
+  gemini: { file: string; content: string };
 }
 
 export interface ProjectConfig {
