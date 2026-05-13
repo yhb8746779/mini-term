@@ -96,6 +96,19 @@ export function getTerminalTheme(terminalFollowTheme: boolean): typeof DARK_TERM
 }
 
 const cache = new Map<number, CachedEntry>();
+
+// AI PTY 标记：FileTree/GitHistory 等高频订阅者据此跳过 AI 会话的输出，避免无意义的正则匹配
+const aiPtyIds = new Set<number>();
+
+export function markAiPty(ptyId: number, isAi: boolean) {
+  if (isAi) aiPtyIds.add(ptyId);
+  else aiPtyIds.delete(ptyId);
+}
+
+export function isAiPty(ptyId: number): boolean {
+  return aiPtyIds.has(ptyId);
+}
+
 const enqueuePtyWrite = createPtyWriteQueue((ptyId, data) =>
   invoke('write_pty', { ptyId, data })
 );
@@ -478,6 +491,7 @@ export function disposeTerminal(ptyId: number): void {
   entry.wrapper.remove();
   entry.cleanup();
   cache.delete(ptyId);
+  aiPtyIds.delete(ptyId);
 }
 
 export function updateAllTerminalThemes(terminalFollowTheme: boolean): void {

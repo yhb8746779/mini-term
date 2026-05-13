@@ -15,6 +15,7 @@ import { ToastContainer } from './components/ToastContainer';
 import { useTauriEvent } from './hooks/useTauriEvent';
 import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
+import { markAiPty } from './utils/terminalCache';
 import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, AiProvider } from './types';
 
 // ─── Debug experiment switches ─────────────────────────────────
@@ -129,6 +130,7 @@ export function App() {
 
   useTauriEvent<PtyStatusChangePayload>('pty-status-change', useCallback((payload) => {
     console.log('[fe-status]', payload.ptyId, payload.status, payload.provider ?? '(no provider)');
+    markAiPty(payload.ptyId, payload.status === 'ai-working' || payload.status === 'ai-idle');
     updatePaneStatusByPty(
       payload.ptyId,
       payload.status as PaneStatus,

@@ -7,6 +7,7 @@ import { useAppStore, isExpanded, toggleExpandedDir } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
 import { showContextMenu } from '../utils/contextMenu';
 import { showPrompt } from '../utils/prompt';
+import { isAiPty } from '../utils/terminalCache';
 import { DiffModal } from './DiffModal';
 import { FileViewerModal } from './FileViewerModal';
 import type { FileEntry, FsChangePayload, GitFileStatus, PtyOutputPayload } from '../types';
@@ -373,6 +374,7 @@ export function FileTree() {
 
   const GIT_PATTERNS = [/create mode/, /Switched to/, /Already up to date/, /insertions?\(\+\)/, /deletions?\(-\)/];
   useTauriEvent<PtyOutputPayload>('pty-output', useCallback((payload: PtyOutputPayload) => {
+    if (isAiPty(payload.ptyId)) return;
     if (GIT_PATTERNS.some((p) => p.test(payload.data))) {
       debouncedRefresh();
     }
