@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- TCC usage descriptions:
+         macOS 在首次拦截目录访问时显示这些说明，让用户知道为何弹窗、
+         同时也是 Apple 公证（notarization）的硬性要求。
+
+         即便用户最终选择走完全磁盘访问（FDA）一次到位，这些字符串仍是
+         系统对"per-directory 弹窗"路径的强制要求 —— 没有 plist 字段，
+         macOS 14+ 会直接静默拒绝访问且不显示任何对话框。 -->
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Mini-Term 需要访问桌面以列出当前项目下的文件和子目录。</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Mini-Term 需要访问 Documents 以列出当前项目下的文件和子目录。</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Mini-Term 需要访问 Downloads 以列出当前项目下的文件和子目录。</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>Mini-Term 需要访问外部卷以打开存储在 U 盘 / 移动硬盘上的项目。</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>Mini-Term 需要访问网络卷以打开存储在 SMB / NFS 共享上的项目。</string>
+</dict>
+</plist>

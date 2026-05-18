@@ -58,6 +58,8 @@ pub fn run() {
             config::load_config,
             config::save_config,
             path_access::prepare_project_access,
+            path_access::get_full_disk_access_status,
+            path_access::recheck_full_disk_access,
             pty::create_pty,
             pty::write_pty,
             pty::resize_pty,

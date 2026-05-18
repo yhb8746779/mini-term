@@ -323,6 +323,35 @@ function SystemSettings() {
 
   const [vscodePathDraft, setVscodePathDraft] = useState(config.vscodePath ?? '');
 
+  // ── macOS Full Disk Access 状态 ────────────────────────────────────────
+  // null = 加载中；true = 已授予（所有目录免授权）；false = 未授予（fallback 到逐项目 bookmark）
+  const [fdaGranted, setFdaGranted] = useState<boolean | null>(null);
+  const [fdaChecking, setFdaChecking] = useState(false);
+
+  const refreshFda = useCallback(async (forceRecheck = false) => {
+    if (!IS_MACOS) return;
+    setFdaChecking(true);
+    try {
+      const cmd = forceRecheck ? 'recheck_full_disk_access' : 'get_full_disk_access_status';
+      const ok = await invoke<boolean>(cmd);
+      setFdaGranted(ok);
+    } catch {
+      setFdaGranted(false);
+    } finally {
+      setFdaChecking(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!IS_MACOS) return;
+    void refreshFda(false);
+    // 用户去系统设置改完权限切回 Mini-Term 时窗口 focus，自动 recheck 一次。
+    // 避免必须重启 app 才能让 ensure_path_access 短路生效。
+    const onFocus = () => { void refreshFda(true); };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [refreshFda]);
+
   useEffect(() => {
     setVscodePathDraft(config.vscodePath ?? '');
   }, [config.vscodePath]);
@@ -418,27 +447,59 @@ function SystemSettings() {
 
   return (
     <div className="space-y-6">
-      {/* macOS 完全磁盘访问引导（仅 macOS 显示） */}
+      {/* macOS 完全磁盘访问（仅 macOS 显示） */}
       {IS_MACOS && (
         <div className="px-3 py-3 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-default)] space-y-2">
           <div className="flex items-start justify-between gap-3">
             <div className="flex-1 min-w-0">
-              <div className="text-base text-[var(--text-primary)]">macOS 完全磁盘访问</div>
+              <div className="flex items-center gap-2">
+                <span className="text-base text-[var(--text-primary)]">macOS 完全磁盘访问</span>
+                {/* 状态徽章：已授予绿色 / 未授予橙色 / 加载中灰色 */}
+                {fdaGranted === null ? (
+                  <span className="px-1.5 py-0.5 text-xs rounded bg-[var(--bg-elevated)] text-[var(--text-muted)]">
+                    检测中…
+                  </span>
+                ) : fdaGranted ? (
+                  <span className="px-1.5 py-0.5 text-xs rounded bg-emerald-500/15 text-emerald-500 border border-emerald-500/30">
+                    已授予
+                  </span>
+                ) : (
+                  <span className="px-1.5 py-0.5 text-xs rounded bg-amber-500/15 text-amber-500 border border-amber-500/30">
+                    未授予
+                  </span>
+                )}
+              </div>
               <div className="text-sm text-[var(--text-muted)] mt-1 leading-relaxed">
-                把 Mini-Term 加入「完全磁盘访问」列表后，访问 Documents / Downloads / 桌面 / 外部卷等受保护目录时不再逐个弹窗授权。
+                {fdaGranted
+                  ? '已开启完全磁盘访问。所有目录（Documents / Downloads / 桌面 / 外部卷等）均无需再逐个授权。'
+                  : '把 Mini-Term 加入「完全磁盘访问」列表后，访问受保护目录时不再逐个弹窗授权。'}
               </div>
             </div>
-            <button
-              type="button"
-              className="px-3 py-1.5 text-base bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90 transition-opacity flex-shrink-0 whitespace-nowrap"
-              onClick={() => openUrl(FDA_PREF_URL)}
-            >
-              打开系统设置
-            </button>
+            <div className="flex flex-col gap-2 flex-shrink-0">
+              {!fdaGranted && (
+                <button
+                  type="button"
+                  className="px-3 py-1.5 text-base bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90 transition-opacity whitespace-nowrap"
+                  onClick={() => openUrl(FDA_PREF_URL)}
+                >
+                  打开系统设置
+                </button>
+              )}
+              <button
+                type="button"
+                disabled={fdaChecking}
+                className="px-3 py-1.5 text-sm bg-[var(--bg-elevated)] text-[var(--text-secondary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] hover:border-[var(--accent)] transition-colors whitespace-nowrap disabled:opacity-50"
+                onClick={() => refreshFda(true)}
+              >
+                {fdaChecking ? '检测中…' : '重新检测'}
+              </button>
+            </div>
           </div>
-          <div className="text-xs text-[var(--text-muted)] leading-relaxed pt-1 border-t border-[var(--border-subtle)]">
-            操作步骤：① 点击右侧「打开系统设置」 → ② 在「完全磁盘访问权限」列表里点 ＋ → ③ 选择「应用程序 / Mini-Term」加入并打开开关 → ④ 重启本应用生效。
-          </div>
+          {!fdaGranted && (
+            <div className="text-xs text-[var(--text-muted)] leading-relaxed pt-1 border-t border-[var(--border-subtle)]">
+              操作步骤：① 点击「打开系统设置」 → ② 在「完全磁盘访问权限」列表点 ＋ → ③ 选 Mini-Term 并打开开关 → ④ 切回本应用，状态会自动刷新（无需重启）。
+            </div>
+          )}
         </div>
       )}
 

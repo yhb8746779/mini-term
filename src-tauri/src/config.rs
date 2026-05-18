@@ -371,6 +371,7 @@ pub fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)] // 留作未来 sandbox 模式启用 bookmark dance 时使用
 pub fn persist_project_bookmark(
     app: &AppHandle,
     project_path: &str,

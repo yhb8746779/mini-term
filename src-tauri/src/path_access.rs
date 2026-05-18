@@ -98,7 +98,21 @@ pub fn sync_project_accesses(app: &AppHandle, projects: &[ProjectConfig]) {
 pub fn ensure_path_access(app: &AppHandle, requested_path: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        ensure_path_access_macos(app, requested_path)
+        // ⚠️ 关键修复：本项目当前未启用 macOS sandbox（tauri.conf.json 无 sandbox
+        // entitlements），security-scoped bookmark dance 在非 sandbox 模式下不仅
+        // 无用，**反而会触发 TCC 弹窗**：`bookmarkDataWithOptions:WithSecurityScope`
+        // 在 TCC 受保护目录（Documents/Downloads/Desktop/external volumes）上调用时，
+        // macOS 会询问用户是否授权，每次切换项目都重弹。
+        //
+        // 当前策略：完全跳过 bookmark dance，让 macOS TCC 自己处理：
+        //   1. read_dir / watch 命中 TCC 受保护目录时，系统只弹一次"X 想访问 Y"，
+        //      用户点允许后该目录授权持久化（重启不丢，前提是 binary 签名稳定）
+        //   2. 用户在系统设置开 FDA → has_full_disk_access() 返回 true → 全磁盘开放
+        //
+        // 若将来启用 sandbox（添加 com.apple.security.app-sandbox entitlement），
+        // 再调用 ensure_path_access_macos 走 bookmark 路径即可。
+        let _ = (app, requested_path);
+        Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -112,7 +126,75 @@ pub fn prepare_project_access(app: AppHandle, path: String) -> Result<(), String
     ensure_path_access(&app, &path)
 }
 
+/// FDA 探测结果缓存：-1 未探测、0 否、1 是。
+///
+/// 模块级 static 让 has_full_disk_access 和 recheck_full_disk_access 共享同一状态，
+/// 后者能真正清空缓存让前者重读，无需重启 app。
 #[cfg(target_os = "macos")]
+static FDA_CACHE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+#[cfg(target_os = "macos")]
+fn probe_fda_uncached() -> bool {
+    // 探测方式：尝试 `read_dir(~/Library/Application Support/com.apple.TCC)`。
+    // 这个目录是 TCC 数据库所在地，**只有获得 FDA 的进程能访问**，是检测 FDA 最可靠的信号。
+    // 不真的读 TCC.db，只判断 read_dir 是否被 EPERM 拒绝，零副作用。
+    let tcc_dir = dirs::home_dir()
+        .map(|h| h.join("Library").join("Application Support").join("com.apple.TCC"));
+    match tcc_dir {
+        Some(p) => std::fs::read_dir(&p).is_ok(),
+        None => false,
+    }
+}
+
+/// 检测当前进程是否已获得 macOS Full Disk Access。
+///
+/// 非 macOS 平台直接返回 true（不存在 FDA 概念，等价于"全权访问"）。
+#[cfg(target_os = "macos")]
+pub fn has_full_disk_access() -> bool {
+    use std::sync::atomic::Ordering;
+    match FDA_CACHE.load(Ordering::Relaxed) {
+        1 => return true,
+        0 => return false,
+        _ => {}
+    }
+    let granted = probe_fda_uncached();
+    FDA_CACHE.store(if granted { 1 } else { 0 }, Ordering::Relaxed);
+    granted
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn has_full_disk_access() -> bool {
+    true
+}
+
+/// Tauri command: 返回当前 FDA 授权状态供前端展示。
+#[tauri::command]
+pub fn get_full_disk_access_status() -> bool {
+    has_full_disk_access()
+}
+
+/// Tauri command: 强制重新检测 FDA（用户从系统设置切换权限后调用，无需重启进程）。
+#[tauri::command]
+pub fn recheck_full_disk_access() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::Ordering;
+        let granted = probe_fda_uncached();
+        FDA_CACHE.store(if granted { 1 } else { 0 }, Ordering::Relaxed);
+        granted
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+/// macOS sandbox 模式下的目录授权流程（security-scoped bookmark）。
+///
+/// 当前 `ensure_path_access` 默认跳过本函数（非 sandbox app 调用 bookmark API 会
+/// 导致 TCC 弹窗反复刷屏）。保留实现作为未来启用 sandbox 时的预备代码。
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn ensure_path_access_macos(app: &AppHandle, requested_path: &str) -> Result<(), String> {
     let requested_norm = normalize_project_path(requested_path);
     let root = {
@@ -175,6 +257,7 @@ fn ensure_path_access_macos(app: &AppHandle, requested_path: &str) -> Result<(),
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 mod mac {
     use std::ffi::{c_char, c_void, CStr, CString};
 
