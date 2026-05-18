@@ -29,7 +29,9 @@ function getHostTriple() {
 
 function ensureHookBuilt(profile) {
   const exe = process.platform === "win32" ? "miniterm-hook.exe" : "miniterm-hook";
-  const src = resolve(SRC_TAURI, "..", "target", profile, exe);
+  // cargo 跑在 SRC_TAURI 工作目录，target 产物在 src-tauri/target/<profile>/。
+  // 不要写成 SRC_TAURI/../target —— 那是 workspace root 风格的目录，本项目没有。
+  const src = resolve(SRC_TAURI, "target", profile, exe);
   if (existsSync(src)) return src;
   console.log(`[prepare-sidecar] ${src} 不存在，先 cargo build --bin miniterm-hook --${profile}`);
   const args = ["build", "--bin", "miniterm-hook"];
