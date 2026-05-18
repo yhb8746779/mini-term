@@ -111,39 +111,46 @@ fn get_server_port() -> Option<u16> {
 }
 
 /// 获取 hook-server.json 的平台特定路径
-fn get_port_file_path() -> Option<std::path::PathBuf> {
-    let app_id = "com.mini-term.app";
+///
+/// ⚠️ APP_IDENTIFIER 必须与 src-tauri/tauri.conf.json 的 `identifier` 字段保持一致，
+/// 否则 hook server 写端口文件用一个目录、helper fallback 读用另一个目录，
+/// 会导致 MINITERM_HOOK_PORT 环境变量丢失（tmux/screen/外部 shell 启动 AI 等场景）
+/// 时连不上 server。当前 tauri.conf.json identifier = "com.tauri-app.tauri-app"。
+///
+/// 注：环境变量 fast path（MINITERM_HOOK_PORT）仍是首选，此路径仅作 fallback。
+const APP_IDENTIFIER: &str = "com.tauri-app.tauri-app";
 
+fn get_port_file_path() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        // Windows: %APPDATA%/com.mini-term.app/hook-server.json
+        // Windows: %APPDATA%/<identifier>/hook-server.json
         std::env::var("APPDATA").ok().map(|appdata| {
             std::path::PathBuf::from(appdata)
-                .join(app_id)
+                .join(APP_IDENTIFIER)
                 .join("hook-server.json")
         })
     }
 
     #[cfg(target_os = "macos")]
     {
-        // macOS: ~/Library/Application Support/com.mini-term.app/hook-server.json
+        // macOS: ~/Library/Application Support/<identifier>/hook-server.json
         dirs::home_dir().map(|h| {
             h.join("Library")
                 .join("Application Support")
-                .join(app_id)
+                .join(APP_IDENTIFIER)
                 .join("hook-server.json")
         })
     }
 
     #[cfg(target_os = "linux")]
     {
-        // Linux: $XDG_DATA_HOME/com.mini-term.app/hook-server.json
-        // 或 ~/.local/share/com.mini-term.app/hook-server.json
+        // Linux: $XDG_DATA_HOME/<identifier>/hook-server.json
+        // 或 ~/.local/share/<identifier>/hook-server.json
         let data_dir = std::env::var("XDG_DATA_HOME")
             .ok()
             .map(std::path::PathBuf::from)
             .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")));
-        data_dir.map(|d| d.join(app_id).join("hook-server.json"))
+        data_dir.map(|d| d.join(APP_IDENTIFIER).join("hook-server.json"))
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]

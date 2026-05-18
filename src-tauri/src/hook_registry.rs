@@ -39,6 +39,19 @@ const CODEX_HOOK_EVENTS: &[&str] = &[
 ];
 
 /// 获取 miniterm-hook 二进制的绝对路径
+///
+/// 与 Tauri sidecar 打包路径对齐（tauri.conf.json bundle.externalBin = "binaries/miniterm-hook"）：
+/// - 生产 .app: `Mini-Term.app/Contents/MacOS/miniterm-hook`（Tauri bundle 阶段将
+///   `src-tauri/binaries/miniterm-hook-<triple>` 复制到主 exe 同目录并去掉 triple 后缀）
+/// - 生产 Windows/Linux: 主 exe 同目录的 `miniterm-hook{,.exe}`
+/// - 开发模式: `target/{debug,release}/miniterm-hook{,.exe}`（Cargo 编 `[[bin]]` 默认产物，
+///   与 `target/.../tauri-app` 同目录）
+///
+/// 三种情况都满足 `current_exe().parent().join("miniterm-hook")` 形式。
+///
+/// 不使用 `app.path().resource_dir()` 的原因：sidecar 与 resource 不同，sidecar 与主 exe 同目录，
+/// resource 在 macOS 上位于 `Contents/Resources/`。Tauri v2 没有专门的 sidecar runtime path API，
+/// 官方建议直接基于 `current_exe()` 解析。
 fn get_hook_binary_path() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| format!("无法获取当前程序路径: {}", e))?;
     let dir = exe
@@ -52,7 +65,31 @@ fn get_hook_binary_path() -> Result<String, String> {
     };
 
     let hook_path = dir.join(hook_name);
+    if !hook_path.exists() {
+        return Err(format!(
+            "miniterm-hook 二进制未找到: {}（生产构建请确认 tauri.conf.json 的 bundle.externalBin 配置正确且 binaries/miniterm-hook-<triple> 已通过 prepare-sidecar.mjs 生成）",
+            hook_path.display()
+        ));
+    }
     Ok(hook_path.to_string_lossy().to_string())
+}
+
+/// 按目标 shell 的引号规则安全转义路径。
+///
+/// 必要性：macOS/Linux 上 Mini-Term 的安装路径常带空格（用户拖到 `~/Downloads/My Apps/` 等），
+/// 不转义直接拼会被 shell 拆字导致 hook 命令在 helper 启动前就失败。
+///
+/// 规则：
+/// - Unix（Claude Code/Codex 用 `/bin/sh -c` 跑 command）：POSIX 单引号包裹；
+///   内嵌单引号按经典模式 `'\''` 转义。
+/// - Windows（Claude Code 在 Win 下走 `cmd.exe`）：双引号包裹；内嵌双引号转义为 `""`
+///   （cmd.exe 的转义规则）。
+fn shell_quote(s: &str) -> String {
+    if cfg!(windows) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 /// 获取 Claude Code 配置文件路径: ~/.claude/settings.json
@@ -75,12 +112,11 @@ fn codex_config_path() -> Option<PathBuf> {
 /// 为 Claude Code 构建单个 hook 条目
 ///
 /// Claude Code 格式要求: { "matcher": "", "hooks": [{ "type": "command", "command": "..." }] }
+///
+/// 所有平台都对 hook_path 走 shell_quote，避免路径含空格（如 `/Applications/Mini Term.app/...`
+/// 或用户自定义路径）时被 shell 拆字、helper 启动前就失败。
 fn build_claude_hook_entry(hook_path: &str, event: &str) -> Value {
-    let command = if cfg!(windows) {
-        format!("\"{}\" {}", hook_path, event)
-    } else {
-        format!("{} {}", hook_path, event)
-    };
+    let command = format!("{} {}", shell_quote(hook_path), event);
     serde_json::json!({
         "matcher": "",
         "hooks": [{
@@ -242,13 +278,14 @@ fn codex_event_timeout(event: &str) -> u64 {
 
 /// 为 Codex 构建单个 hook 条目
 ///
-/// Codex 在 Windows 上使用 PowerShell 执行 hook 命令，
-/// 需要用 call operator (`& "path"`) 格式。
+/// Codex 在 Windows 上使用 PowerShell 执行 hook 命令，需要用 call operator (`& "path"`)；
+/// macOS/Linux 走 `/bin/sh -c`，POSIX 单引号包裹最稳。两边都靠 shell_quote 自动选规则。
 fn build_codex_hook_entry(hook_path: &str, event: &str) -> Value {
     let command = if cfg!(windows) {
-        format!("& \"{}\" {}", hook_path, event)
+        // PowerShell call operator + 双引号包裹路径（shell_quote 默认就是双引号包裹）
+        format!("& {} {}", shell_quote(hook_path), event)
     } else {
-        format!("{} {}", hook_path, event)
+        format!("{} {}", shell_quote(hook_path), event)
     };
     serde_json::json!([{
         "hooks": [{
@@ -471,13 +508,9 @@ fn gemini_settings_path() -> Option<PathBuf> {
 
 /// 为 Gemini CLI 构建单个 hook 条目（结构同 Claude Code）
 fn build_gemini_hook_entry(hook_path: &str, event: &str) -> Value {
-    // Gemini 和 Claude Code 一样，都是从配置直接 exec，
-    // Windows 下走 cmd.exe 调用，带空格的路径用双引号包起来即可。
-    let command = if cfg!(windows) {
-        format!("\"{}\" {}", hook_path, event)
-    } else {
-        format!("{} {}", hook_path, event)
-    };
+    // Gemini 和 Claude Code 一样，从配置直接 exec；shell_quote 在 Win 下出双引号、
+    // 在 Unix 下出 POSIX 单引号，两边都防空格路径。
+    let command = format!("{} {}", shell_quote(hook_path), event);
     serde_json::json!({
         "matcher": "",
         "hooks": [{
