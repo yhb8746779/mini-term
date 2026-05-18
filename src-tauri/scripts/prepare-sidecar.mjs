@@ -113,19 +113,32 @@ function prepareSingleArchSidecar(profile, target, hostTriple) {
 }
 
 /// 用 lipo 把 aarch64 + x86_64 两个 darwin binary 合并成 universal fat binary。
-/// 文件名 `miniterm-hook-universal-apple-darwin`，匹配 Tauri build --target
-/// universal-apple-darwin 阶段实际查找的资源路径。
-function prepareUniversalSidecar(aarch64Path, x86_64Path) {
-  const dstDir = resolve(SRC_TAURI, "binaries");
-  const dst = resolve(dstDir, "miniterm-hook-universal-apple-darwin");
+///
+/// 同时写两个位置：
+/// 1. `binaries/miniterm-hook-universal-apple-darwin`
+///    匹配 externalBin sidecar 命名约定，让 tauri-build lib 阶段校验通过。
+/// 2. `target/universal-apple-darwin/release/miniterm-hook`
+///    匹配 cargo 默认 [[bin]] 产物路径风格。Tauri v2 bundling 阶段对 universal
+///    target 实际找的就是这个路径（实测错误信息：`Failed to copy binary from
+///    target/universal-apple-darwin/release/miniterm-hook ... does not exist`），
+///    cargo 不会自动 lipo 合并 [[bin]]，必须手动生成。
+function prepareUniversalSidecar(profile, aarch64Path, x86_64Path) {
+  const dstBin = resolve(SRC_TAURI, "binaries", "miniterm-hook-universal-apple-darwin");
+  const cargoUniDir = resolve(SRC_TAURI, "target", "universal-apple-darwin", profile);
+  const dstCargo = resolve(cargoUniDir, "miniterm-hook");
+  mkdirSync(cargoUniDir, { recursive: true });
 
-  console.log(`[prepare-sidecar] lipo -create -> ${dst}`);
-  const r = spawnSync("lipo", ["-create", "-output", dst, aarch64Path, x86_64Path], {
-    stdio: "inherit",
-  });
-  if (r.status !== 0) throw new Error("lipo -create 失败");
-  chmodSync(dst, 0o755);
-  console.log(`[prepare-sidecar] ${dst}`);
+  const runLipo = (out) => {
+    console.log(`[prepare-sidecar] lipo -create -> ${out}`);
+    const r = spawnSync("lipo", ["-create", "-output", out, aarch64Path, x86_64Path], {
+      stdio: "inherit",
+    });
+    if (r.status !== 0) throw new Error(`lipo -create 失败: ${out}`);
+    chmodSync(out, 0o755);
+  };
+
+  runLipo(dstBin);
+  runLipo(dstCargo);
 }
 
 function main() {
@@ -141,9 +154,10 @@ function main() {
     produced[target] = prepareSingleArchSidecar(profile, target, hostTriple);
   }
 
-  // macOS 双 arch 同时存在 → 合并出 universal fat binary
+  // macOS 双 arch 同时存在 → 合并出 universal fat binary（写两个位置）
   if (produced["aarch64-apple-darwin"] && produced["x86_64-apple-darwin"]) {
     prepareUniversalSidecar(
+      profile,
       produced["aarch64-apple-darwin"],
       produced["x86_64-apple-darwin"],
     );
