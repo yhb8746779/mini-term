@@ -5,15 +5,17 @@
 //
 // 触发时机: tauri.conf.json beforeBuildCommand / beforeDevCommand。
 //
-// 设计原则：
-// - profile 通过命令行参数 (debug/release) 指定，默认 release
-// - 默认按当前 host triple 生成；macOS 上若 toolchain 同时安装了 aarch64 和
-//   x86_64 两个 target（CI universal build 必备），自动同时生成两个 sidecar，
-//   让 `tauri build --target universal-apple-darwin` 能找到全部资源
-// - 若 miniterm-hook 还没编出来，主动 cargo build 一次
-// - 解决 tauri-build 校验 externalBin 资源 ↔ cargo build 产出 sidecar 的循环
-//   依赖：先放 0 字节占位文件让 build.rs 校验通过，cargo build 完后真 binary
-//   覆盖占位
+// 三种典型场景：
+// 1) 本地 dev（mac aarch64-only）：只生成 host triple 一个文件
+// 2) CI Linux/Windows：只生成对应单 target 文件
+// 3) CI macOS universal：rustup 安装了 aarch64 + x86_64 双 target，
+//    本脚本会分别编译两个 arch，再用 `lipo -create` 合并为一个 universal
+//    binary 文件名 `miniterm-hook-universal-apple-darwin`（Tauri build
+//    --target universal-apple-darwin 阶段实际需要的就是这一个 fat binary）。
+//
+// 同时还为单 arch target 文件保留单独生成，以便：
+// - 单架构 build（比如 --target aarch64-apple-darwin）也能找到对应 sidecar
+// - tauri-build 在 lib build.rs 阶段对每个 cargo target 做的资源校验都能通过
 
 import { execSync, spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, chmodSync, writeFileSync } from "node:fs";
@@ -32,7 +34,6 @@ function getHostTriple() {
   return m[1].trim();
 }
 
-/// 返回 rustup 已安装的 target triple 列表
 function getInstalledTargets() {
   try {
     const out = execSync("rustup target list --installed", { encoding: "utf8" });
@@ -42,8 +43,8 @@ function getInstalledTargets() {
   }
 }
 
-/// 决定本次需要生成 sidecar 的 target 列表
-function resolveTargets(hostTriple) {
+/// 返回需要单独编译产出的 target triple 列表（不含 universal-apple-darwin 这种伪 triple）。
+function resolveSingleArchTargets(hostTriple) {
   // 命令行覆盖（逗号分隔）；CI 可以传 --targets aarch64-apple-darwin,x86_64-apple-darwin
   const cliIdx = process.argv.findIndex((a) => a === "--targets");
   if (cliIdx >= 0 && process.argv[cliIdx + 1]) {
@@ -53,12 +54,11 @@ function resolveTargets(hostTriple) {
     return process.env.SIDECAR_TARGETS.split(",").map((s) => s.trim()).filter(Boolean);
   }
 
-  // macOS universal 自动检测：rustup 同时装了 aarch64 和 x86_64 → 双生成
+  // macOS universal 自动检测：rustup 同时装了 aarch64 和 x86_64 → 双 arch 编译
   if (process.platform === "darwin") {
     const installed = getInstalledTargets();
-    const macTargets = installed.filter((t) => t.endsWith("-apple-darwin"));
-    if (macTargets.includes("aarch64-apple-darwin") &&
-        macTargets.includes("x86_64-apple-darwin")) {
+    if (installed.includes("aarch64-apple-darwin") &&
+        installed.includes("x86_64-apple-darwin")) {
       return ["aarch64-apple-darwin", "x86_64-apple-darwin"];
     }
   }
@@ -68,15 +68,10 @@ function resolveTargets(hostTriple) {
 
 function buildHookForTarget(profile, target, isHostTriple) {
   const exe = process.platform === "win32" ? "miniterm-hook.exe" : "miniterm-hook";
-  // 非 host triple 用 cargo --target，产物路径是 target/<triple>/<profile>/。
-  // host triple 不传 --target，产物在 target/<profile>/（cargo 默认行为）。
-  // 注意：如果用户给所有 build 都加了 --target host-triple（CI 普遍写法），
-  //       cargo 产物会落到 target/<triple>/<profile>/，不在 target/<profile>/。
-  //       下面探测两个路径，存在哪个用哪个。
+  // 优先 target 子目录路径（CI 风格），fallback 到 flat（host triple 默认）
   const tripleDir = resolve(SRC_TAURI, "target", target, profile, exe);
   const flatDir = resolve(SRC_TAURI, "target", profile, exe);
 
-  // 选择 src 路径：优先 triple 子目录（CI 风格），fallback 到 flat（本地默认风格）
   const pickExistingSrc = () => {
     if (existsSync(tripleDir)) return tripleDir;
     if (isHostTriple && existsSync(flatDir)) return flatDir;
@@ -97,13 +92,13 @@ function buildHookForTarget(profile, target, isHostTriple) {
   return src;
 }
 
-function prepareSidecarForTarget(profile, target, hostTriple) {
+function prepareSingleArchSidecar(profile, target, hostTriple) {
   const exeSuffix = target.includes("windows") ? ".exe" : "";
   const dstDir = resolve(SRC_TAURI, "binaries");
   mkdirSync(dstDir, { recursive: true });
   const dst = resolve(dstDir, `miniterm-hook-${target}${exeSuffix}`);
 
-  // 先放 0 字节占位让 tauri-build 校验通过（详见模块顶注释）
+  // 先放 0 字节占位让 tauri-build 校验通过
   if (!existsSync(dst)) {
     writeFileSync(dst, "");
     if (!target.includes("windows")) chmodSync(dst, 0o755);
@@ -114,19 +109,44 @@ function prepareSidecarForTarget(profile, target, hostTriple) {
   copyFileSync(src, dst);
   if (!target.includes("windows")) chmodSync(dst, 0o755);
   console.log(`[prepare-sidecar] ${dst}`);
+  return dst;
+}
+
+/// 用 lipo 把 aarch64 + x86_64 两个 darwin binary 合并成 universal fat binary。
+/// 文件名 `miniterm-hook-universal-apple-darwin`，匹配 Tauri build --target
+/// universal-apple-darwin 阶段实际查找的资源路径。
+function prepareUniversalSidecar(aarch64Path, x86_64Path) {
+  const dstDir = resolve(SRC_TAURI, "binaries");
+  const dst = resolve(dstDir, "miniterm-hook-universal-apple-darwin");
+
+  console.log(`[prepare-sidecar] lipo -create -> ${dst}`);
+  const r = spawnSync("lipo", ["-create", "-output", dst, aarch64Path, x86_64Path], {
+    stdio: "inherit",
+  });
+  if (r.status !== 0) throw new Error("lipo -create 失败");
+  chmodSync(dst, 0o755);
+  console.log(`[prepare-sidecar] ${dst}`);
 }
 
 function main() {
-  // profile：CLI 第一个非 flag 参数（debug/release），否则环境变量 PROFILE，最后默认 release
   const positional = process.argv.slice(2).filter((a) => !a.startsWith("--") && (a === "debug" || a === "release"));
   const profile = positional[0] || (process.env.PROFILE === "debug" ? "debug" : "release");
 
   const hostTriple = getHostTriple();
-  const targets = resolveTargets(hostTriple);
-  console.log(`[prepare-sidecar] profile=${profile} targets=${targets.join(",")}`);
+  const singleArchTargets = resolveSingleArchTargets(hostTriple);
+  console.log(`[prepare-sidecar] profile=${profile} targets=${singleArchTargets.join(",")}`);
 
-  for (const target of targets) {
-    prepareSidecarForTarget(profile, target, hostTriple);
+  const produced = {};
+  for (const target of singleArchTargets) {
+    produced[target] = prepareSingleArchSidecar(profile, target, hostTriple);
+  }
+
+  // macOS 双 arch 同时存在 → 合并出 universal fat binary
+  if (produced["aarch64-apple-darwin"] && produced["x86_64-apple-darwin"]) {
+    prepareUniversalSidecar(
+      produced["aarch64-apple-darwin"],
+      produced["x86_64-apple-darwin"],
+    );
   }
 }
 
