@@ -11,10 +11,12 @@ import { ProjectList } from './components/ProjectList';
 import { FileTree } from './components/FileTree';
 import { GitHistory } from './components/GitHistory';
 import { SettingsModal } from './components/SettingsModal';
+import { SearchModal } from './components/SearchModal';
 import { ToastContainer } from './components/ToastContainer';
 import { useTauriEvent } from './hooks/useTauriEvent';
 import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
+import { markAiPty } from './utils/terminalCache';
 import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, AiProvider } from './types';
 
 // ─── Debug experiment switches ─────────────────────────────────
@@ -36,6 +38,8 @@ export function App() {
   const restoredProjectsRef = useRef(new Set<string>());
   const activeProject = config.projects.find((p) => p.id === activeProjectId) ?? null;
   const activeProjectReady = !activeProjectId || accessReadyProjectId === activeProjectId;
+  const searchModalOpen = useAppStore((s) => s.searchModalOpen);
+  const setSearchModalOpen = useAppStore((s) => s.setSearchModalOpen);
 
   useEffect(() => {
     invoke<AppConfig>('load_config').then((cfg) => {
@@ -112,6 +116,19 @@ export function App() {
     config,
   ]);
 
+  // Ctrl+Shift+F 打开/关闭搜索弹窗
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.shiftKey && e.key === 'F') {
+        e.preventDefault();
+        const { searchModalOpen: isOpen, setSearchModalOpen: setOpen } = useAppStore.getState();
+        setOpen(!isOpen);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
   // 主题变化时应用新主题
   useEffect(() => {
     applyTheme(config.theme ?? 'auto');
@@ -129,6 +146,7 @@ export function App() {
 
   useTauriEvent<PtyStatusChangePayload>('pty-status-change', useCallback((payload) => {
     console.log('[fe-status]', payload.ptyId, payload.status, payload.provider ?? '(no provider)');
+    markAiPty(payload.ptyId, typeof payload.status === 'string' && payload.status.startsWith('ai-'));
     updatePaneStatusByPty(
       payload.ptyId,
       payload.status as PaneStatus,
@@ -307,6 +325,7 @@ export function App() {
         </Allotment> : null}
       </div>
       <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} />
+      <SearchModal open={searchModalOpen} onClose={() => setSearchModalOpen(false)} />
       <ToastContainer />
     </div>
   );

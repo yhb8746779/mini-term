@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// Layer 2（进程级兜底）：从近期 PTY 输出中识别 AI CLI 启动 banner，
 /// 用于在 Layer 1（命令 echo 解析）漏判时恢复会话状态。
@@ -914,16 +914,36 @@ pub fn create_pty(
                 .unwrap_or(fallback_locale);
             cmd.env("LC_CTYPE", lc_ctype_val);
         }
+
+        // LESSCHARSET 告诉 git 默认 pager (less) 直接输出 UTF-8 字节，
+        // 不再把非 ASCII 字符转义成 <XX> 序列（git log 中文乱码常见原因）。
+        cmd.env("LESSCHARSET", "utf-8");
     }
 
-    let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
-
+    // 提前分配 pty_id 以便注入到子进程环境变量。spawn 失败时 id 浪费一个，
+    // 但 next_id 只是单调计数器，不影响功能。
     let pty_id = {
         let mut next = state.next_id.lock().unwrap();
         let id = *next;
         *next += 1;
         id
     };
+
+    // ── Hook 系统环境变量注入 ──────────────────────────────────────────────
+    // MINITERM_PTY_ID: miniterm-hook CLI 读取此变量识别事件来自哪个 PTY pane，
+    //   实现"事件 ↔ 终端"精确关联（Claude Code / Codex / Gemini hook 调用时继承）
+    // MINITERM_HOOK_PORT: hook server 实际监听的端口（按需启动且端口冲突时会递增），
+    //   miniterm-hook 优先读此变量发送 POST，避免每次读端口文件
+    cmd.env("MINITERM_PTY_ID", pty_id.to_string());
+    let hook_port = {
+        let hook_state = app.state::<crate::hook_server::HookState>();
+        hook_state.get_port()
+    };
+    if hook_port != 0 {
+        cmd.env("MINITERM_HOOK_PORT", hook_port.to_string());
+    }
+
+    let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
 
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
@@ -1134,7 +1154,11 @@ pub fn resize_pty(state: tauri::State<'_, PtyManager>, pty_id: u32, cols: u16, r
 }
 
 #[tauri::command]
-pub fn kill_pty(state: tauri::State<'_, PtyManager>, pty_id: u32) -> Result<(), String> {
+pub fn kill_pty(
+    app: AppHandle,
+    state: tauri::State<'_, PtyManager>,
+    pty_id: u32,
+) -> Result<(), String> {
     // Remove metadata maps immediately so subsequent lookups return nothing.
     let instance = state.instances.lock().unwrap().remove(&pty_id);
     state.last_output.lock().unwrap().remove(&pty_id);
@@ -1147,6 +1171,11 @@ pub fn kill_pty(state: tauri::State<'_, PtyManager>, pty_id: u32) -> Result<(), 
     state.resize_cooldown_until.lock().unwrap().remove(&pty_id);
     state.recent_output_window.lock().unwrap().remove(&pty_id);
     state.last_busy_signal_at.lock().unwrap().remove(&pty_id);
+
+    // Hook state 同步清理：PTY 关闭后该 ID 上的 hook 事件就没意义了
+    if let Some(hook_state) = app.try_state::<crate::hook_server::HookState>() {
+        hook_state.remove(pty_id);
+    }
 
     // Drop the PTY instance on a background thread.
     //

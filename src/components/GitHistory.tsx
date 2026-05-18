@@ -4,6 +4,7 @@ import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useAppStore } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
 import { showContextMenu } from '../utils/contextMenu';
+import { isAiPty } from '../utils/terminalCache';
 import { formatRelativeTime } from '../utils/timeFormat';
 import { CommitDiffModal } from './CommitDiffModal';
 import type { GitRepoInfo, GitCommitInfo, CommitFileInfo, BranchInfo, PtyOutputPayload } from '../types';
@@ -368,6 +369,7 @@ export function GitHistory() {
     'pty-output',
     useCallback(
       (payload: PtyOutputPayload) => {
+        if (isAiPty(payload.ptyId)) return;
         if (GIT_REFRESH_PATTERNS.some((p) => p.test(payload.data))) {
           debouncedRefresh();
         }

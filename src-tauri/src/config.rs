@@ -65,6 +65,10 @@ pub struct AppConfig {
     pub terminal_font_preset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_custom_font_family: Option<String>,
+    /// Hook server 开关：true 时启动时绑定 127.0.0.1:23456 接收 Claude/Codex/Gemini hook 事件。
+    /// 默认关闭（避免 Windows 防火墙无条件弹窗），用户在设置页主动开启。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +174,7 @@ impl Default for AppConfig {
             vscode_path: None,
             terminal_font_preset: None,
             terminal_custom_font_family: None,
+            hook_enabled: None,
         }
     }
 }
