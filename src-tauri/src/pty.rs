@@ -367,16 +367,27 @@ fn has_seconds_marker(data: &str) -> bool {
                 || (c == 0xE2 && bytes.get(s_pos + 2) == Some(&0x80) && bytes.get(s_pos + 3) == Some(&0xA2)),
         };
         if !after_ok { continue; }
-        // 数字前（跳过空白后）必须是分隔符或 chunk 开头
+        // 数字前（跳过空白后）必须是分隔符或 chunk 开头，
+        // 或者前缀是 "<digits>m" / "<digits>h" 单位（"1m 7s" / "2h 5m" 这类
+        // claude/codex/gemini 跑过 1 分钟后的复合时长格式）。
         let mut k = num_start;
         while k > 0 && (bytes[k - 1] == b' ' || bytes[k - 1] == b'\t') { k -= 1; }
         let before_ok = if k == 0 {
             true
         } else {
             let pc = bytes[k - 1];
-            matches!(pc, b'(' | b',' | b'\n' | b'\r')
+            if matches!(pc, b'(' | b',' | b'\n' | b'\r')
                 || (k >= 2 && bytes[k - 2] == 0xC2 && pc == 0xB7)
                 || (k >= 3 && bytes[k - 3] == 0xE2 && bytes[k - 2] == 0x80 && pc == 0xA2)
+            {
+                true
+            } else if matches!(pc, b'm' | b'h') && k >= 2 && bytes[k - 2].is_ascii_digit() {
+                // 复合时长前缀 "1m " / "2h "：m/h 前必须紧跟数字，避免 "tools"
+                // 末尾的 "ls "、句尾 "him " 等普通文本误命中。
+                true
+            } else {
+                false
+            }
         };
         if before_ok { return true; }
     }
@@ -481,6 +492,24 @@ impl PtyManager {
             sessions.insert(pty_id);
             providers.insert(pty_id, provider.to_string());
         }
+    }
+
+    /// Layer 3 反向裁定：当 PTY 子进程树中 AI CLI 已不存在（含异常自退、MCP
+    /// 启动失败回到 shell 等不会触发 keyboard exit_ai 路径的场景），由
+    /// process_monitor 在宽限期后调用，清除会话标记并清空近期信号。
+    ///
+    /// 同步清空 recent_output_window 防止上一次 AI banner 残留触发 Layer 2
+    /// reconcile 把会话又建回来；清掉 last_busy_signal_at 防止旧 spinner
+    /// 时间戳让本应 idle 的状态在窗口期内被误判回 AI working。
+    pub fn clear_ai_session(&self, pty_id: u32) {
+        {
+            let mut sessions = self.ai_sessions.lock().unwrap();
+            let mut providers = self.ai_providers.lock().unwrap();
+            sessions.remove(&pty_id);
+            providers.remove(&pty_id);
+        }
+        self.recent_output_window.lock().unwrap().insert(pty_id, String::new());
+        self.last_busy_signal_at.lock().unwrap().remove(&pty_id);
     }
 
     /// 返回近期输出窗口的原始内容（含 ANSI 转义），供 process_monitor 做 awaiting-input 检测
@@ -1883,6 +1912,22 @@ mod tests {
         // 数字+s 在 chunk 开头/末尾应仍能识别
         assert!(chunk_has_busy_signal("5s "));
         assert!(chunk_has_busy_signal("(2s"));
+    }
+
+    #[test]
+    fn busy_signal_compound_minute_seconds() {
+        // claude/codex/gemini 跑过 1 分钟后 spinner 时长会变成 "1m 7s"
+        // 复合格式，has_seconds_marker 必须识别 "7s" 前面是数字+m 单位。
+        assert!(chunk_has_busy_signal(
+            "Processing… (1m 7s · ↓ 3.0k tokens · almost done thinking with xhigh effort)"
+        ));
+        assert!(chunk_has_busy_signal("* Cooked for 1m 43s"));
+        assert!(chunk_has_busy_signal("(esc to interrupt, 2m 5s)"));
+        // 小时+分+秒 也应识别（罕见但合法）
+        assert!(chunk_has_busy_signal("Brewing… (1h 2m 30s)"));
+        // 反例：m/h 前不是数字时不应误命中
+        assert!(!chunk_has_busy_signal("hi m 5s old"));
+        assert!(!chunk_has_busy_signal("alarm 7s"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use serde::Serialize;
 use std::collections::HashMap;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 /// Layer 3 检测的 AI CLI 命令名（与 pty.rs AI_COMMANDS 保持同步）
@@ -23,6 +23,15 @@ const AI_GENERATING_WINDOW: Duration = Duration::from_secs(2);
 /// `Contemplating (Ns)`、gemini `(esc to cancel, Ns)` 的 N 都是秒级递增），
 /// 5s 窗口足够维持"AI 仍在工作"判定；spinner 一旦从屏幕消失就立即视为 complete。
 const AI_BUSY_SIGNAL_WINDOW: Duration = Duration::from_secs(5);
+/// Layer 3 反向裁定的宽限期：连续 N 秒在 PTY 子进程树中看不到 AI CLI
+/// 进程时，视为 AI 已退出（含 codex MCP 启动失败自退、claude 异常 crash、
+/// 用户从 IDE 终止进程等不经过 keyboard exit_ai 路径的场景），清除会话标记。
+///
+/// 5s 宽限的取舍：
+/// - 用户键入 `claude<Enter>` 后，shell 到 fork 出 claude 进程通常 200~500ms，
+///   慢机器/冷启动最多 ~2s；5s 留有充裕余量，避免误清刚启动的会话。
+/// - 太长会让"AI 已退出但状态点继续闪"的窗口期太久（用户可见的 bug 时长）。
+const AI_SUBPROCESS_GRACE: Duration = Duration::from_secs(5);
 
 /// 强交互短语：出现即触发 ai-awaiting-input
 ///
@@ -337,6 +346,9 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
     thread::spawn(move || {
         // 存储上一次发送的 (status, provider) 对，避免重复 emit 相同状态
         let mut prev_states: HashMap<u32, (String, Option<String>)> = HashMap::new();
+        // Layer 3 反向裁定用：每个 pty 最近一次在子进程树中观察到 AI CLI 的时间。
+        // 连续 AI_SUBPROCESS_GRACE 都未观察到则清除会话标记。
+        let mut last_seen_ai_subproc: HashMap<u32, Instant> = HashMap::new();
 
         loop {
             let pty_ids = pty_manager.get_pty_ids();
@@ -378,15 +390,46 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
                 pty_manager.try_reconcile_ai_from_banner(*pty_id);
 
                 // Layer 3：子进程名真相源，最后生效，覆盖 Layer 1/2 可能的误判
+                let mut layer3_saw_ai = false;
                 if let Some(ref snapshot) = proc_snapshot {
                     if let Some(shell_pid) = pty_manager.get_child_pid(*pty_id) {
                         if let Some(provider) = detect_ai_in_subtree(snapshot, shell_pid) {
                             pty_manager.force_ai_session(*pty_id, provider);
+                            layer3_saw_ai = true;
                         }
                     }
                 }
 
-                let (is_ai, prov) = pty_manager.get_ai_session_info(*pty_id);
+                let (mut is_ai, mut prov) = pty_manager.get_ai_session_info(*pty_id);
+
+                // ── Layer 3 反向裁定：AI 子进程消失则撤销会话标记 ────────────
+                //
+                // Layer 1（keyboard）的 exit_ai 仅覆盖 /exit、Ctrl+D、双 Ctrl+C
+                // 等"用户主动退出"路径。AI CLI 自身 crash/exit（如 codex 因
+                // MCP 启动失败立即返回到 shell、claude 异常退出）时这些键盘
+                // 信号不会触发，会话标记会一直留着导致状态点持续闪烁。
+                //
+                // Layer 3 在子进程快照可用时，看见 AI CLI 就刷新时间戳，
+                // 看不见则计时；超过宽限期即调 clear_ai_session 把会话清掉。
+                // proc_snapshot 失败（极少数权限/IO 错误）时跳过本轮不冒进清除。
+                if proc_snapshot.is_some() {
+                    if is_ai {
+                        let now = Instant::now();
+                        if layer3_saw_ai {
+                            last_seen_ai_subproc.insert(*pty_id, now);
+                        } else {
+                            let last = *last_seen_ai_subproc.entry(*pty_id).or_insert(now);
+                            if now.duration_since(last) >= AI_SUBPROCESS_GRACE {
+                                pty_manager.clear_ai_session(*pty_id);
+                                last_seen_ai_subproc.remove(pty_id);
+                                is_ai = false;
+                                prov = None;
+                            }
+                        }
+                    } else {
+                        last_seen_ai_subproc.remove(pty_id);
+                    }
+                }
                 let (status, provider) = if is_ai {
                     let raw_window = pty_manager.get_recent_output_window(*pty_id);
 
@@ -426,6 +469,7 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
             }
 
             prev_states.retain(|id, _| pty_ids.contains(id));
+            last_seen_ai_subproc.retain(|id, _| pty_ids.contains(id));
 
             let sleep_ms = if pty_ids.is_empty() { 2000 } else { 500 };
             thread::sleep(Duration::from_millis(sleep_ms));

@@ -310,6 +310,13 @@ function FontSizeSlider({
 
 // ─── SystemSettings（系统设置页）───
 
+const IS_MACOS = /Mac OS X|Macintosh/.test(navigator.userAgent);
+
+// macOS 隐私与安全 → 完全磁盘访问 子页面 URL Scheme。
+// 旧版（Big Sur ~ Ventura）走 com.apple.preference.security?Privacy_AllFiles；
+// 新版 System Settings（Ventura+）也兼容此 anchor，会直接定位到 FDA 列表。
+const FDA_PREF_URL = 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles';
+
 function SystemSettings() {
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
@@ -411,6 +418,30 @@ function SystemSettings() {
 
   return (
     <div className="space-y-6">
+      {/* macOS 完全磁盘访问引导（仅 macOS 显示） */}
+      {IS_MACOS && (
+        <div className="px-3 py-3 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-default)] space-y-2">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex-1 min-w-0">
+              <div className="text-base text-[var(--text-primary)]">macOS 完全磁盘访问</div>
+              <div className="text-sm text-[var(--text-muted)] mt-1 leading-relaxed">
+                把 Mini-Term 加入「完全磁盘访问」列表后，访问 Documents / Downloads / 桌面 / 外部卷等受保护目录时不再逐个弹窗授权。
+              </div>
+            </div>
+            <button
+              type="button"
+              className="px-3 py-1.5 text-base bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90 transition-opacity flex-shrink-0 whitespace-nowrap"
+              onClick={() => openUrl(FDA_PREF_URL)}
+            >
+              打开系统设置
+            </button>
+          </div>
+          <div className="text-xs text-[var(--text-muted)] leading-relaxed pt-1 border-t border-[var(--border-subtle)]">
+            操作步骤：① 点击右侧「打开系统设置」 → ② 在「完全磁盘访问权限」列表里点 ＋ → ③ 选择「应用程序 / Mini-Term」加入并打开开关 → ④ 重启本应用生效。
+          </div>
+        </div>
+      )}
+
       {/* 主题模式 */}
       <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
         主题
