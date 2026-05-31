@@ -142,8 +142,9 @@ async function restoreSplitNode(
           cwd: projectPath,
         });
         panes.push({ id: genId(), shellName: shell.name, status: 'idle' as PaneStatus, ptyId });
-      } catch {
-        // skip failed pane
+      } catch (err) {
+        // 启动时批量恢复，单个失败不阻塞其他 pane；仅记日志，便于 devtools 排查。
+        console.error('[restoreSplitNode] create_pty failed', { shell: shell.command, cwd: projectPath, err });
       }
     }
     if (panes.length === 0) return null;

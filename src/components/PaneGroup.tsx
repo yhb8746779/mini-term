@@ -6,6 +6,7 @@ import { StatusDot } from './StatusDot';
 import { showContextMenu } from '../utils/contextMenu';
 import { showConfirm, showPrompt } from '../utils/prompt';
 import { disposeTerminal } from '../utils/terminalCache';
+import { createPtySafe } from '../utils/createPty';
 import type { SplitNode, PaneState, ShellConfig } from '../types';
 
 interface Props {
@@ -28,11 +29,13 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
       ?? config.availableShells[0];
     if (!shell) return;
 
-    const ptyId = await invoke<number>('create_pty', {
+    const ptyId = await createPtySafe({
       shell: shell.command,
       args: shell.args ?? [],
       cwd: projectPath,
+      shellName: shell.name,
     });
+    if (ptyId === null) return;
 
     const newPane: PaneState = {
       id: genId(),

@@ -1,8 +1,8 @@
 import { useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { useAppStore, genId, saveLayoutToConfig } from '../store';
 import { SplitLayout } from './SplitLayout';
 import { showContextMenu } from '../utils/contextMenu';
+import { createPtySafe } from '../utils/createPty';
 import type { TerminalTab, PaneState, SplitNode, ShellConfig } from '../types';
 
 interface Props {
@@ -55,11 +55,13 @@ export function TerminalArea({ projectId, projectPath }: Props) {
       ?? config.availableShells[0];
     if (!shell) return;
 
-    const ptyId = await invoke<number>('create_pty', {
+    const ptyId = await createPtySafe({
       shell: shell.command,
       args: shell.args ?? [],
       cwd: projectPath,
+      shellName: shell.name,
     });
+    if (ptyId === null) return;
 
     const paneId = genId();
     const tabId = genId();
@@ -101,11 +103,13 @@ export function TerminalArea({ projectId, projectPath }: Props) {
         ?? config.availableShells[0];
       if (!shell) return;
 
-      const ptyId = await invoke<number>('create_pty', {
+      const ptyId = await createPtySafe({
         shell: shell.command,
         args: shell.args ?? [],
         cwd: projectPath,
+        shellName: shell.name,
       });
+      if (ptyId === null) return;
 
       const newPane: PaneState = {
         id: genId(),
