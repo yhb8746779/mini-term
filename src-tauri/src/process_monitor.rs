@@ -154,6 +154,12 @@ fn detect_awaiting_input(raw_output: &str) -> bool {
 ///   Unix 上保持 None，进程名本身就足够精确（gemini / codex 都是原生二进制）。
 type ProcEntry = (u32, u32, String, Option<String>);
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SubtreeObservation {
+    ai_provider: Option<&'static str>,
+    has_ssh: bool,
+}
+
 /// 抓一次系统进程列表。Unix 调 `ps -A`，Windows 用 sysinfo（含命令行）。
 #[cfg(unix)]
 fn snapshot_processes() -> Option<Vec<ProcEntry>> {
@@ -285,50 +291,60 @@ fn detect_ai_from_cmdline(cmdline: &str) -> Option<&'static str> {
     None
 }
 
-/// 在进程快照中，从 root_pid 做 BFS，找到任意 comm 匹配 AI CLI 名字的后代。
-/// 返回第一个匹配的 provider 名（稳定字符串切片）。
+/// 在进程快照中，从 root_pid 做 BFS，同时识别本地 AI CLI 和交互式 SSH 传输。
+/// root 本身也参与识别，以覆盖直接把 ssh.exe 作为 PTY 子进程启动的场景。
 ///
 /// 两级匹配：
 /// 1. 进程名直接匹配（claude.exe / codex.exe / gemini / grok）—— 覆盖原生二进制
 /// 2. node.exe / cmd.exe / pwsh.exe 等启动器进程 + 命令行参数匹配 npm 包名 ——
 ///    覆盖 Windows 下 gemini-cli 这类"只有 node.exe 没有原生 exe"的场景
-fn detect_ai_in_subtree(snapshot: &[ProcEntry], root_pid: u32) -> Option<&'static str> {
+fn inspect_process_subtree(snapshot: &[ProcEntry], root_pid: u32) -> SubtreeObservation {
     // 构建 ppid -> children 索引
     let mut by_ppid: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut by_pid: HashMap<u32, usize> = HashMap::new();
     for (idx, entry) in snapshot.iter().enumerate() {
+        by_pid.insert(entry.0, idx);
         by_ppid.entry(entry.1).or_default().push(idx);
     }
 
     let mut queue: Vec<u32> = vec![root_pid];
+    let mut observation = SubtreeObservation::default();
     // 深度保护：终端进程树一般很浅（shell → AI CLI → maybe node/python helper）
     let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
     while let Some(pid) = queue.pop() {
         if !visited.insert(pid) {
             continue;
         }
+        if let Some(&idx) = by_pid.get(&pid) {
+            let (_, _, comm, cmdline) = &snapshot[idx];
+            let lower = comm.to_lowercase();
+            let stem = lower.trim_end_matches(".exe");
+            if stem == "ssh" {
+                observation.has_ssh = true;
+            }
+            if observation.ai_provider.is_none() {
+                observation.ai_provider = AI_SUBPROCESS_NAMES
+                    .iter()
+                    .find(|&&ai| stem == ai)
+                    .map(|&ai| ai_to_static(ai))
+                    .or_else(|| {
+                        // ssh.exe 的 argv 可能包含远端命令或路径，不能据此认定
+                        // 主机存在 AI 子进程；远端状态只能由 PTY 数据流推断。
+                        if stem == "ssh" {
+                            None
+                        } else {
+                            cmdline.as_deref().and_then(detect_ai_from_cmdline)
+                        }
+                    });
+            }
+        }
         if let Some(child_idxs) = by_ppid.get(&pid) {
             for &idx in child_idxs {
-                let (child_pid, _, comm, cmdline) = &snapshot[idx];
-                let lower = comm.to_lowercase();
-                // 去掉常见扩展名，如 windows 上的 .exe
-                let stem = lower.trim_end_matches(".exe");
-                for &ai in AI_SUBPROCESS_NAMES {
-                    if stem == ai {
-                        return Some(ai_to_static(ai));
-                    }
-                }
-                // 命令行兜底：进程名没直接命中时（node.exe / cmd.exe / pwsh.exe 等），
-                // 检查命令行参数是否含 npm 包路径特征。Unix 上 cmdline=None，跳过。
-                if let Some(cmd) = cmdline {
-                    if let Some(provider) = detect_ai_from_cmdline(cmd) {
-                        return Some(provider);
-                    }
-                }
-                queue.push(*child_pid);
+                queue.push(snapshot[idx].0);
             }
         }
     }
-    None
+    observation
 }
 
 /// 把动态 &str 映射到固定 &'static str，避免 lifetime 泄漏
@@ -349,6 +365,10 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
         // Layer 3 反向裁定用：每个 pty 最近一次在子进程树中观察到 AI CLI 的时间。
         // 连续 AI_SUBPROCESS_GRACE 都未观察到则清除会话标记。
         let mut last_seen_ai_subproc: HashMap<u32, Instant> = HashMap::new();
+        // SSH 内的 AI 进程不在主机进程表中。这里只记录本地进程树是否处于 SSH
+        // 传输，不向远端安装 hook、转发环境变量或读写任何远端配置文件。
+        let mut ssh_transport_ptys: std::collections::HashSet<u32> =
+            std::collections::HashSet::new();
 
         loop {
             let pty_ids = pty_manager.get_pty_ids();
@@ -391,9 +411,12 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
 
                 // Layer 3：子进程名真相源，最后生效，覆盖 Layer 1/2 可能的误判
                 let mut layer3_saw_ai = false;
+                let mut layer3_saw_ssh = false;
                 if let Some(ref snapshot) = proc_snapshot {
                     if let Some(shell_pid) = pty_manager.get_child_pid(*pty_id) {
-                        if let Some(provider) = detect_ai_in_subtree(snapshot, shell_pid) {
+                        let observation = inspect_process_subtree(snapshot, shell_pid);
+                        layer3_saw_ssh = observation.has_ssh;
+                        if let Some(provider) = observation.ai_provider {
                             pty_manager.force_ai_session(*pty_id, provider);
                             layer3_saw_ai = true;
                         }
@@ -417,6 +440,18 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
                         let now = Instant::now();
                         if layer3_saw_ai {
                             last_seen_ai_subproc.insert(*pty_id, now);
+                            ssh_transport_ptys.remove(pty_id);
+                        } else if layer3_saw_ssh {
+                            // 远端 AI 无法出现在主机进程表中，不能把"未看到本地 AI"
+                            // 当成退出证据。保留 Layer 1/2 建立的会话，并继续按 PTY
+                            // 输出推断 thinking/generating/complete/awaiting-input。
+                            ssh_transport_ptys.insert(*pty_id);
+                            last_seen_ai_subproc.remove(pty_id);
+                        } else if ssh_transport_ptys.remove(pty_id) {
+                            // SSH 传输已经退出，远端 AI 必然不再连接到当前 PTY。
+                            pty_manager.clear_ai_session(*pty_id);
+                            is_ai = false;
+                            prov = None;
                         } else {
                             let last = *last_seen_ai_subproc.entry(*pty_id).or_insert(now);
                             if now.duration_since(last) >= AI_SUBPROCESS_GRACE {
@@ -428,6 +463,7 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
                         }
                     } else {
                         last_seen_ai_subproc.remove(pty_id);
+                        ssh_transport_ptys.remove(pty_id);
                     }
                 }
                 let (status, provider) = if is_ai {
@@ -470,6 +506,7 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
 
             prev_states.retain(|id, _| pty_ids.contains(id));
             last_seen_ai_subproc.retain(|id, _| pty_ids.contains(id));
+            ssh_transport_ptys.retain(|id| pty_ids.contains(id));
 
             let sleep_ms = if pty_ids.is_empty() { 2000 } else { 500 };
             thread::sleep(Duration::from_millis(sleep_ms));
@@ -477,3 +514,88 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
     });
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proc_entry(pid: u32, ppid: u32, name: &str) -> ProcEntry {
+        (pid, ppid, name.to_string(), None)
+    }
+
+    #[test]
+    fn subtree_detects_local_ai_provider() {
+        let snapshot = vec![
+            proc_entry(10, 0, "powershell.exe"),
+            proc_entry(11, 10, "claude.exe"),
+        ];
+
+        let observation = inspect_process_subtree(&snapshot, 10);
+
+        assert_eq!(observation.ai_provider, Some("claude"));
+        assert!(!observation.has_ssh);
+    }
+
+    #[test]
+    fn subtree_detects_ssh_below_local_shell() {
+        let snapshot = vec![
+            proc_entry(20, 0, "powershell.exe"),
+            proc_entry(21, 20, "ssh.exe"),
+        ];
+
+        let observation = inspect_process_subtree(&snapshot, 20);
+
+        assert_eq!(observation.ai_provider, None);
+        assert!(observation.has_ssh);
+    }
+
+    #[test]
+    fn subtree_detects_ssh_when_it_is_the_pty_root() {
+        let snapshot = vec![proc_entry(30, 0, "ssh.exe")];
+
+        let observation = inspect_process_subtree(&snapshot, 30);
+
+        assert_eq!(observation.ai_provider, None);
+        assert!(observation.has_ssh);
+    }
+
+    #[test]
+    fn ssh_remote_command_is_not_mistaken_for_local_ai_process() {
+        let snapshot = vec![(
+            35,
+            0,
+            "ssh.exe".to_string(),
+            Some("ssh vm /usr/local/lib/claude-code/bin/claude".to_string()),
+        )];
+
+        let observation = inspect_process_subtree(&snapshot, 35);
+
+        assert_eq!(observation.ai_provider, None);
+        assert!(observation.has_ssh);
+    }
+
+    #[test]
+    fn ssh_agent_is_not_mistaken_for_interactive_ssh() {
+        let snapshot = vec![
+            proc_entry(40, 0, "powershell.exe"),
+            proc_entry(41, 40, "ssh-agent.exe"),
+        ];
+
+        let observation = inspect_process_subtree(&snapshot, 40);
+
+        assert!(!observation.has_ssh);
+    }
+
+    #[test]
+    fn subtree_reports_local_ai_even_when_ssh_also_exists() {
+        let snapshot = vec![
+            proc_entry(50, 0, "powershell.exe"),
+            proc_entry(51, 50, "claude.exe"),
+            proc_entry(52, 51, "ssh.exe"),
+        ];
+
+        let observation = inspect_process_subtree(&snapshot, 50);
+
+        assert_eq!(observation.ai_provider, Some("claude"));
+        assert!(observation.has_ssh);
+    }
+}
