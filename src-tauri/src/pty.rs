@@ -882,6 +882,15 @@ pub fn create_pty(
 
     // Advertise terminal capabilities so TUI apps (Claude Code, etc.)
     // enable colors and advanced cursor rendering.
+    // Automated launchers may set TERM=dumb together with NO_COLOR=1. Once
+    // Mini-Term provides a real color PTY, that inherited opt-out is stale.
+    if std::env::var("TERM")
+        .ok()
+        .as_deref()
+        .is_some_and(|term| term.eq_ignore_ascii_case("dumb"))
+    {
+        cmd.env_remove("NO_COLOR");
+    }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
 

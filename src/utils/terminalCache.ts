@@ -19,6 +19,7 @@ import { useAppStore, findPaneByPty } from '../store';
 import type { PtyOutputPayload, AiProvider } from '../types';
 import { getResolvedTheme } from './themeManager';
 import { createPtyWriteQueue } from './ptyWriteQueue';
+import { showErrorToast } from './errorToast';
 
 export interface CachedTerminal {
   term: Terminal;
@@ -36,6 +37,10 @@ interface CachedEntry extends CachedTerminal {
     maxChunk: number;
     lastLogAt: number;
   };
+  // 上一次 cols/rows 漂移检测的时间戳。pty-output 节流到每 500ms 检查一次，
+  // 兜底 ResizeObserver 漏触发导致的 fit 不一致（窗口最小化还原、DPI 变化、
+  // Allotment 过渡期 fit 算错等场景）。
+  lastDriftCheckAt: number;
 }
 
 export const DARK_TERMINAL_THEME = {
@@ -407,6 +412,18 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
       void pasteToTerminal(ptyId);
       return false;
     }
+    // Ctrl+Shift+R：手动强制 refit + refresh。
+    // 自动 drift 检测兜不住时（比如 WebGL 字形图集偏移没触发尺寸变化）的逃生口。
+    if (e.ctrlKey && e.shiftKey && e.code === 'KeyR') {
+      e.preventDefault();
+      try {
+        fitAddon.fit();
+        term.refresh(0, Math.max(term.rows - 1, 0));
+        invoke('resize_pty', { ptyId, cols: term.cols, rows: term.rows }).catch(() => {});
+        logTerminalPerf('terminal_manual_refit', `pty_id=${ptyId} | cols=${term.cols} | rows=${term.rows}`);
+      } catch { /* ignore */ }
+      return false;
+    }
     // macOS 只在 Ctrl 单独按下时（无 Shift/Meta/Alt）才有系统绑定干扰
     if (e.ctrlKey && !e.shiftKey && !e.metaKey && !e.altKey) {
       const data = MACOS_CTRL_MAP[e.code];
@@ -463,6 +480,30 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
           entry.outputDiag.maxChunk = 0;
           entry.outputDiag.lastLogAt = now;
         }
+
+        // cols/rows 漂移兜底：ResizeObserver 偶尔会漏触发（最小化还原、DPI 切换、
+        // Allotment 过渡期 fit 算错等），导致 term.cols 跟可视宽度对不上，
+        // 输出按错误 cols 折行，表现为长行横向溢出，必须等用户拖窗口才恢复。
+        // 这里在输出落地前节流检测一次，偏差超阈值就自动 refit。
+        if (now - entry.lastDriftCheckAt > 500 && entry.wrapper.clientWidth > 0) {
+          entry.lastDriftCheckAt = now;
+          try {
+            const proposed = fitAddon.proposeDimensions();
+            if (proposed) {
+              const colsDrift = Math.abs(proposed.cols - term.cols);
+              const rowsDrift = Math.abs(proposed.rows - term.rows);
+              if (colsDrift > 2 || rowsDrift > 1) {
+                fitAddon.fit();
+                term.refresh(0, Math.max(term.rows - 1, 0));
+                invoke('resize_pty', { ptyId, cols: term.cols, rows: term.rows }).catch(() => {});
+                logTerminalPerf(
+                  'terminal_auto_refit',
+                  `pty_id=${ptyId} | cols_drift=${colsDrift} | rows_drift=${rowsDrift} | new_cols=${term.cols} | new_rows=${term.rows}`,
+                );
+              }
+            }
+          } catch { /* wrapper 未挂载到 DOM */ }
+        }
       }
       term.write(event.payload.data);
     }
@@ -487,6 +528,7 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     renderer,
     webglAddon,
     outputDiag: { writes: 0, bytes: 0, maxChunk: 0, lastLogAt: performance.now() },
+    lastDriftCheckAt: performance.now(),
   };
   cache.set(ptyId, entry);
   return entry;
@@ -595,6 +637,26 @@ export const _isMacOS = /Mac OS X|Macintosh/.test(navigator.userAgent);
 export const _isWindows = /Windows/.test(navigator.userAgent);
 export const _isLinux = /Linux/.test(navigator.userAgent) && !_isWindows && !_isMacOS;
 
+interface ClipboardPathImage {
+  savedPath: string;
+  terminalPath: string;
+}
+
+/** 通过 pane 绑定的 Shell 配置判断当前 PTY 是否由 wsl.exe 启动。 */
+function isWslPty(ptyId: number): boolean {
+  const { projectStates, config } = useAppStore.getState();
+  for (const projectState of projectStates.values()) {
+    for (const tab of projectState.tabs) {
+      const pane = findPaneByPty(tab.splitLayout, ptyId);
+      if (!pane) continue;
+      const shell = config.availableShells.find((candidate) => candidate.name === pane.shellName);
+      const command = shell?.command.trim().replace(/^"|"$/g, '') ?? '';
+      return /(^|[\\/])wsl(?:\.exe)?$/i.test(command);
+    }
+  }
+  return false;
+}
+
 /** 把剪贴板图片落盘成临时 PNG，返回路径；任何环节失败返回 null */
 async function trySaveStandardClipboardImage(): Promise<string | null> {
   try {
@@ -608,6 +670,29 @@ async function trySaveStandardClipboardImage(): Promise<string | null> {
     return path;
   } catch {
     return null;
+  }
+}
+
+/** 保存截图并返回终端可读取路径；优先走 WebView RGBA，再走平台原生剪贴板。 */
+async function trySaveClipboardImageForPathPaste(): Promise<ClipboardPathImage | null> {
+  try {
+    const image = await readImage();
+    const [rgba, size] = await Promise.all([image.rgba(), image.size()]);
+    return await invoke<ClipboardPathImage>('save_clipboard_rgba_image_for_path_paste', {
+      rgba: Array.from(rgba),
+      width: size.width,
+      height: size.height,
+    });
+  } catch (pluginError) {
+    try {
+      return await invoke<ClipboardPathImage>('read_clipboard_image_for_path_paste');
+    } catch (nativeError) {
+      debugTerm('clipboard:path_image_save_failed', {
+        pluginError: String(pluginError),
+        nativeError: String(nativeError),
+      });
+      return null;
+    }
   }
 }
 
@@ -638,7 +723,7 @@ function getAiProviderForPty(ptyId: number): AiProvider | null {
 // 剪贴板来源必须区分为以下几类，三种图片相关类型不可互换：
 //
 //   1. plain-text           → sendAiTextPaste
-//   2. raw-image            → sendAiScreenshotImagePaste      （截图工具图片位图）
+//   2. raw-image            → 路径提示或 sendAiScreenshotImagePaste（按平台/终端分流）
 //   3. explorer-image-files → sendAiExplorerImageFilesPaste   （Explorer 复制的图片文件路径）
 //   4. explorer-files       → sendAiExplorerFilesPaste        （Explorer 复制的普通文件路径）
 //   5. finder-image-files   → sendAiExplorerImageFilesPaste   （Finder 复制的图片文件路径）
@@ -650,7 +735,7 @@ function getAiProviderForPty(ptyId: number): AiProvider | null {
 //   raw-image
 //     = 截图工具/图片编辑器直接写入剪贴板的图片位图（CF_DIB/CF_BITMAP）。
 //       Web Clipboard API 暴露 image/* MIME type。
-//       Mini-Term 增强路径：Windows Alt+V 让 Claude/Codex 从剪贴板读取真实图片数据。
+//       Windows WSL / macOS AI 终端转为可读取路径；Windows 本机终端保留原生图片快捷键。
 //
 //   explorer-image-files / finder-image-files
 //     = 资源管理器/Finder 复制的图片文件（CF_HDROP / public.file-url 文件路径列表）。
@@ -1008,7 +1093,7 @@ async function detectClipboardPayload(preferImage = false): Promise<ClipboardPay
  *
  * AI pane（Claude / Codex / Gemini CLI）六条独立路径：
  *   plain-text             → sendAiTextPaste                — bracketed-paste，无延迟
- *   raw-image              → sendAiScreenshotImagePaste     — 截图位图，Windows Alt+V
+ *   raw-image              → 路径提示或 sendAiScreenshotImagePaste — 按平台/终端分流
  *   explorer-image-files   → sendAiExplorerImageFilesPaste  — 文件→位图写入剪贴板→Alt+V
  *   finder-image-files     → sendAiExplorerImageFilesPaste  — 同上（macOS）
  *   explorer-files         → sendAiExplorerFilesPaste       — Explorer 普通文件路径注入
@@ -1016,7 +1101,7 @@ async function detectClipboardPayload(preferImage = false): Promise<ClipboardPay
  *   rich-object            → Ctrl+V                        — 无法识别的富对象，residual fallback
  *
  *   三种"图片相关"类型严格区分（参见顶部注释）：
- *     raw-image              = 截图工具图片位图 → Alt+V，AI CLI 直接读取剪贴板图片数据
+ *     raw-image              = 截图工具图片位图 → 路径提示或原生图片快捷键
  *     explorer-image-files   = Rust 加载文件→写 CF_DIB/TIFF→Alt+V，AI CLI 读取为图片块
  *     explorer-files         = 文件路径引用（非图片扩展名）→ 路径文本注入，文件引用
  *
@@ -1028,6 +1113,8 @@ async function detectClipboardPayload(preferImage = false): Promise<ClipboardPay
 export async function pasteToTerminal(ptyId: number): Promise<void> {
   const provider = getAiProviderForPty(ptyId);
   const isAiPane = !!provider;
+  const isWslPane = isWslPty(ptyId);
+  const usesImagePathPaste = isWslPane || (_isMacOS && isAiPane);
 
   // 诊断：AI pane 身份判定（文档 §5.2）
   if (TERM_DEBUG) {
@@ -1042,11 +1129,30 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
       if (paneStatus) break;
     }
     debugTerm('paste:ai_identity', {
-      ptyId, paneStatus, aiProvider, provider, isAiPane,
+      ptyId, paneStatus, aiProvider, provider, isAiPane, isWslPane, usesImagePathPaste,
     });
   }
 
   const clipboard = await detectClipboardPayload(isAiPane);
+
+  if (usesImagePathPaste && clipboard.kind === 'raw-image') {
+    const image = await trySaveClipboardImageForPathPaste();
+    if (!image) {
+      showErrorToast('无法读取剪贴板图片，未向终端粘贴内容');
+      return;
+    }
+    const prompt = `请读取图片 @${image.terminalPath}`;
+    sendAiTextPaste(ptyId, prompt);
+    debugTerm('paste:route', {
+      ptyId,
+      provider,
+      clipboardKind: clipboard.kind,
+      route: isWslPane ? 'wsl-image-path' : 'mac-image-path',
+      savedPath: image.savedPath,
+      terminalPath: image.terminalPath,
+    });
+    return;
+  }
 
   if (isAiPane) {
     let route = 'noop';

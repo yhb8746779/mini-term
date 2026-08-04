@@ -1,5 +1,6 @@
 mod ai_sessions;
 mod clipboard;
+mod clipboard_path;
 mod config;
 mod editor;
 mod fs;
@@ -34,6 +35,7 @@ pub fn run() {
         .manage(hook_server::HookState::new())
         .setup(|app| {
             clipboard::cleanup_old_clipboard_images();
+            clipboard_path::start_cleanup();
             let handle = app.handle().clone();
             let config = crate::config::read_config(&handle);
             crate::path_access::sync_project_accesses(&handle, &config.projects);
@@ -87,8 +89,10 @@ pub fn run() {
             perf_log::get_perf_log_path,
             perf_log::log_perf_from_frontend,
             clipboard::save_clipboard_rgba_image,
+            clipboard_path::save_clipboard_rgba_image_for_path_paste,
             clipboard::read_clipboard_image_macos,
             clipboard::read_clipboard_image,
+            clipboard_path::read_clipboard_image_for_path_paste,
             clipboard::read_clipboard_file_paths,
             clipboard::read_clipboard_file_paths_macos,
             clipboard::load_image_to_clipboard,
