@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# Per-workspace helper build cache; retained locally for sandbox rebuilds, never released.
+.cache/
+src-tauri/miniterm-hook/target/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

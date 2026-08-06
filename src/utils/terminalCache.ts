@@ -125,7 +125,53 @@ const TERM_DEBUG = localStorage.getItem('mini-term-debug') === '1';
 const FORCE_DISABLE_WEBGL = localStorage.getItem('mini-term-disable-webgl') === '1';
 const FORCE_MONO_ONLY = localStorage.getItem('mini-term-mono-only') === '1';
 const UTF8_ENCODER = new TextEncoder();
+const REMOTE_STATUS_OSC = 777;
+const REMOTE_STATUS_PREFIX = 'miniterm;';
+const REMOTE_STATUS_MAX_ENCODED = 16 * 1024;
 let snapshotListenerInstalled = false;
+
+interface RemoteStatusPayload {
+  v: 1;
+  event: string;
+  status: 'idle' | 'ai-complete' | 'ai-thinking' | 'ai-generating' | 'ai-awaiting-input';
+  provider: AiProvider;
+  sessionId?: string | null;
+  seq?: number;
+  timestamp?: number;
+}
+
+const REMOTE_STATUS_EVENTS = new Set([
+  'SessionStart', 'SessionEnd', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse',
+  'Stop', 'PermissionRequest', 'Elicitation', 'Notification', 'SubagentStart',
+  'SubagentStop', 'PreCompact', 'PostCompact', 'BeforeAgent',
+  'BeforeToolSelection', 'BeforeTool', 'AfterModel', 'AfterAgent',
+]);
+const REMOTE_STATUS_VALUES = new Set([
+  'idle', 'ai-complete', 'ai-thinking', 'ai-generating', 'ai-awaiting-input',
+]);
+const REMOTE_STATUS_PROVIDERS = new Set(['claude', 'codex', 'gemini', 'grok']);
+
+function parseRemoteStatusOsc(data: string): RemoteStatusPayload | null {
+  if (!data.startsWith(REMOTE_STATUS_PREFIX)) return null;
+  const encoded = data.slice(REMOTE_STATUS_PREFIX.length);
+  if (!encoded || encoded.length > REMOTE_STATUS_MAX_ENCODED || !/^[A-Za-z0-9_-]+$/.test(encoded)) return null;
+  try {
+    const normalized = encoded.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+    const bytes = Uint8Array.from(atob(padded), (char) => char.charCodeAt(0));
+    if (bytes.byteLength > 8 * 1024) return null;
+    const value = JSON.parse(new TextDecoder().decode(bytes)) as Partial<RemoteStatusPayload>;
+    if (value.v !== 1 || typeof value.event !== 'string' || !REMOTE_STATUS_EVENTS.has(value.event)) return null;
+    if (typeof value.status !== 'string' || !REMOTE_STATUS_VALUES.has(value.status)) return null;
+    if (typeof value.provider !== 'string' || !REMOTE_STATUS_PROVIDERS.has(value.provider)) return null;
+    if (value.sessionId !== undefined && value.sessionId !== null && (typeof value.sessionId !== 'string' || value.sessionId.length === 0 || value.sessionId.length > 256 || !/^[!-~]+$/.test(value.sessionId))) return null;
+    if (value.seq !== undefined && (!Number.isSafeInteger(value.seq) || value.seq < 0)) return null;
+    if (value.timestamp !== undefined && (!Number.isSafeInteger(value.timestamp) || value.timestamp < 0)) return null;
+    return value as RemoteStatusPayload;
+  } catch {
+    return null;
+  }
+}
 
 function debugTerm(scope: string, payload: Record<string, unknown>) {
   if (!TERM_DEBUG) return;
@@ -326,6 +372,21 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   term.parser.registerCsiHandler({ final: 'l', prefix: '?' }, (params) =>
     params.some(isAltScreenMode));
 
+  // 远端 Hook 通过 SSH/WSL PTY 输出私有 OSC 777。handler 返回 true 会消费该帧，
+  // 因而状态元数据不会显示在终端或进入 scrollback。ptyId 始终取当前本地实例。
+  const remoteStatusDisp = term.parser.registerOscHandler(REMOTE_STATUS_OSC, (data) => {
+    if (!data.startsWith(REMOTE_STATUS_PREFIX)) return false;
+    const payload = parseRemoteStatusOsc(data);
+    if (payload) {
+      invoke<boolean>('report_remote_ai_status', { ptyId, payload }).catch((error) => {
+        debugTerm('remote-status:report-failed', { ptyId, error: String(error) });
+      });
+    } else {
+      debugTerm('remote-status:rejected', { ptyId, encodedLength: data.length });
+    }
+    return true;
+  });
+
   term.open(wrapper);
 
   // Unicode 11 addon：修正 CJK / Emoji 双宽字符的列宽计算，避免中文乱码
@@ -517,6 +578,7 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     unlisten?.();
     onDataDisp.dispose();
     onResizeDisp.dispose();
+    remoteStatusDisp.dispose();
     term.dispose();
   };
 

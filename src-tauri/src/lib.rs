@@ -12,6 +12,7 @@ mod perf_log;
 mod search;
 mod process_monitor;
 mod pty;
+mod remote_status;
 
 use tauri::Manager;
 
@@ -103,6 +104,7 @@ pub fn run() {
             hook_registry::get_hook_config_snippet,
             hook_registry::get_hook_status,
             hook_server::toggle_hook_server,
+            hook_server::report_remote_ai_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -78,16 +78,15 @@ function buildHookForTarget(profile, target, isHostTriple) {
     return null;
   };
 
-  let src = pickExistingSrc();
-  if (src) return src;
-
+  // 即使已有产物也必须执行 cargo build。Cargo 会使用增量缓存，成本很低；
+  // 直接复用文件会在 helper 源码变化后把旧二进制继续带入 dev/安装包。
   console.log(`[prepare-sidecar] cargo build --bin miniterm-hook --target ${target} (${profile})`);
   const args = ["build", "--bin", "miniterm-hook", "--target", target];
   if (profile === "release") args.push("--release");
   const r = spawnSync("cargo", args, { cwd: SRC_TAURI, stdio: "inherit" });
   if (r.status !== 0) throw new Error(`cargo build miniterm-hook (${target}) 失败`);
 
-  src = pickExistingSrc();
+  const src = pickExistingSrc();
   if (!src) throw new Error(`cargo 已编完但 ${tripleDir} 和 ${flatDir} 都找不到`);
   return src;
 }

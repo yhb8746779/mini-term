@@ -827,12 +827,13 @@ function ShortcutsSettings() {
 // 实现"事件级"精确状态感知（PreToolUse → ai-thinking、Stop → ai-complete 等），
 // 取代纯启发式（spinner 检测 + 字节流活跃度）的偶尔误判和冷启动延迟。
 
-type HookProvider = 'claude' | 'codex' | 'gemini';
+type HookProvider = 'claude' | 'codex' | 'gemini' | 'remote';
 
 interface HookSnippet {
   claude: { file: string; content: string };
   codex: { files: Array<{ file: string; content: string; note?: string }> };
   gemini: { file: string; content: string };
+  remote?: { file: string; content: string };
 }
 
 function HookSettings() {
@@ -1002,7 +1003,7 @@ function HookSettings() {
 
       {/* 配置片段展示 */}
       {snippet && (
-        <div className={dimmed}>
+        <div>
           <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
             手动粘贴片段（高级）
           </div>
@@ -1010,6 +1011,7 @@ function HookSettings() {
             {tabBtn('claude', 'Claude Code')}
             {tabBtn('codex', 'Codex')}
             {tabBtn('gemini', 'Gemini CLI')}
+            {snippet.remote && tabBtn('remote', '远端 SSH / WSL')}
           </div>
 
           {activeTab === 'claude' && (
@@ -1038,6 +1040,14 @@ function HookSettings() {
             <SnippetBlock
               file={snippet.gemini.file}
               content={snippet.gemini.content}
+              onCopy={handleCopy}
+            />
+          )}
+
+          {activeTab === 'remote' && snippet.remote && (
+            <SnippetBlock
+              file={snippet.remote.file}
+              content={snippet.remote.content}
               onCopy={handleCopy}
             />
           )}

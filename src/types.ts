@@ -44,6 +44,7 @@ export interface HookConfigSnippet {
   claude: { file: string; content: string };
   codex: { files: Array<{ file: string; content: string; note?: string }> };
   gemini: { file: string; content: string };
+  remote?: { file: string; content: string };
 }
 
 export interface ProjectConfig {

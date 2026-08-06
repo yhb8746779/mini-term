@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// Layer 3 检测的 AI CLI 命令名（与 pty.rs AI_COMMANDS 保持同步）
 const AI_SUBPROCESS_NAMES: &[&str] = &["claude", "codex", "gemini", "grok"];
@@ -111,14 +111,18 @@ fn strip_ansi_simple(s: &str) -> String {
                             None => break,
                             Some('\x07') => break,
                             Some('\x1b') => {
-                                if chars.peek() == Some(&'\\') { chars.next(); }
+                                if chars.peek() == Some(&'\\') {
+                                    chars.next();
+                                }
                                 break;
                             }
                             Some(_) => {}
                         }
                     }
                 }
-                _ => { chars.next(); }
+                _ => {
+                    chars.next();
+                }
             }
         } else {
             result.push(c);
@@ -181,15 +185,23 @@ fn snapshot_processes() -> Option<Vec<ProcEntry>> {
         let mut iter = line.split_whitespace();
         let Some(pid_s) = iter.next() else { continue };
         let Some(ppid_s) = iter.next() else { continue };
-        let Ok(pid) = pid_s.parse::<u32>() else { continue };
-        let Ok(ppid) = ppid_s.parse::<u32>() else { continue };
+        let Ok(pid) = pid_s.parse::<u32>() else {
+            continue;
+        };
+        let Ok(ppid) = ppid_s.parse::<u32>() else {
+            continue;
+        };
         // comm 可能含空格（"Google Chrome Helper"），把剩余部分合并
         let comm: String = iter.collect::<Vec<_>>().join(" ");
         if comm.is_empty() {
             continue;
         }
         // ps 在部分系统上输出含路径（如 "/usr/bin/node"），取 basename
-        let base = comm.rsplit(&['/', '\\'][..]).next().unwrap_or(&comm).to_string();
+        let base = comm
+            .rsplit(&['/', '\\'][..])
+            .next()
+            .unwrap_or(&comm)
+            .to_string();
         result.push((pid, ppid, base, None));
     }
     Some(result)
@@ -226,7 +238,11 @@ fn snapshot_processes() -> Option<Vec<ProcEntry>> {
             continue;
         }
         // 取 basename，对齐 Unix 版
-        let base = name.rsplit(&['/', '\\'][..]).next().unwrap_or(&name).to_string();
+        let base = name
+            .rsplit(&['/', '\\'][..])
+            .next()
+            .unwrap_or(&name)
+            .to_string();
 
         // 收集命令行：argv 以空格 join，整体转小写便于匹配
         let cmd = process.cmd();
@@ -359,6 +375,7 @@ fn ai_to_static(name: &str) -> &'static str {
 }
 
 pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
+    let hook_state = app.state::<crate::hook_server::HookState>().inner().clone();
     thread::spawn(move || {
         // 存储上一次发送的 (status, provider) 对，避免重复 emit 相同状态
         let mut prev_states: HashMap<u32, (String, Option<String>)> = HashMap::new();
@@ -386,6 +403,12 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
             let proc_snapshot = snapshot_processes();
 
             for pty_id in &pty_ids {
+                // Hook/OSC 是事件级真相源。有效状态会建立远端 AI 会话，避免 WSL/SSH
+                // 中的 AI 因不出现在宿主机进程树而被误判退出。
+                let mut hook_status = hook_state.get_effective_status(*pty_id);
+                if let Some((_, Some(provider))) = &hook_status {
+                    pty_manager.force_ai_session(*pty_id, ai_to_static(provider));
+                }
                 // ── Layer 2：进程级 banner 兜底检测 ──────────────────────────
                 //
                 // AI 会话检测采用三层架构：
@@ -443,63 +466,112 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
                             ssh_transport_ptys.remove(pty_id);
                         } else if layer3_saw_ssh {
                             // 远端 AI 无法出现在主机进程表中，不能把"未看到本地 AI"
-                            // 当成退出证据。保留 Layer 1/2 建立的会话，并继续按 PTY
-                            // 输出推断 thinking/generating/complete/awaiting-input。
+                            // 当成退出证据。记录 SSH 传输，供其消失时明确清理 Hook。
                             ssh_transport_ptys.insert(*pty_id);
                             last_seen_ai_subproc.remove(pty_id);
                         } else if ssh_transport_ptys.remove(pty_id) {
                             // SSH 传输已经退出，远端 AI 必然不再连接到当前 PTY。
+                            hook_state.remove(*pty_id);
                             pty_manager.clear_ai_session(*pty_id);
+                            hook_status = None;
                             is_ai = false;
                             prov = None;
-                        } else {
-                            let last = *last_seen_ai_subproc.entry(*pty_id).or_insert(now);
+                        } else if let Some(last) = last_seen_ai_subproc.get(pty_id).copied() {
                             if now.duration_since(last) >= AI_SUBPROCESS_GRACE {
+                                // 曾明确看到的本地 AI 子进程已退出；旧 Hook 不能继续覆盖
+                                // 进程退出这一更强的终止信号。
+                                hook_state.remove(*pty_id);
                                 pty_manager.clear_ai_session(*pty_id);
                                 last_seen_ai_subproc.remove(pty_id);
+                                hook_status = None;
                                 is_ai = false;
                                 prov = None;
                             }
+                        } else if hook_status.is_some() {
+                            // WSL/远端 Agent 不一定表现为 ssh.exe，也不在宿主进程表中。
+                            // 这种情况下保持 Hook，直到 Stop、PermissionRequest、
+                            // SessionEnd 或 pane 关闭等明确事件。
+                        } else {
+                            last_seen_ai_subproc.insert(*pty_id, now);
                         }
                     } else {
                         last_seen_ai_subproc.remove(pty_id);
                         ssh_transport_ptys.remove(pty_id);
                     }
                 }
-                let (status, provider) = if is_ai {
-                    let raw_window = pty_manager.get_recent_output_window(*pty_id);
+                let has_hook_status = hook_status.is_some();
+                let (status, provider): (String, Option<String>) =
+                    if let Some((hook_value, hook_provider)) = hook_status {
+                        let raw_window = pty_manager.get_recent_output_window(*pty_id);
+                        let busy =
+                            pty_manager.has_recent_busy_signal(*pty_id, AI_BUSY_SIGNAL_WINDOW);
+                        let active = pty_manager.has_recent_output(*pty_id, AI_GENERATING_WINDOW);
+                        // permission/complete 是精确 Hook 终态；working Hook 可由当前屏幕
+                        // 细分为 generating/awaiting-input，但不能被降成 complete。
+                        let refined = if hook_value == "ai-thinking" {
+                            if detect_awaiting_input(&raw_window) {
+                                "ai-awaiting-input"
+                            } else if busy && active {
+                                "ai-generating"
+                            } else {
+                                "ai-thinking"
+                            }
+                        } else {
+                            hook_value.as_str()
+                        };
+                        (refined.to_string(), hook_provider.or(prov))
+                    } else if is_ai {
+                        let raw_window = pty_manager.get_recent_output_window(*pty_id);
 
-                    // 状态判定：以"屏幕上的 spinner busy 信号"为唯一 working 真相源，
-                    // 不再用单纯的字节流活跃度兜底。原因：gemini 等 CLI 在 idle 时
-                    // 仍会持续每秒重绘整个屏幕（cursor blink + footer 状态栏），
-                    // 让 has_recent_output(30s) 永远命中导致状态点常驻慢呼吸。
-                    let busy = pty_manager.has_recent_busy_signal(*pty_id, AI_BUSY_SIGNAL_WINDOW);
-                    let active = pty_manager.has_recent_output(*pty_id, AI_GENERATING_WINDOW);
-                    let status = if detect_awaiting_input(&raw_window) {
-                        "ai-awaiting-input"
-                    } else if busy && active {
-                        // spinner 在屏幕上 + 2s 内 PTY 还在吐字节 → 真在输出 token
-                        "ai-generating"
-                    } else if busy {
-                        // spinner 在屏幕上 + 字节流暂停 → 思考/工具调用/网络等待
-                        "ai-thinking"
+                        // 状态判定：以"屏幕上的 spinner busy 信号"为唯一 working 真相源，
+                        // 不再用单纯的字节流活跃度兜底。原因：gemini 等 CLI 在 idle 时
+                        // 仍会持续每秒重绘整个屏幕（cursor blink + footer 状态栏），
+                        // 让 has_recent_output(30s) 永远命中导致状态点常驻慢呼吸。
+                        let busy =
+                            pty_manager.has_recent_busy_signal(*pty_id, AI_BUSY_SIGNAL_WINDOW);
+                        let active = pty_manager.has_recent_output(*pty_id, AI_GENERATING_WINDOW);
+                        let status = if detect_awaiting_input(&raw_window) {
+                            "ai-awaiting-input"
+                        } else if busy && active {
+                            // spinner 在屏幕上 + 2s 内 PTY 还在吐字节 → 真在输出 token
+                            "ai-generating"
+                        } else if busy {
+                            // spinner 在屏幕上 + 字节流暂停 → 思考/工具调用/网络等待
+                            "ai-thinking"
+                        } else if layer3_saw_ssh || ssh_transport_ptys.contains(pty_id) {
+                            // SSH 内的远端 Agent 不会把进程和 spinner 暴露给宿主机。
+                            // 没有明确 Hook 完成事件时，不能把“看不到 spinner”当作完成，
+                            // 否则切换窗口或远端静默约 10 秒就会误报 Done。
+                            "ai-thinking"
+                        } else {
+                            // spinner 已不在屏幕（或从未出现）→ 完成一轮，等待下一条指令
+                            "ai-complete"
+                        };
+                        (status.to_string(), prov)
                     } else {
-                        // spinner 已不在屏幕（或从未出现）→ 完成一轮，等待下一条指令
-                        "ai-complete"
+                        ("idle".to_string(), None)
                     };
-                    (status, prov)
-                } else {
-                    ("idle", None)
-                };
 
                 let prev = prev_states.get(pty_id);
-                let same = prev.map_or(false, |(ps, pp)| ps.as_str() == status && pp.as_deref() == provider.as_deref());
+                let same = prev.map_or(false, |(ps, pp)| *ps == status && *pp == provider);
                 if !same {
-                    let _ = app.emit("pty-status-change", PtyStatusChangePayload {
-                        pty_id: *pty_id,
-                        status: status.to_string(),
-                        provider: provider.clone(),
-                    });
+                    if status == "ai-complete" || (!has_hook_status && is_ai) {
+                        eprintln!(
+                            "[status-arbiter] pty_id={} source={} status={} provider={:?}",
+                            pty_id,
+                            if has_hook_status { "hook" } else { "heuristic" },
+                            status,
+                            provider
+                        );
+                    }
+                    let _ = app.emit(
+                        "pty-status-change",
+                        PtyStatusChangePayload {
+                            pty_id: *pty_id,
+                            status: status.clone(),
+                            provider: provider.clone(),
+                        },
+                    );
                     prev_states.insert(*pty_id, (status.to_string(), provider));
                 }
             }
@@ -598,4 +670,5 @@ mod tests {
         assert_eq!(observation.ai_provider, Some("claude"));
         assert!(observation.has_ssh);
     }
+
 }

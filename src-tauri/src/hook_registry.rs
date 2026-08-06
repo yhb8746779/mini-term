@@ -116,7 +116,7 @@ fn codex_config_path() -> Option<PathBuf> {
 /// 所有平台都对 hook_path 走 shell_quote，避免路径含空格（如 `/Applications/Mini Term.app/...`
 /// 或用户自定义路径）时被 shell 拆字、helper 启动前就失败。
 fn build_claude_hook_entry(hook_path: &str, event: &str) -> Value {
-    let command = format!("{} {}", shell_quote(hook_path), event);
+    let command = format!("{} {} claude", shell_quote(hook_path), event);
     serde_json::json!({
         "matcher": "",
         "hooks": [{
@@ -283,9 +283,9 @@ fn codex_event_timeout(event: &str) -> u64 {
 fn build_codex_hook_entry(hook_path: &str, event: &str) -> Value {
     let command = if cfg!(windows) {
         // PowerShell call operator + 双引号包裹路径（shell_quote 默认就是双引号包裹）
-        format!("& {} {}", shell_quote(hook_path), event)
+        format!("& {} {} codex", shell_quote(hook_path), event)
     } else {
-        format!("{} {}", shell_quote(hook_path), event)
+        format!("{} {} codex", shell_quote(hook_path), event)
     };
     serde_json::json!([{
         "hooks": [{
@@ -318,11 +318,14 @@ fn ensure_codex_hooks_feature() -> Result<(), String> {
     let mut doc: toml_edit::DocumentMut = content.parse::<toml_edit::DocumentMut>()
         .map_err(|e| format!("解析 config.toml 失败: {}", e))?;
 
-    // 确保 [features] 段落存在并设置 codex_hooks = true
+    // 确保 [features] 段落存在并设置当前 Codex 正式 hooks feature。
     if doc.get("features").is_none() {
         doc["features"] = toml_edit::Item::Table(toml_edit::Table::new());
     }
-    doc["features"]["codex_hooks"] = toml_edit::value(true);
+    doc["features"]["hooks"] = toml_edit::value(true);
+    if doc["features"].get("codex_hooks").is_some() {
+        doc["features"].as_table_like_mut().map(|table| table.remove("codex_hooks"));
+    }
 
     std::fs::write(&config_path, doc.to_string())
         .map_err(|e| format!("写入 config.toml 失败: {}", e))?;
@@ -510,7 +513,7 @@ fn gemini_settings_path() -> Option<PathBuf> {
 fn build_gemini_hook_entry(hook_path: &str, event: &str) -> Value {
     // Gemini 和 Claude Code 一样，从配置直接 exec；shell_quote 在 Win 下出双引号、
     // 在 Unix 下出 POSIX 单引号，两边都防空格路径。
-    let command = format!("{} {}", shell_quote(hook_path), event);
+    let command = format!("{} {} gemini", shell_quote(hook_path), event);
     serde_json::json!({
         "matcher": "",
         "hooks": [{
@@ -518,6 +521,26 @@ fn build_gemini_hook_entry(hook_path: &str, event: &str) -> Value {
             "command": command
         }]
     })
+}
+
+fn build_remote_hook_entry(hook_path: &str, event: &str, provider: &str) -> Value {
+    serde_json::json!({
+        "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": format!("MINITERM_REMOTE_OSC=1 {} {} {}", hook_path, event, provider)
+        }]
+    })
+}
+
+fn build_remote_codex_hook_entry(hook_path: &str, event: &str) -> Value {
+    serde_json::json!([{
+        "hooks": [{
+            "type": "command",
+            "command": format!("MINITERM_REMOTE_OSC=1 {} {} codex", hook_path, event),
+            "timeout": codex_event_timeout(event)
+        }]
+    }])
 }
 
 /// 注册 Gemini CLI hooks 到 ~/.gemini/settings.json
@@ -732,6 +755,36 @@ pub fn get_hook_config_snippet(_app: AppHandle) -> Result<Value, String> {
     let gemini_str = serde_json::to_string_pretty(&gemini_snippet)
         .map_err(|e| e.to_string())?;
 
+    // 远端/WSL 片段不引用宿主机绝对路径，只要求用户先把同版本 helper 放入 PATH。
+    let remote_hook_path = "/usr/local/bin/miniterm-hook";
+    let mut remote_claude_hooks = serde_json::Map::new();
+    for event in CLAUDE_HOOK_EVENTS {
+        remote_claude_hooks.insert(
+            event.to_string(),
+            serde_json::json!([build_remote_hook_entry(remote_hook_path, event, "claude")]),
+        );
+    }
+    let mut remote_codex_hooks = serde_json::Map::new();
+    for event in CODEX_HOOK_EVENTS {
+        remote_codex_hooks.insert(
+            event.to_string(),
+            build_remote_codex_hook_entry(remote_hook_path, event),
+        );
+    }
+    let mut remote_gemini_hooks = serde_json::Map::new();
+    for event in GEMINI_HOOK_EVENTS {
+        remote_gemini_hooks.insert(
+            event.to_string(),
+            serde_json::json!([build_remote_hook_entry(remote_hook_path, event, "gemini")]),
+        );
+    }
+    let remote_str = format!(
+        "# 1) 将与 MiniTerm 同版本的 miniterm-hook 安装到远端\n#    sudo install -m 0755 miniterm-hook /usr/local/bin/miniterm-hook\n# 2) 将下面 JSON 分别合并到对应配置文件。命令中的 MINITERM_REMOTE_OSC=1 会强制只发送 OSC 777 状态帧，不探测 HTTP 端口。\n\n[Claude ~/.claude/settings.json]\n{}\n\n[Codex ~/.codex/hooks.json]\n{}\n\n[Codex ~/.codex/config.toml]\n[features]\nhooks = true\n\n[Gemini ~/.gemini/settings.json]\n{}",
+        serde_json::to_string_pretty(&serde_json::json!({"hooks": remote_claude_hooks})).unwrap_or_default(),
+        serde_json::to_string_pretty(&serde_json::json!({"hooks": remote_codex_hooks})).unwrap_or_default(),
+        serde_json::to_string_pretty(&serde_json::json!({"hooks": remote_gemini_hooks})).unwrap_or_default(),
+    );
+
     Ok(serde_json::json!({
         "claude": {
             "file": "~/.claude/settings.json",
@@ -746,13 +799,17 @@ pub fn get_hook_config_snippet(_app: AppHandle) -> Result<Value, String> {
                 {
                     "file": "~/.codex/config.toml",
                     "note": "追加以下内容",
-                    "content": "[features]\ncodex_hooks = true"
+                    "content": "[features]\nhooks = true"
                 }
             ]
         },
         "gemini": {
             "file": "~/.gemini/settings.json",
             "content": gemini_str
+        },
+        "remote": {
+            "file": "SSH / WSL / 堡垒机",
+            "content": remote_str
         }
     }))
 }
