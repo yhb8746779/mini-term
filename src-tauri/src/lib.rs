@@ -13,6 +13,7 @@ mod search;
 mod process_monitor;
 mod pty;
 mod remote_status;
+mod ssh_upload;
 
 use tauri::Manager;
 
@@ -94,6 +95,10 @@ pub fn run() {
             clipboard::read_clipboard_image_macos,
             clipboard::read_clipboard_image,
             clipboard_path::read_clipboard_image_for_path_paste,
+            clipboard_path::copy_image_file_for_path_paste,
+            process_monitor::get_pty_transport,
+            ssh_upload::upload_image_over_ssh,
+            ssh_upload::upload_image_to_ssh_clipboard_bridge,
             clipboard::read_clipboard_file_paths,
             clipboard::read_clipboard_file_paths_macos,
             clipboard::load_image_to_clipboard,

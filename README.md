@@ -107,7 +107,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 
 ### 直接下载
 
-前往 [Releases](https://github.com/dreamlonglll/mini-term/releases) 页面下载最新安装包。
+前往 [Releases](https://github.com/yhb8746779/mini-term/releases) 页面下载最新安装包。
 
 > **平台支持说明**
 > - **Windows** — 主要支持平台，保证可用性，日常开发与测试均在 Windows 上进行
@@ -125,7 +125,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 
 ```bash
 # 克隆仓库
-git clone https://github.com/dreamlonglll/mini-term.git
+git clone https://github.com/yhb8746779/mini-term.git
 cd mini-term
 
 # 安装依赖

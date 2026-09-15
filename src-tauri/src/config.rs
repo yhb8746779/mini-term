@@ -69,6 +69,9 @@ pub struct AppConfig {
     /// 默认关闭（避免 Windows 防火墙无条件弹窗），用户在设置页主动开启。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_enabled: Option<bool>,
+    /// SSH 图片桥接：把宿主机图片投递到具备剪贴板桥接能力的沙箱，再触发 AI CLI 原生粘贴。
+    #[serde(default = "default_ssh_image_bridges")]
+    pub ssh_image_bridges: Vec<SshImageBridgeConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +137,19 @@ pub struct ShellConfig {
     pub args: Option<Vec<String>>,
 }
 
+/// 一条 SSH 图片桥接规则。`probe_command` 是用户明确配置的远端 shell 命令，
+/// 必须在桥接可用时返回 0；`{directory}` 会在执行前替换为 remote_directory。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshImageBridgeConfig {
+    pub id: String,
+    pub name: String,
+    pub ssh_host: String,
+    pub remote_directory: String,
+    pub probe_command: String,
+    pub file_prefix: String,
+}
+
 fn default_ui_font_size() -> f64 {
     13.0
 }
@@ -151,6 +167,17 @@ fn default_ai_completion_popup() -> bool {
 }
 fn default_ai_completion_taskbar_flash() -> bool {
     true
+}
+
+fn default_ssh_image_bridges() -> Vec<SshImageBridgeConfig> {
+    vec![SshImageBridgeConfig {
+        id: "codesandbox-ssh-4".into(),
+        name: "CodeSandbox 本机沙箱".into(),
+        ssh_host: "4".into(),
+        remote_directory: "/workspace/clipboard".into(),
+        probe_command: "test -x {directory}/bin/xclip".into(),
+        file_prefix: "clipboard-".into(),
+    }]
 }
 
 impl Default for AppConfig {
@@ -175,6 +202,7 @@ impl Default for AppConfig {
             terminal_font_preset: None,
             terminal_custom_font_family: None,
             hook_enabled: None,
+            ssh_image_bridges: default_ssh_image_bridges(),
         }
     }
 }

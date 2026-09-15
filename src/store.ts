@@ -367,6 +367,7 @@ export const useAppStore = create<AppStore>((set) => ({
     aiCompletionTaskbarFlash: true,
     terminalFontPreset: 'system',
     terminalCustomFontFamily: '',
+    sshImageBridges: [],
   },
   setConfig: (config) => set({ config }),
 

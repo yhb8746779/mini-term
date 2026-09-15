@@ -16,7 +16,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { readText, readImage, writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useAppStore, findPaneByPty } from '../store';
-import type { PtyOutputPayload, AiProvider } from '../types';
+import type { PtyOutputPayload, AiProvider, SshImageBridgeConfig } from '../types';
 import { getResolvedTheme } from './themeManager';
 import { createPtyWriteQueue } from './ptyWriteQueue';
 import { showErrorToast } from './errorToast';
@@ -704,19 +704,26 @@ interface ClipboardPathImage {
   terminalPath: string;
 }
 
-/** 通过 pane 绑定的 Shell 配置判断当前 PTY 是否由 wsl.exe 启动。 */
-function isWslPty(ptyId: number): boolean {
-  const { projectStates, config } = useAppStore.getState();
-  for (const projectState of projectStates.values()) {
-    for (const tab of projectState.tabs) {
-      const pane = findPaneByPty(tab.splitLayout, ptyId);
-      if (!pane) continue;
-      const shell = config.availableShells.find((candidate) => candidate.name === pane.shellName);
-      const command = shell?.command.trim().replace(/^"|"$/g, '') ?? '';
-      return /(^|[\\/])wsl(?:\.exe)?$/i.test(command);
-    }
+/** pane 当前的"传输层"：终端里看到的文件系统在哪。 */
+type PtyTransport = 'local' | 'wsl' | 'ssh';
+
+/**
+ * 探测 pane 当前的传输层（后端扫进程树，见 process_monitor::get_pty_transport）。
+ *
+ * 为什么不能看 Shell 配置：
+ *   用户几乎都是开一个 pwsh pane 之后手敲 `ssh xxx` / `wsl` 进去的，
+ *   配置里的 command 永远是 pwsh。旧的 isWslPty() 就栽在这里——
+ *   它恒返回 false，导致图片路径粘贴那条路一次都没走到过。
+ *
+ * 探测失败一律按 local 处理：保持与改动前完全一致的行为，不制造新的失败模式。
+ */
+async function getPtyTransport(ptyId: number): Promise<PtyTransport> {
+  try {
+    const transport = await invoke<string>('get_pty_transport', { ptyId });
+    return transport === 'ssh' || transport === 'wsl' ? transport : 'local';
+  } catch {
+    return 'local';
   }
-  return false;
 }
 
 /** 把剪贴板图片落盘成临时 PNG，返回路径；任何环节失败返回 null */
@@ -755,6 +762,55 @@ async function trySaveClipboardImageForPathPaste(): Promise<ClipboardPathImage |
       });
       return null;
     }
+  }
+}
+
+/**
+ * 把本地图片推到 pane 所连的远端，返回远端绝对路径。
+ *
+ * 用于连云服务器的场景：远端没有宿主机的任何挂载，贴本地路径读不到，
+ * 必须另开一条 ssh 连接把文件真的传过去（见 ssh_upload.rs）。
+ *
+ * 失败原因原样带回：免密没配 / /tmp 不可写 / 超时，对用户都是可行动的信息。
+ */
+async function uploadImageOverSsh(
+  ptyId: number,
+  localPath: string,
+): Promise<{ remotePath: string } | { error: string }> {
+  try {
+    const remotePath = await invoke<string>('upload_image_over_ssh', { ptyId, localPath });
+    return { remotePath };
+  } catch (err) {
+    debugTerm('clipboard:ssh_upload_failed', { localPath, error: String(err) });
+    return { error: String(err) };
+  }
+}
+
+/**
+ * 优先投递到 Code Sandbox 的 xclip bridge，供 Alt+V 创建原生图片块。
+ * 该 command 会在 bridge helper 缺失时失败，调用方应回退到普通 SSH 上传。
+ */
+async function uploadImageToSshClipboardBridge(
+  ptyId: number,
+  localPath: string,
+  bridges: SshImageBridgeConfig[],
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    await invoke('upload_image_to_ssh_clipboard_bridge', { ptyId, localPath, bridges });
+    return { ok: true };
+  } catch (err) {
+    debugTerm('clipboard:ssh_bridge_upload_failed', { localPath, error: String(err) });
+    return { ok: false, error: String(err) };
+  }
+}
+
+/** 把 Explorer/Finder 复制的图片文件拷进共享目录，返回终端可读取路径。 */
+async function tryCopyImageFileForPathPaste(path: string): Promise<ClipboardPathImage | null> {
+  try {
+    return await invoke<ClipboardPathImage>('copy_image_file_for_path_paste', { path });
+  } catch (err) {
+    debugTerm('clipboard:path_image_copy_failed', { path, error: String(err) });
+    return null;
   }
 }
 
@@ -1175,8 +1231,17 @@ async function detectClipboardPayload(preferImage = false): Promise<ClipboardPay
 export async function pasteToTerminal(ptyId: number): Promise<void> {
   const provider = getAiProviderForPty(ptyId);
   const isAiPane = !!provider;
-  const isWslPane = isWslPty(ptyId);
-  const usesImagePathPaste = isWslPane || (_isMacOS && isAiPane);
+  const transport = await getPtyTransport(ptyId);
+  // ssh / wsl 下终端看到的不是宿主机文件系统：
+  //   - 通用 SSH 对端无法读取宿主机剪贴板或路径
+  //   - 宿主机的 C:\... / H:\... 路径对端也解析不了
+  // 两者都改成"给出一个终端侧能打开的路径"，但拿到路径的方式不同：
+  //   wsl → 落到宿主机与发行版共享的目录，换算成 WSL 路径
+  //   ssh → 另开一条 ssh 连接把图片传到远端 /tmp（见 uploadImageOverSsh）
+  //
+  // Code Sandbox 是例外：它提供 xclip bridge，可让 Claude Code 的 Alt+V 产生
+  // 原生图片块。bridge 不存在时仍严格回退到已验证的 /tmp 路径上传。
+  const usesImagePathPaste = transport !== 'local' || (_isMacOS && isAiPane);
 
   // 诊断：AI pane 身份判定（文档 §5.2）
   if (TERM_DEBUG) {
@@ -1191,29 +1256,84 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
       if (paneStatus) break;
     }
     debugTerm('paste:ai_identity', {
-      ptyId, paneStatus, aiProvider, provider, isAiPane, isWslPane, usesImagePathPaste,
+      ptyId, paneStatus, aiProvider, provider, isAiPane, transport, usesImagePathPaste,
     });
   }
 
   const clipboard = await detectClipboardPayload(isAiPane);
 
-  if (usesImagePathPaste && clipboard.kind === 'raw-image') {
-    const image = await trySaveClipboardImageForPathPaste();
-    if (!image) {
-      showErrorToast('无法读取剪贴板图片，未向终端粘贴内容');
+  if (usesImagePathPaste) {
+    // 截图位图和"资源管理器复制的图片文件"走同一条路，区别只在于图片是从
+    // 剪贴板解码出来的、还是本来就已经是磁盘上的文件。
+    const imageFilePaths =
+      clipboard.kind === 'explorer-image-files' || clipboard.kind === 'finder-image-files'
+        ? clipboard.paths ?? []
+        : [];
+
+    if (clipboard.kind === 'raw-image' || imageFilePaths.length > 0) {
+      let terminalPaths: string[];
+      let failure = '无法读取剪贴板图片，未向终端粘贴内容';
+
+      if (transport === 'ssh') {
+        // 远端（云服务器）看不到本机文件系统，贴本地路径必然读不到，
+        // 只能另开一条 ssh 连接把图片真的传过去。
+        // 截图先落成本地文件；已经是文件的直接传，不必多拷一次。
+        const localPaths = clipboard.kind === 'raw-image'
+          ? [(await trySaveClipboardImageForPathPaste())?.savedPath]
+          : imageFilePaths;
+        // 单张图片优先走 Code Sandbox xclip bridge。成功后必须发图片快捷键，
+        // 才会让 Claude Code 显示原生 [Image #N]，而不是 @/tmp 路径文本。
+        if (localPaths.length === 1 && localPaths[0]) {
+          const bridges = useAppStore.getState().config.sshImageBridges ?? [];
+          const bridge = await uploadImageToSshClipboardBridge(ptyId, localPaths[0], bridges);
+          if (bridge.ok) {
+            await sendAiScreenshotImagePaste(ptyId, provider);
+            debugTerm('paste:route', {
+              ptyId,
+              provider,
+              clipboardKind: clipboard.kind,
+              route: 'ssh-clipboard-bridge-image',
+            });
+            return;
+          }
+          failure = bridge.error;
+        }
+
+        // bridge 不可用或多图时，保留通用 SSH 的可靠路径文本回退。
+        const results = await Promise.all(
+          localPaths
+            .filter((p): p is string => !!p)
+            .map((p) => uploadImageOverSsh(ptyId, p)),
+        );
+        terminalPaths = results.flatMap((r) => ('remotePath' in r ? [r.remotePath] : []));
+        // 远端失败的原因（免密没配、/tmp 不可写、超时）对用户有实际价值，
+        // 别吞掉换成一句笼统的"读取失败"。
+        const firstError = results.find((r) => 'error' in r);
+        if (firstError && 'error' in firstError) failure = firstError.error;
+      } else {
+        const images = clipboard.kind === 'raw-image'
+          ? [await trySaveClipboardImageForPathPaste()]
+          : await Promise.all(imageFilePaths.map((p) => tryCopyImageFileForPathPaste(p)));
+        terminalPaths = images
+          .filter((image): image is ClipboardPathImage => image !== null)
+          .map((image) => image.terminalPath);
+      }
+
+      if (terminalPaths.length === 0) {
+        showErrorToast(failure);
+        return;
+      }
+      const prompt = `请读取图片 ${terminalPaths.map((p) => `@${p}`).join(' ')}`;
+      sendAiTextPaste(ptyId, prompt);
+      debugTerm('paste:route', {
+        ptyId,
+        provider,
+        clipboardKind: clipboard.kind,
+        route: `${transport}-image-path`,
+        terminalPaths,
+      });
       return;
     }
-    const prompt = `请读取图片 @${image.terminalPath}`;
-    sendAiTextPaste(ptyId, prompt);
-    debugTerm('paste:route', {
-      ptyId,
-      provider,
-      clipboardKind: clipboard.kind,
-      route: isWslPane ? 'wsl-image-path' : 'mac-image-path',
-      savedPath: image.savedPath,
-      terminalPath: image.terminalPath,
-    });
-    return;
   }
 
   if (isAiPane) {

@@ -48,20 +48,20 @@ fn image_dir() -> Result<PathBuf, String> {
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-fn next_file_name() -> String {
+fn next_file_name(ext: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let sequence = IMAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("miniterm-{nanos}-{}-{sequence}.png", std::process::id())
+    format!("miniterm-{nanos}-{}-{sequence}.{ext}", std::process::id())
 }
 
 #[cfg(any(windows, target_os = "macos"))]
 fn save_png(rgba: &[u8], width: u32, height: u32) -> Result<PathBuf, String> {
     let dir = image_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建图片目录失败: {e}"))?;
-    let path = dir.join(next_file_name());
+    let path = dir.join(next_file_name("png"));
     image::save_buffer(&path, rgba, width, height, image::ColorType::Rgba8)
         .map_err(|e| format!("保存 PNG 失败: {e}"))?;
     Ok(path)
@@ -124,6 +124,35 @@ pub fn read_clipboard_image_for_path_paste() -> Result<ClipboardPathImage, Strin
     }
 }
 
+/// 把 Explorer / Finder 复制的图片文件拷进共享目录，返回终端可读取的路径。
+///
+/// 与 `save_clipboard_rgba_image_for_path_paste` 的区别：
+///   那个处理的是剪贴板里的位图（截图工具），这个处理的是已经存在的图片文件。
+///   两者最终都落在同一个目录，前端因此可以用同一条"贴路径"的路由。
+///
+/// 直接按字节拷贝而不重新编码：无损，且省掉一次解码/编码开销。
+#[tauri::command]
+pub fn copy_image_file_for_path_paste(path: String) -> Result<ClipboardPathImage, String> {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let source = PathBuf::from(&path);
+        let ext = source
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("png")
+            .to_lowercase();
+        let dir = image_dir()?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建图片目录失败: {e}"))?;
+        let target = dir.join(next_file_name(&ext));
+        std::fs::copy(&source, &target).map_err(|e| format!("复制图片文件失败: {e}"))?;
+        build_result(target)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Err(format!("图片路径粘贴仅支持 Windows/macOS，path={path}"))
+    }
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 fn cleanup_old_images() {
     let Ok(dir) = image_dir() else {
@@ -137,12 +166,14 @@ fn cleanup_old_images() {
         .unwrap_or(std::time::UNIX_EPOCH);
     for entry in entries.flatten() {
         let path = entry.path();
-        let is_owned_png = path.extension().and_then(|ext| ext.to_str()) == Some("png")
+        // 只按前缀认领：copy_image_file_for_path_paste 会保留源文件扩展名
+        // （.jpg/.gif/.webp…），按扩展名过滤会漏掉它们导致目录只增不减。
+        let is_owned = path.is_file()
             && path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("miniterm-"));
-        if is_owned_png
+        if is_owned
             && entry
                 .metadata()
                 .and_then(|meta| meta.modified())
@@ -177,11 +208,20 @@ mod tests {
     #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn generated_names_are_unique() {
-        let first = next_file_name();
-        let second = next_file_name();
+        let first = next_file_name("png");
+        let second = next_file_name("png");
         assert_ne!(first, second);
         assert!(first.starts_with("miniterm-"));
         assert!(first.ends_with(".png"));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn generated_names_keep_requested_extension() {
+        // cleanup_old_images 靠 miniterm- 前缀认领，扩展名可以是任意图片格式
+        let name = next_file_name("jpg");
+        assert!(name.starts_with("miniterm-"));
+        assert!(name.ends_with(".jpg"));
     }
 
     #[cfg(windows)]

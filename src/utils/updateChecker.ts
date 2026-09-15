@@ -1,4 +1,4 @@
-const GITHUB_REPO = 'dreamlonglll/mini-term';
+const GITHUB_REPO = 'yhb8746779/mini-term';
 
 export interface ReleaseInfo {
   version: string;

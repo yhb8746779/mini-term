@@ -31,6 +31,8 @@ export interface AppConfig {
   terminalCustomFontFamily?: string;
   /** Hook server 开关：开启后启动时绑定 127.0.0.1:23456 接收 Claude/Codex/Gemini hook 事件。默认 undefined（关闭）。 */
   hookEnabled?: boolean;
+  /** SSH 沙箱的原生图片粘贴桥接规则。 */
+  sshImageBridges: SshImageBridgeConfig[];
 }
 
 /** Hook server 运行状态（前端通过 get_hook_status 命令查询） */
@@ -61,6 +63,19 @@ export interface ShellConfig {
   name: string;
   command: string;
   args?: string[];
+}
+
+export interface SshImageBridgeConfig {
+  id: string;
+  name: string;
+  /** `ssh <host>` 中的目标字符串，例如 `4` 或 `user@example.com`。 */
+  sshHost: string;
+  /** 远端桥接目录，MiniTerm 会把图片写入其中。 */
+  remoteDirectory: string;
+  /** 远端桥接就绪探测命令，`{directory}` 会替换成远端桥接目录。 */
+  probeCommand: string;
+  /** 桥接程序识别的图片文件名前缀，例如 `clipboard-`。 */
+  filePrefix: string;
 }
 
 // === 布局持久化 ===

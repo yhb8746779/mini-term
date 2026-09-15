@@ -8,14 +8,14 @@ import { useAppStore } from '../store';
 import { checkForUpdate, compareVersions, type ReleaseInfo } from '../utils/updateChecker';
 import { applyTheme } from '../utils/themeManager';
 import { updateAllTerminalThemes, updateAllTerminalFonts, updateAllTerminalWebgl, FONT_PRESET_OPTIONS } from '../utils/terminalCache';
-import type { ShellConfig } from '../types';
+import type { ShellConfig, SshImageBridgeConfig } from '../types';
 
 interface Props {
   open: boolean;
   onClose: () => void;
 }
 
-type SettingsPage = 'terminal' | 'system' | 'hook' | 'shortcuts' | 'diagnostics' | 'about';
+type SettingsPage = 'terminal' | 'ssh-bridge' | 'system' | 'hook' | 'shortcuts' | 'diagnostics' | 'about';
 
 // ─── ShellRow（终端设置子组件）───
 
@@ -266,6 +266,115 @@ function TerminalSettings() {
       <div className="pt-3 text-sm text-[var(--text-muted)]">
         点击圆点设为默认终端 · 新建终端标签页时可选择类型
       </div>
+    </div>
+  );
+}
+
+// ─── SshImageBridgeSettings（SSH 图片桥接设置）───
+
+function newSshImageBridge(): SshImageBridgeConfig {
+  const id = globalThis.crypto?.randomUUID?.() ?? `ssh-bridge-${Date.now()}`;
+  return {
+    id,
+    name: '新的沙箱桥接',
+    sshHost: '',
+    remoteDirectory: '/workspace/clipboard',
+    probeCommand: 'test -x {directory}/bin/xclip',
+    filePrefix: 'clipboard-',
+  };
+}
+
+function SshImageBridgeRow({
+  bridge,
+  onUpdate,
+  onDelete,
+}: {
+  bridge: SshImageBridgeConfig;
+  onUpdate: (bridge: SshImageBridgeConfig) => void;
+  onDelete: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(bridge);
+
+  useEffect(() => setDraft(bridge), [bridge]);
+
+  const setField = (field: keyof SshImageBridgeConfig, value: string) => {
+    setDraft((current) => ({ ...current, [field]: value }));
+  };
+
+  const save = () => {
+    const normalized = {
+      ...draft,
+      name: draft.name.trim() || '未命名桥接',
+      sshHost: draft.sshHost.trim(),
+      remoteDirectory: draft.remoteDirectory.trim(),
+      probeCommand: draft.probeCommand.trim(),
+      filePrefix: draft.filePrefix.trim(),
+    };
+    if (!normalized.sshHost || !normalized.remoteDirectory || !normalized.probeCommand || !normalized.filePrefix) return;
+    onUpdate(normalized);
+    setEditing(false);
+  };
+
+  if (!editing) {
+    return (
+      <div className="flex items-center gap-3 px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] group hover:border-[var(--border-default)] transition-colors">
+        <div className="flex-1 min-w-0">
+          <div className="text-base font-medium text-[var(--text-primary)]">{bridge.name}</div>
+          <div className="text-sm text-[var(--text-muted)] font-mono truncate">ssh {bridge.sshHost || '(未配置)'}</div>
+        </div>
+        <div className="hidden group-hover:flex items-center gap-1">
+          <button className="px-2 py-0.5 text-sm text-[var(--text-muted)] hover:text-[var(--text-primary)]" onClick={() => setEditing(true)}>编辑</button>
+          <button className="px-2 py-0.5 text-sm text-[var(--text-muted)] hover:text-[var(--color-error)]" onClick={onDelete}>删除</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2 p-3 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--accent)] border-dashed">
+      <input className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)]" value={draft.name} placeholder="规则名称" onChange={(e) => setField('name', e.target.value)} />
+      <input className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base font-mono outline-none focus:border-[var(--accent)]" value={draft.sshHost} placeholder="SSH 目标，例如 4 或 user@example.com" onChange={(e) => setField('sshHost', e.target.value)} />
+      <input className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base font-mono outline-none focus:border-[var(--accent)]" value={draft.remoteDirectory} placeholder="远端图片桥接目录" onChange={(e) => setField('remoteDirectory', e.target.value)} />
+      <input className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base font-mono outline-none focus:border-[var(--accent)]" value={draft.probeCommand} placeholder="就绪探测命令，支持 {directory}" onChange={(e) => setField('probeCommand', e.target.value)} />
+      <input className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base font-mono outline-none focus:border-[var(--accent)]" value={draft.filePrefix} placeholder="文件名前缀，例如 clipboard-" onChange={(e) => setField('filePrefix', e.target.value)} />
+      <div className="flex gap-2 justify-end">
+        <button className="px-3 py-1 text-base bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90" onClick={save}>保存</button>
+        <button className="px-3 py-1 text-base text-[var(--text-muted)] hover:text-[var(--text-primary)]" onClick={() => { setDraft(bridge); setEditing(false); }}>取消</button>
+      </div>
+    </div>
+  );
+}
+
+function SshImageBridgeSettings() {
+  const config = useAppStore((s) => s.config);
+  const setConfig = useAppStore((s) => s.setConfig);
+  const bridges = config.sshImageBridges ?? [];
+
+  const persist = async (updated: SshImageBridgeConfig[]) => {
+    const newConfig = { ...useAppStore.getState().config, sshImageBridges: updated };
+    setConfig(newConfig);
+    await invoke('save_config', { config: newConfig });
+  };
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">SSH 图片桥接</div>
+        <p className="text-sm text-[var(--text-muted)] leading-5">匹配的 SSH 终端会先把单张图片写入该沙箱的桥接目录，再发送 Alt+V 让 Claude Code 创建原生图片块。不匹配或探测失败时自动回退到 /tmp 图片路径。</p>
+      </div>
+      <div className="space-y-2">
+        {bridges.map((bridge) => (
+          <SshImageBridgeRow
+            key={bridge.id}
+            bridge={bridge}
+            onUpdate={(next) => void persist(bridges.map((item) => item.id === next.id ? next : item))}
+            onDelete={() => void persist(bridges.filter((item) => item.id !== bridge.id))}
+          />
+        ))}
+      </div>
+      <button className="w-full py-2.5 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-base text-[var(--text-muted)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all" onClick={() => void persist([...bridges, newSshImageBridge()])}>+ 添加桥接规则</button>
+      <div className="text-sm text-[var(--text-muted)] leading-5">“就绪探测命令”会在匹配的远端 SSH 主机执行，必须只在图片桥接可用时返回成功。<code>{'{directory}'}</code> 会替换成上面的远端目录。</div>
     </div>
   );
 }
@@ -1243,6 +1352,7 @@ function DiagnosticsSettings() {
 
 const MENU_ITEMS: { key: SettingsPage; label: string }[] = [
   { key: 'terminal', label: '终端设置' },
+  { key: 'ssh-bridge', label: 'SSH 图片桥接' },
   { key: 'system', label: '系统设置' },
   { key: 'hook', label: 'AI Hook 集成' },
   { key: 'shortcuts', label: '快捷键' },
@@ -1302,6 +1412,7 @@ export function SettingsModal({ open, onClose }: Props) {
           {/* 右侧内容 */}
           <div className="flex-1 overflow-y-auto px-5 py-4">
             {activePage === 'terminal' && <TerminalSettings />}
+            {activePage === 'ssh-bridge' && <SshImageBridgeSettings />}
             {activePage === 'system' && <SystemSettings />}
             {activePage === 'hook' && <HookSettings />}
             {activePage === 'shortcuts' && <ShortcutsSettings />}

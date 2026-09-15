@@ -162,6 +162,9 @@ type ProcEntry = (u32, u32, String, Option<String>);
 struct SubtreeObservation {
     ai_provider: Option<&'static str>,
     has_ssh: bool,
+    has_wsl: bool,
+    /// 离 root 最近的那个 ssh 进程 pid，供上传图片时复现同一条 ssh 命令。
+    ssh_pid: Option<u32>,
 }
 
 /// 抓一次系统进程列表。Unix 调 `ps -A`，Windows 用 sysinfo（含命令行）。
@@ -323,11 +326,13 @@ fn inspect_process_subtree(snapshot: &[ProcEntry], root_pid: u32) -> SubtreeObse
         by_ppid.entry(entry.1).or_default().push(idx);
     }
 
-    let mut queue: Vec<u32> = vec![root_pid];
+    let mut queue: Vec<(u32, usize)> = vec![(root_pid, 0)];
     let mut observation = SubtreeObservation::default();
+    // 记录已选中 ssh 进程的深度，用于always保留"离 root 最近"的那个。
+    let mut ssh_depth = usize::MAX;
     // 深度保护：终端进程树一般很浅（shell → AI CLI → maybe node/python helper）
     let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    while let Some(pid) = queue.pop() {
+    while let Some((pid, depth)) = queue.pop() {
         if !visited.insert(pid) {
             continue;
         }
@@ -337,6 +342,17 @@ fn inspect_process_subtree(snapshot: &[ProcEntry], root_pid: u32) -> SubtreeObse
             let stem = lower.trim_end_matches(".exe");
             if stem == "ssh" {
                 observation.has_ssh = true;
+                // 取最靠近 root 的那个 ssh：它才是用户在这个 pane 里亲手敲的那条
+                // 命令，argv 可复现。更深层的 ssh（远端再跳）宿主机无法重放。
+                if depth < ssh_depth {
+                    ssh_depth = depth;
+                    observation.ssh_pid = Some(pid);
+                }
+            }
+            // wsl.exe / wslhost.exe 只是"传输层"，跟 ssh 同性质：终端里看到的
+            // 文件系统不是宿主机的。用于粘贴路由判断，不参与 AI 识别。
+            if stem == "wsl" {
+                observation.has_wsl = true;
             }
             if observation.ai_provider.is_none() {
                 observation.ai_provider = AI_SUBPROCESS_NAMES
@@ -356,7 +372,7 @@ fn inspect_process_subtree(snapshot: &[ProcEntry], root_pid: u32) -> SubtreeObse
         }
         if let Some(child_idxs) = by_ppid.get(&pid) {
             for &idx in child_idxs {
-                queue.push(snapshot[idx].0);
+                queue.push((snapshot[idx].0, depth + 1));
             }
         }
     }
@@ -586,6 +602,52 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
     });
 }
 
+/// 由 SubtreeObservation 推出 pane 的"传输层"。
+///
+/// 语义是"终端里看到的文件系统在哪"，而不是 shell 叫什么：
+///   ssh   → 远端机器；宿主机剪贴板/路径对它无意义
+///   wsl   → WSL 发行版；能看到宿主机盘符的挂载点，但路径写法不同
+///   local → 宿主机本身
+///
+/// ssh 优先于 wsl：`wsl -e ssh host` 这种嵌套场景，最终落点是远端。
+fn transport_from_observation(observation: &SubtreeObservation) -> &'static str {
+    if observation.has_ssh {
+        "ssh"
+    } else if observation.has_wsl {
+        "wsl"
+    } else {
+        "local"
+    }
+}
+
+/// 探测指定 PTY 当前的传输层，供前端粘贴路由使用。
+///
+/// 为什么按需扫描而不是复用 500ms 轮询的结果：
+///   粘贴是低频用户操作，一次全量进程快照在 Windows 上约 10-30ms，
+///   换来的是"不用再维护一份 pty→transport 的同步状态"。
+///
+/// 为什么不能沿用 shell 配置判断：
+///   用户通常是开一个 pwsh pane 之后手敲 `ssh xxx` / `wsl` 进去的，
+///   配置里的 command 永远是 pwsh，静态判断必然误判为 local。
+#[tauri::command]
+pub fn get_pty_transport(state: tauri::State<'_, crate::pty::PtyManager>, pty_id: u32) -> String {
+    let Some(root_pid) = state.get_child_pid(pty_id) else {
+        return "local".into();
+    };
+    let Some(snapshot) = snapshot_processes() else {
+        return "local".into();
+    };
+    transport_from_observation(&inspect_process_subtree(&snapshot, root_pid)).into()
+}
+
+/// 找出该 PTY 进程树里那条交互式 ssh 的 pid。
+/// 供 ssh_upload 复现同一条 ssh 命令，把图片推到同一台远端。
+pub fn find_ssh_pid_for_pty(pty_manager: &crate::pty::PtyManager, pty_id: u32) -> Option<u32> {
+    let root_pid = pty_manager.get_child_pid(pty_id)?;
+    let snapshot = snapshot_processes()?;
+    inspect_process_subtree(&snapshot, root_pid).ssh_pid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,4 +733,55 @@ mod tests {
         assert!(observation.has_ssh);
     }
 
+    #[test]
+    fn subtree_detects_wsl_below_local_shell() {
+        let snapshot = vec![
+            proc_entry(60, 0, "pwsh.exe"),
+            proc_entry(61, 60, "wsl.exe"),
+        ];
+
+        let observation = inspect_process_subtree(&snapshot, 60);
+
+        assert!(observation.has_wsl);
+        assert!(!observation.has_ssh);
+        assert_eq!(transport_from_observation(&observation), "wsl");
+    }
+
+    #[test]
+    fn plain_local_shell_reports_local_transport() {
+        let snapshot = vec![proc_entry(70, 0, "pwsh.exe")];
+
+        let observation = inspect_process_subtree(&snapshot, 70);
+
+        assert_eq!(transport_from_observation(&observation), "local");
+    }
+
+    /// 用户的真实形态：pwsh 里手敲 `ssh 2` 进 Code Sandbox VM。
+    /// 静态 shell 配置只看得到 pwsh，必须靠进程树才能判成 ssh。
+    #[test]
+    fn ssh_typed_inside_pwsh_reports_ssh_transport() {
+        let snapshot = vec![
+            proc_entry(80, 0, "pwsh.exe"),
+            proc_entry(81, 80, "ssh.exe"),
+        ];
+
+        let observation = inspect_process_subtree(&snapshot, 80);
+
+        assert_eq!(transport_from_observation(&observation), "ssh");
+    }
+
+    /// wsl -e ssh host：最终落点是远端，ssh 必须压过 wsl。
+    #[test]
+    fn ssh_nested_in_wsl_prefers_ssh_transport() {
+        let snapshot = vec![
+            proc_entry(90, 0, "pwsh.exe"),
+            proc_entry(91, 90, "wsl.exe"),
+            proc_entry(92, 91, "ssh.exe"),
+        ];
+
+        let observation = inspect_process_subtree(&snapshot, 90);
+
+        assert!(observation.has_wsl);
+        assert_eq!(transport_from_observation(&observation), "ssh");
+    }
 }
