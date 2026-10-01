@@ -120,6 +120,14 @@ jobs:
             sudo security add-trusted-cert -d -r trustRoot -p codeSign \
               -k /Library/Keychains/System.keychain "$work/cert.pem"
           fi
+          # Tauri 只按 Apple 证书类型前缀（Apple Development: / Developer ID Application: 等）
+          # 查找钥匙串里的证书，并要求 subject 带 OU（Team ID），否则同样报 failed to resolve signing identity。
+          subject="$(/usr/bin/openssl x509 -in "$work/cert.pem" -noout -subject)"
+          if ! grep -qE 'CN ?= ?(iOS Distribution|Apple Distribution|Developer ID Application|Mac App Distribution|Apple Development|iOS App Development|Mac Development): ' <<<"$subject" \
+            || ! grep -qE 'OU ?= ?' <<<"$subject"; then
+            echo "::error::证书 subject 不符合 Tauri 要求（需 Apple 类型前缀 + OU）：$subject"
+            exit 1
+          fi
           check_kc="$work/check.keychain-db"
           security create-keychain -p check "$check_kc"
           security import "$work/cert.p12" -k "$check_kc" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign >/dev/null
