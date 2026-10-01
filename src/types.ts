@@ -68,14 +68,20 @@ export interface ShellConfig {
 export interface SshImageBridgeConfig {
   id: string;
   name: string;
-  /** `ssh <host>` 中的目标字符串，例如 `4` 或 `user@example.com`。 */
+  /** `ssh <host>` 中的目标字符串，多个用逗号分隔，例如 `4,claude` 或 `user@example.com`。 */
   sshHost: string;
-  /** 远端桥接目录，MiniTerm 会把图片写入其中。 */
+  /** 远端桥接目录，替换探测命令里的 `{directory}`。 */
   remoteDirectory: string;
   /** 远端桥接就绪探测命令，`{directory}` 会替换成远端桥接目录。 */
   probeCommand: string;
-  /** 桥接程序识别的图片文件名前缀，例如 `clipboard-`。 */
+  /** 旧版上传到桥接目录时使用的文件名前缀，保留以兼容已有配置。 */
   filePrefix: string;
+  /** 宿主机上与沙箱共享的目录；为空或不存在时回退到 ssh 上传。 */
+  hostSharedDirectory: string;
+  /** 沙箱里看到的同一个共享目录，例如 `/workspace/h-workspace`。 */
+  remoteSharedDirectory: string;
+  /** 共享目录下存放图片的子目录，例如 `temp`。 */
+  sharedImageSubdirectory: string;
 }
 
 // === 布局持久化 ===

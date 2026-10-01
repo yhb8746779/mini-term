@@ -787,20 +787,37 @@ async function uploadImageOverSsh(
 }
 
 /**
- * 优先投递到 Code Sandbox 的 xclip bridge，供 Alt+V 创建原生图片块。
- * 该 command 会在 bridge helper 缺失时失败，调用方应回退到普通 SSH 上传。
+ * 探测 pane 所连沙箱是否提供 Code Sandbox xclip bridge（只探测、不上传）。
+ * bridge helper 会当场从宿主机剪贴板拉图，成功后发图片快捷键即可生成原生图片块。
  */
-async function uploadImageToSshClipboardBridge(
+async function probeSshClipboardBridge(
   ptyId: number,
-  localPath: string,
   bridges: SshImageBridgeConfig[],
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
-    await invoke('upload_image_to_ssh_clipboard_bridge', { ptyId, localPath, bridges });
+    await invoke('probe_ssh_clipboard_bridge', { ptyId, bridges });
     return { ok: true };
   } catch (err) {
-    debugTerm('clipboard:ssh_bridge_upload_failed', { localPath, error: String(err) });
+    debugTerm('clipboard:ssh_bridge_probe_failed', { error: String(err) });
     return { ok: false, error: String(err) };
+  }
+}
+
+/**
+ * 把图片写进宿主机与沙箱共享的目录（例如映射成 /workspace/h-workspace 的目录），
+ * 返回沙箱内路径；规则未配置共享目录或宿主机目录不存在时失败，调用方回退到 ssh 上传。
+ */
+async function stageImageInSshSharedDirectory(
+  ptyId: number,
+  localPath: string,
+  bridges: SshImageBridgeConfig[],
+): Promise<{ remotePath: string } | { error: string }> {
+  try {
+    const remotePath = await invoke<string>('stage_image_in_ssh_shared_directory', { ptyId, localPath, bridges });
+    return { remotePath };
+  } catch (err) {
+    debugTerm('clipboard:ssh_shared_stage_failed', { localPath, error: String(err) });
+    return { error: String(err) };
   }
 }
 
@@ -1237,10 +1254,10 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
   //   - 宿主机的 C:\... / H:\... 路径对端也解析不了
   // 两者都改成"给出一个终端侧能打开的路径"，但拿到路径的方式不同：
   //   wsl → 落到宿主机与发行版共享的目录，换算成 WSL 路径
-  //   ssh → 另开一条 ssh 连接把图片传到远端 /tmp（见 uploadImageOverSsh）
+  //   ssh → 写进宿主机与沙箱的共享目录；没有共享目录时另开一条 ssh 连接传到远端 /tmp
   //
-  // Code Sandbox 是例外：它提供 xclip bridge，可让 Claude Code 的 Alt+V 产生
-  // 原生图片块。bridge 不存在时仍严格回退到已验证的 /tmp 路径上传。
+  // Code Sandbox 是例外：它提供 xclip bridge，可让 Claude Code 的图片快捷键产生
+  // 原生图片块。bridge 不存在时回退到上面的路径文本。
   const usesImagePathPaste = transport !== 'local' || (_isMacOS && isAiPane);
 
   // 诊断：AI pane 身份判定（文档 §5.2）
@@ -1275,18 +1292,24 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
       let failure = '无法读取剪贴板图片，未向终端粘贴内容';
 
       if (transport === 'ssh') {
-        // 远端（云服务器）看不到本机文件系统，贴本地路径必然读不到，
-        // 只能另开一条 ssh 连接把图片真的传过去。
-        // 截图先落成本地文件；已经是文件的直接传，不必多拷一次。
-        const localPaths = clipboard.kind === 'raw-image'
-          ? [(await trySaveClipboardImageForPathPaste())?.savedPath]
-          : imageFilePaths;
-        // 单张图片优先走 Code Sandbox xclip bridge。成功后必须发图片快捷键，
-        // 才会让 Claude Code 显示原生 [Image #N]，而不是 @/tmp 路径文本。
-        if (localPaths.length === 1 && localPaths[0]) {
-          const bridges = useAppStore.getState().config.sshImageBridges ?? [];
-          const bridge = await uploadImageToSshClipboardBridge(ptyId, localPaths[0], bridges);
-          if (bridge.ok) {
+        const bridges = useAppStore.getState().config.sshImageBridges ?? [];
+
+        // 1. 单张图片优先走 Code Sandbox xclip bridge：只探测不上传，bridge helper
+        //    会当场从宿主机剪贴板取图，发图片快捷键后 Claude Code 显示原生 [Image #N]。
+        //    Finder/Explorer 复制的是文件引用，先把文件内容写成剪贴板位图。
+        const imageCount = clipboard.kind === 'raw-image' ? 1 : imageFilePaths.length;
+        if (imageCount === 1) {
+          const bridge = await probeSshClipboardBridge(ptyId, bridges);
+          let clipboardReady = bridge.ok;
+          if (bridge.ok && clipboard.kind !== 'raw-image') {
+            try {
+              await invoke('load_image_to_clipboard', { path: imageFilePaths[0] });
+            } catch (err) {
+              debugTerm('clipboard:ssh_bridge_load_image_failed', { error: String(err) });
+              clipboardReady = false;
+            }
+          }
+          if (clipboardReady) {
             await sendAiScreenshotImagePaste(ptyId, provider);
             debugTerm('paste:route', {
               ptyId,
@@ -1296,14 +1319,21 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
             });
             return;
           }
-          failure = bridge.error;
+          if (!bridge.ok) failure = bridge.error;
         }
 
-        // bridge 不可用或多图时，保留通用 SSH 的可靠路径文本回退。
+        // 2. 路径文本回退。截图先落成本地文件；已经是文件的直接用。
+        //    能写共享目录就不走 ssh；否则另开一条 ssh 连接把图片传到远端 /tmp。
+        const localPaths = clipboard.kind === 'raw-image'
+          ? [(await trySaveClipboardImageForPathPaste())?.savedPath]
+          : imageFilePaths;
         const results = await Promise.all(
           localPaths
             .filter((p): p is string => !!p)
-            .map((p) => uploadImageOverSsh(ptyId, p)),
+            .map(async (p) => {
+              const staged = await stageImageInSshSharedDirectory(ptyId, p, bridges);
+              return 'remotePath' in staged ? staged : uploadImageOverSsh(ptyId, p);
+            }),
         );
         terminalPaths = results.flatMap((r) => ('remotePath' in r ? [r.remotePath] : []));
         // 远端失败的原因（免密没配、/tmp 不可写、超时）对用户有实际价值，

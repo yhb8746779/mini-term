@@ -148,6 +148,34 @@ pub struct SshImageBridgeConfig {
     pub remote_directory: String,
     pub probe_command: String,
     pub file_prefix: String,
+    /// 宿主机上与远端共享的目录（例如 Code Sandbox 把它映射成 /workspace/h-workspace）。
+    /// 为空或目录不存在时不走共享目录，回退到 ssh 上传。
+    #[serde(default = "default_host_shared_directory")]
+    pub host_shared_directory: String,
+    /// 远端看到的共享目录路径，与 host_shared_directory 指向同一份数据。
+    #[serde(default = "default_remote_shared_directory")]
+    pub remote_shared_directory: String,
+    /// 共享目录下存放图片的子目录（相对路径）。
+    #[serde(default = "default_shared_image_subdirectory")]
+    pub shared_image_subdirectory: String,
+}
+
+fn default_host_shared_directory() -> String {
+    // Windows 的 H:\workspace 在沙箱里映射为 /workspace/h-workspace（与 clipboard_path 的 WSL 约定一致）；
+    // macOS 的映射目录因人而异，留空由用户在设置页填写。
+    if cfg!(windows) {
+        r"H:\workspace".into()
+    } else {
+        String::new()
+    }
+}
+
+fn default_remote_shared_directory() -> String {
+    "/workspace/h-workspace".into()
+}
+
+fn default_shared_image_subdirectory() -> String {
+    "temp".into()
 }
 
 fn default_ui_font_size() -> f64 {
@@ -173,11 +201,25 @@ fn default_ssh_image_bridges() -> Vec<SshImageBridgeConfig> {
     vec![SshImageBridgeConfig {
         id: "codesandbox-ssh-4".into(),
         name: "CodeSandbox 本机沙箱".into(),
-        ssh_host: "4".into(),
+        // Windows 上沙箱别名是 `4`，macOS 上是 `claude`；逗号分隔可同时匹配多个目标。
+        ssh_host: "4,claude".into(),
         remote_directory: "/workspace/clipboard".into(),
         probe_command: "test -x {directory}/bin/xclip".into(),
         file_prefix: "clipboard-".into(),
+        host_shared_directory: default_host_shared_directory(),
+        remote_shared_directory: default_remote_shared_directory(),
+        shared_image_subdirectory: default_shared_image_subdirectory(),
     }]
+}
+
+/// 旧版默认规则只匹配 `4`（Windows 别名），macOS 上 `ssh claude` 永远匹配不到。
+/// 仅升级仍保持出厂值的默认规则，用户改过的不动。
+fn migrate_ssh_image_bridges(bridges: &mut [SshImageBridgeConfig]) {
+    for bridge in bridges.iter_mut() {
+        if bridge.id == "codesandbox-ssh-4" && bridge.ssh_host.trim() == "4" {
+            bridge.ssh_host = "4,claude".into();
+        }
+    }
 }
 
 impl Default for AppConfig {
@@ -322,6 +364,8 @@ fn normalize_split_node(node: &mut SavedSplitNode) {
 }
 
 fn migrate_config(mut config: AppConfig) -> AppConfig {
+    migrate_ssh_image_bridges(&mut config.ssh_image_bridges);
+
     // 迁移 SavedSplitNode: pane → panes
     for project in config.projects.iter_mut() {
         if let Some(layout) = project.saved_layout.as_mut() {
@@ -457,6 +501,23 @@ fn normalize_project_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn migrates_factory_ssh_bridge_to_match_mac_alias() {
+        let json = r#"{"projects":[],"defaultShell":"zsh","availableShells":[],"uiFontSize":13,"terminalFontSize":14,
+            "sshImageBridges":[
+                {"id":"codesandbox-ssh-4","name":"CodeSandbox 本机沙箱","sshHost":"4","remoteDirectory":"/workspace/clipboard","probeCommand":"test -x {directory}/bin/xclip","filePrefix":"clipboard-"},
+                {"id":"custom","name":"自定义","sshHost":"4","remoteDirectory":"/workspace/clipboard","probeCommand":"true","filePrefix":"clipboard-"}
+            ]}"#;
+        let config = migrate_config(serde_json::from_str(json).unwrap());
+
+        assert_eq!(config.ssh_image_bridges[0].ssh_host, "4,claude");
+        // 用户自建的规则不动
+        assert_eq!(config.ssh_image_bridges[1].ssh_host, "4");
+        // 旧配置缺少共享目录字段时使用默认值
+        assert_eq!(config.ssh_image_bridges[0].remote_shared_directory, "/workspace/h-workspace");
+        assert_eq!(config.ssh_image_bridges[0].shared_image_subdirectory, "temp");
+    }
+
     use super::*;
 
     #[test]

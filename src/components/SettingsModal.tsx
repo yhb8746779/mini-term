@@ -281,6 +281,9 @@ function newSshImageBridge(): SshImageBridgeConfig {
     remoteDirectory: '/workspace/clipboard',
     probeCommand: 'test -x {directory}/bin/xclip',
     filePrefix: 'clipboard-',
+    hostSharedDirectory: '',
+    remoteSharedDirectory: '/workspace/h-workspace',
+    sharedImageSubdirectory: 'temp',
   };
 }
 
@@ -309,9 +312,11 @@ function SshImageBridgeRow({
       sshHost: draft.sshHost.trim(),
       remoteDirectory: draft.remoteDirectory.trim(),
       probeCommand: draft.probeCommand.trim(),
-      filePrefix: draft.filePrefix.trim(),
+      hostSharedDirectory: (draft.hostSharedDirectory ?? '').trim(),
+      remoteSharedDirectory: (draft.remoteSharedDirectory ?? '').trim(),
+      sharedImageSubdirectory: (draft.sharedImageSubdirectory ?? '').trim(),
     };
-    if (!normalized.sshHost || !normalized.remoteDirectory || !normalized.probeCommand || !normalized.filePrefix) return;
+    if (!normalized.sshHost || !normalized.remoteDirectory || !normalized.probeCommand) return;
     onUpdate(normalized);
     setEditing(false);
   };
@@ -322,6 +327,9 @@ function SshImageBridgeRow({
         <div className="flex-1 min-w-0">
           <div className="text-base font-medium text-[var(--text-primary)]">{bridge.name}</div>
           <div className="text-sm text-[var(--text-muted)] font-mono truncate">ssh {bridge.sshHost || '(未配置)'}</div>
+          <div className="text-sm text-[var(--text-muted)] font-mono truncate">
+            共享目录 {bridge.hostSharedDirectory ? `${bridge.hostSharedDirectory} → ${bridge.remoteSharedDirectory}/${bridge.sharedImageSubdirectory}` : '(未配置，回退 ssh 上传)'}
+          </div>
         </div>
         <div className="hidden group-hover:flex items-center gap-1">
           <button className="px-2 py-0.5 text-sm text-[var(--text-muted)] hover:text-[var(--text-primary)]" onClick={() => setEditing(true)}>编辑</button>
@@ -334,10 +342,13 @@ function SshImageBridgeRow({
   return (
     <div className="space-y-2 p-3 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--accent)] border-dashed">
       <input className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)]" value={draft.name} placeholder="规则名称" onChange={(e) => setField('name', e.target.value)} />
-      <input className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base font-mono outline-none focus:border-[var(--accent)]" value={draft.sshHost} placeholder="SSH 目标，例如 4 或 user@example.com" onChange={(e) => setField('sshHost', e.target.value)} />
+      <input className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base font-mono outline-none focus:border-[var(--accent)]" value={draft.sshHost} placeholder="SSH 目标，多个用逗号分隔，例如 4,claude" onChange={(e) => setField('sshHost', e.target.value)} />
       <input className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base font-mono outline-none focus:border-[var(--accent)]" value={draft.remoteDirectory} placeholder="远端图片桥接目录" onChange={(e) => setField('remoteDirectory', e.target.value)} />
       <input className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base font-mono outline-none focus:border-[var(--accent)]" value={draft.probeCommand} placeholder="就绪探测命令，支持 {directory}" onChange={(e) => setField('probeCommand', e.target.value)} />
-      <input className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base font-mono outline-none focus:border-[var(--accent)]" value={draft.filePrefix} placeholder="文件名前缀，例如 clipboard-" onChange={(e) => setField('filePrefix', e.target.value)} />
+      <div className="pt-1 text-sm text-[var(--text-muted)]">共享目录（可选）：配置后图片直接写进共享目录，不再经 ssh 上传</div>
+      <input className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base font-mono outline-none focus:border-[var(--accent)]" value={draft.hostSharedDirectory ?? ''} placeholder="宿主机共享目录，例如 H:\workspace 或 Mac 上映射到沙箱的目录" onChange={(e) => setField('hostSharedDirectory', e.target.value)} />
+      <input className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base font-mono outline-none focus:border-[var(--accent)]" value={draft.remoteSharedDirectory ?? ''} placeholder="沙箱内对应路径，例如 /workspace/h-workspace" onChange={(e) => setField('remoteSharedDirectory', e.target.value)} />
+      <input className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base font-mono outline-none focus:border-[var(--accent)]" value={draft.sharedImageSubdirectory ?? ''} placeholder="图片子目录，例如 temp" onChange={(e) => setField('sharedImageSubdirectory', e.target.value)} />
       <div className="flex gap-2 justify-end">
         <button className="px-3 py-1 text-base bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90" onClick={save}>保存</button>
         <button className="px-3 py-1 text-base text-[var(--text-muted)] hover:text-[var(--text-primary)]" onClick={() => { setDraft(bridge); setEditing(false); }}>取消</button>
@@ -361,7 +372,7 @@ function SshImageBridgeSettings() {
     <div className="space-y-4">
       <div>
         <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">SSH 图片桥接</div>
-        <p className="text-sm text-[var(--text-muted)] leading-5">匹配的 SSH 终端会先把单张图片写入该沙箱的桥接目录，再发送 Alt+V 让 Claude Code 创建原生图片块。不匹配或探测失败时自动回退到 /tmp 图片路径。</p>
+        <p className="text-sm text-[var(--text-muted)] leading-5">匹配的 SSH 终端粘贴单张图片时，先执行就绪探测（不上传），成功则发送图片快捷键，由沙箱的 xclip 桥接直接读取宿主机剪贴板，生成原生 [Image #N]。探测失败时，若配置了共享目录且宿主机目录存在，就把图片写入共享目录并粘贴沙箱内路径；否则回退到 ssh 上传到远端 /tmp。</p>
       </div>
       <div className="space-y-2">
         {bridges.map((bridge) => (
