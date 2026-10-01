@@ -108,6 +108,30 @@ jobs:
             echo "::error::ENABLE_APPLE_SIGNING=true 但缺少 APPLE_CERTIFICATE / APPLE_SIGNING_IDENTITY"
             exit 1
           fi
+          # 自签名证书默认不受信任，Tauri 解析签名身份时只认"有效"身份，会报
+          # failed to resolve signing identity。把证书加入 runner 的系统信任（仅代码签名），
+          # 再在临时钥匙串里确认身份有效，避免白跑 20 分钟编译。
+          work="$RUNNER_TEMP/apple-signing"
+          mkdir -p "$work"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$work/cert.p12"
+          /usr/bin/openssl pkcs12 -in "$work/cert.p12" -nokeys -clcerts \
+            -passin env:APPLE_CERTIFICATE_PASSWORD -out "$work/cert.pem"
+          if ! grep -q "Apple" <(/usr/bin/openssl x509 -in "$work/cert.pem" -noout -issuer); then
+            sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+              -k /Library/Keychains/System.keychain "$work/cert.pem"
+          fi
+          check_kc="$work/check.keychain-db"
+          security create-keychain -p check "$check_kc"
+          security import "$work/cert.p12" -k "$check_kc" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign >/dev/null
+          if ! security find-identity -v -p codesigning "$check_kc" | grep -qF "\"$APPLE_SIGNING_IDENTITY\""; then
+            security find-identity -p codesigning "$check_kc"
+            echo "::error::签名身份 $APPLE_SIGNING_IDENTITY 无效（证书未被信任或名称不匹配）"
+            exit 1
+          fi
+          security delete-keychain "$check_kc"
+          rm -rf "$work"
+          echo "Signing identity OK: $APPLE_SIGNING_IDENTITY"
+
           export_var() {
             local name="$1"
             local value="${!name}"
