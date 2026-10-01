@@ -116,7 +116,10 @@ jobs:
           echo "$APPLE_CERTIFICATE" | base64 --decode > "$work/cert.p12"
           /usr/bin/openssl pkcs12 -in "$work/cert.p12" -nokeys -clcerts \
             -passin env:APPLE_CERTIFICATE_PASSWORD -out "$work/cert.pem"
-          if ! grep -q "Apple" <(/usr/bin/openssl x509 -in "$work/cert.pem" -noout -issuer); then
+          # 只给自签名证书（issuer == subject）加信任；Apple 签发的证书本来就受信任。
+          cert_subject="$(/usr/bin/openssl x509 -in "$work/cert.pem" -noout -subject | sed 's/^subject= *//')"
+          cert_issuer="$(/usr/bin/openssl x509 -in "$work/cert.pem" -noout -issuer | sed 's/^issuer= *//')"
+          if [ "$cert_subject" = "$cert_issuer" ]; then
             sudo security add-trusted-cert -d -r trustRoot -p codeSign \
               -k /Library/Keychains/System.keychain "$work/cert.pem"
           fi
