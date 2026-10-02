@@ -1297,13 +1297,19 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
         // 1. 单张图片优先走 Code Sandbox xclip bridge：只探测不上传，bridge helper
         //    会当场从宿主机剪贴板取图，发图片快捷键后 Claude Code 显示原生 [Image #N]。
         //    Finder/Explorer 复制的是文件引用，先把文件内容写成剪贴板位图。
+        //    macOS 上截图位图也要重写一遍：微信等应用只放 file-url + TIFF，
+        //    桥接只认 PNG，必须先落盘再以 PNG 写回剪贴板。
         const imageCount = clipboard.kind === 'raw-image' ? 1 : imageFilePaths.length;
         if (imageCount === 1) {
           const bridge = await probeSshClipboardBridge(ptyId, bridges);
           let clipboardReady = bridge.ok;
-          if (bridge.ok && clipboard.kind !== 'raw-image') {
+          if (bridge.ok && (clipboard.kind !== 'raw-image' || _isMacOS)) {
             try {
-              await invoke('load_image_to_clipboard', { path: imageFilePaths[0] });
+              const sourcePath = clipboard.kind === 'raw-image'
+                ? (await trySaveClipboardImageForPathPaste())?.savedPath
+                : imageFilePaths[0];
+              if (!sourcePath) throw new Error('无法读取剪贴板图片');
+              await invoke('load_image_to_clipboard', { path: sourcePath });
             } catch (err) {
               debugTerm('clipboard:ssh_bridge_load_image_failed', { error: String(err) });
               clipboardReady = false;
