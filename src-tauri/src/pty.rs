@@ -407,6 +407,11 @@ pub struct PtyManager {
     ai_sessions: Arc<Mutex<HashSet<u32>>>,
     /// 当前 AI 会话的 provider（"claude" / "codex" / "gemini"）
     ai_providers: Arc<Mutex<HashMap<u32, String>>>,
+    /// 高可信来源（启动 banner / Hook / 子进程名 / 用户亲手键入的命令）最近一次确认的 provider。
+    /// 会话标记被清掉后仍保留：SSH 面板里双 Ctrl+C 清空输入框会被当成"退出 AI"，
+    /// 而 Claude 实际仍在运行，随后回复里的 `## Codex …` 之类行会被文本启发式误判成启动 codex。
+    /// 文本启发式得出的 provider 与此不一致时，以此为准。
+    confirmed_providers: Arc<Mutex<HashMap<u32, String>>>,
     input_buffers: Arc<Mutex<HashMap<u32, String>>>,
     last_ctrlc: Arc<Mutex<HashMap<u32, Instant>>>,
     last_enter: Arc<Mutex<HashMap<u32, Instant>>>,
@@ -432,6 +437,7 @@ impl PtyManager {
             last_output: Arc::new(Mutex::new(HashMap::new())),
             ai_sessions: Arc::new(Mutex::new(HashSet::new())),
             ai_providers: Arc::new(Mutex::new(HashMap::new())),
+            confirmed_providers: Arc::new(Mutex::new(HashMap::new())),
             input_buffers: Arc::new(Mutex::new(HashMap::new())),
             last_ctrlc: Arc::new(Mutex::new(HashMap::new())),
             last_enter: Arc::new(Mutex::new(HashMap::new())),
@@ -473,6 +479,24 @@ impl PtyManager {
         instances.get(&pty_id).and_then(|inst| inst.child.process_id())
     }
 
+    fn confirm_provider(&self, pty_id: u32, provider: &str) {
+        self.confirmed_providers
+            .lock()
+            .unwrap()
+            .insert(pty_id, provider.to_string());
+    }
+
+    /// 文本启发式（shell echo / 输出扫描）得出的 provider 只是猜测：
+    /// 已有高可信确认时以确认值为准，避免 AI 回复里的文字把颜色改掉。
+    fn resolve_heuristic_provider(&self, pty_id: u32, detected: &'static str) -> String {
+        self.confirmed_providers
+            .lock()
+            .unwrap()
+            .get(&pty_id)
+            .cloned()
+            .unwrap_or_else(|| detected.to_string())
+    }
+
     /// Layer 3（进程级真相）：由 process_monitor 调用，一旦在 PTY 子进程树里
     /// 发现了 AI CLI 进程（claude / codex / gemini / grok），强制建立/纠正会话。
     ///
@@ -480,6 +504,7 @@ impl PtyManager {
     /// - 不依赖终端输出，对 MCP 错误刷屏、--resume 长历史回放等场景免疫；
     /// - 优先级最高：provider 不一致时直接覆盖（OS 级进程是最强真相）。
     pub fn force_ai_session(&self, pty_id: u32, provider: &str) {
+        self.confirm_provider(pty_id, provider);
         let need_update = {
             let sessions = self.ai_sessions.lock().unwrap();
             let providers = self.ai_providers.lock().unwrap();
@@ -565,7 +590,8 @@ impl PtyManager {
             // Part A+B: 直接用统一函数检测 provider；仅在同时能确定 provider 时才
             // 进入 AI 状态，且在同一锁范围内原子写入 session + provider，
             // 消除 monitor 在两次独立写入之间轮询导致的 provider=None 竞态。
-            if let Some(provider) = detect_provider_from_output(output) {
+            if let Some(detected) = detect_provider_from_output(output) {
+                let provider = self.resolve_heuristic_provider(pty_id, detected);
                 // 先清空 recent_output_window，再设置 session+provider。
                 // 防止 monitor 在两步之间抢跑 try_reconcile_ai_from_banner，
                 // 用旧 banner（如上次 Claude 的）覆盖本次检测到的 provider（如 Codex）。
@@ -573,7 +599,7 @@ impl PtyManager {
                 let mut sessions = self.ai_sessions.lock().unwrap();
                 let mut providers = self.ai_providers.lock().unwrap();
                 sessions.insert(pty_id);
-                providers.insert(pty_id, provider.to_string());
+                providers.insert(pty_id, provider);
             }
         }
     }
@@ -587,8 +613,9 @@ impl PtyManager {
         if self.get_ai_provider(pty_id).is_some() {
             return; // 已有 provider，无需补填
         }
-        if let Some(provider) = detect_provider_from_output(output) {
-            self.ai_providers.lock().unwrap().insert(pty_id, provider.to_string());
+        if let Some(detected) = detect_provider_from_output(output) {
+            let provider = self.resolve_heuristic_provider(pty_id, detected);
+            self.ai_providers.lock().unwrap().insert(pty_id, provider);
         }
     }
 
@@ -624,6 +651,9 @@ impl PtyManager {
 
         // banner 检测（高精度，用于会话建立和 provider 纠正）
         let banner_detected = detect_provider_from_banner(&window);
+        if let Some(detected) = banner_detected {
+            self.confirm_provider(pty_id, detected);
+        }
 
         // 原子读取当前状态（锁顺序：ai_sessions → ai_providers）
         let (is_ai, current_provider) = {
@@ -652,7 +682,8 @@ impl PtyManager {
             // 回退到 detect_provider_from_output 扫描近期输出中的 shell echo 行。
             // 仅在 provider=None 时回填，避免用 output 检测覆盖已知 provider（防误判）。
             if let Some(detected) = detect_provider_from_output(&window) {
-                self.ai_providers.lock().unwrap().insert(pty_id, detected.to_string());
+                let provider = self.resolve_heuristic_provider(pty_id, detected);
+                self.ai_providers.lock().unwrap().insert(pty_id, provider);
             }
         }
     }
@@ -668,6 +699,8 @@ impl PtyManager {
         let mut exit_ai = false;
         let mut entered = false;
         let mut detected_provider: Option<&'static str> = None;
+        // 区分来源：用户亲手键入的命令是高可信；PSReadLine 补偿路径扫屏幕文字只是猜测
+        let mut provider_from_heuristic = false;
         // Enter 时 buf 的内容（需在锁外使用，所以提升到外层作用域）
         let mut last_cmd = String::new();
         {
@@ -767,6 +800,7 @@ impl PtyManager {
                 if let Some(provider) = detect_provider_from_output(ose_data) {
                     enter_ai = true;
                     detected_provider = Some(provider);
+                    provider_from_heuristic = true;
                 }
             }
         }
@@ -791,14 +825,23 @@ impl PtyManager {
             if enter_ai {
                 self.recent_output_window.lock().unwrap().insert(pty_id, String::new());
             }
+            // 在获取 sessions/providers 锁之前解析，避免与 confirmed_providers 交叉加锁
+            let provider_to_set = detected_provider.map(|p| {
+                if provider_from_heuristic {
+                    self.resolve_heuristic_provider(pty_id, p)
+                } else {
+                    self.confirm_provider(pty_id, p);
+                    p.to_string()
+                }
+            });
 
             {
                 let mut sessions = self.ai_sessions.lock().unwrap();
                 let mut providers = self.ai_providers.lock().unwrap();
                 if enter_ai {
                     sessions.insert(pty_id);
-                    if let Some(p) = detected_provider {
-                        providers.insert(pty_id, p.to_string());
+                    if let Some(p) = provider_to_set {
+                        providers.insert(pty_id, p);
                     }
                 } else {
                     sessions.remove(&pty_id);
@@ -1173,6 +1216,7 @@ pub fn kill_pty(
     state.last_output.lock().unwrap().remove(&pty_id);
     state.ai_sessions.lock().unwrap().remove(&pty_id);
     state.ai_providers.lock().unwrap().remove(&pty_id);
+    state.confirmed_providers.lock().unwrap().remove(&pty_id);
     state.input_buffers.lock().unwrap().remove(&pty_id);
     state.last_ctrlc.lock().unwrap().remove(&pty_id);
     state.last_enter.lock().unwrap().remove(&pty_id);
@@ -1779,6 +1823,49 @@ mod tests {
         assert!(!mgr.is_ai_session(1));
         mgr.try_reconcile_ai_from_banner(1);
         assert!(!mgr.is_ai_session(1), "Ctrl+D 退出后 banner 不应重新触发");
+    }
+
+    /// SSH 面板里 Claude 进程不在宿主机进程表中：双 Ctrl+C 清空输入框会被当成退出，
+    /// 随后 Claude 回复里的 `## Codex …` 行曾被文本启发式识别成"启动 codex"，状态点变蓝。
+    #[test]
+    fn heuristic_reentry_keeps_confirmed_claude_provider() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "claude --dangerously-skip-permissions\r");
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("claude"));
+
+        mgr.track_input(1, "\x03");
+        mgr.track_input(1, "\x03"); // 双 Ctrl+C：被当成退出，Claude 实际仍在运行
+        assert!(!mgr.is_ai_session(1));
+
+        mgr.track_input(1, "\r");
+        mgr.inject_pty_output(1, "## Codex 配置说明\n");
+
+        assert!(mgr.is_ai_session(1));
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn typed_codex_command_overrides_confirmed_claude() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "claude\r");
+        mgr.track_input(1, "/exit\r");
+        mgr.track_input(1, "codex\r");
+
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn banner_confirms_provider_for_ssh_session() {
+        let mgr = PtyManager::new();
+        mgr.inject_banner_output(1, "Claude Code v2.1.285\n");
+        mgr.try_reconcile_ai_from_banner(1);
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("claude"));
+
+        mgr.clear_ai_session(1);
+        mgr.track_input(1, "\r");
+        mgr.inject_pty_output(1, "$ codex\n");
+
+        assert_eq!(mgr.get_ai_provider(1).as_deref(), Some("claude"));
     }
 
     #[test]
