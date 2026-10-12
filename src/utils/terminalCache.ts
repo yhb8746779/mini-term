@@ -20,6 +20,7 @@ import type { PtyOutputPayload, AiProvider, SshImageBridgeConfig } from '../type
 import { getResolvedTheme } from './themeManager';
 import { createPtyWriteQueue } from './ptyWriteQueue';
 import { showErrorToast } from './errorToast';
+import { selectedSshImageBridges } from './sshImageBridges';
 
 export interface CachedTerminal {
   term: Terminal;
@@ -666,12 +667,18 @@ export function writePtyInput(ptyId: number, data: string): Promise<void> {
 
 /**
  * 获取当前选中文本：优先取 xterm 选区，fallback 到页面 DOM 选区。
- * 解决 Claude/Codex TUI 内部自管理文本区域不反映为 xterm selection 的问题。
+ * DOM 兜底只接受当前终端内的选区；TUI 自己绘制的高亮不属于 DOM 选区。
  */
 export function getAnySelectedText(ptyId: number): string {
-  const termSel = cache.get(ptyId)?.term.getSelection() ?? '';
+  const entry = cache.get(ptyId);
+  const termSel = entry?.term.getSelection() ?? '';
   if (termSel) return termSel;
-  return window.getSelection()?.toString().trim() ?? '';
+  const selection = window.getSelection();
+  if (!entry || !selection?.anchorNode || !selection.focusNode ||
+      !entry.wrapper.contains(selection.anchorNode) || !entry.wrapper.contains(selection.focusNode)) {
+    return '';
+  }
+  return selection.toString();
 }
 
 /** 把指定文本写入系统剪贴板。供右键菜单在弹出时已拿到快照的场景使用。 */
@@ -870,7 +877,7 @@ function getAiProviderForPty(ptyId: number): AiProvider | null {
 //   raw-image
 //     = 截图工具/图片编辑器直接写入剪贴板的图片位图（CF_DIB/CF_BITMAP）。
 //       Web Clipboard API 暴露 image/* MIME type。
-//       Windows WSL / macOS AI 终端转为可读取路径；Windows 本机终端保留原生图片快捷键。
+//       SSH / WSL 与 macOS 非 Codex AI 终端走路径/桥接；本机 Codex 保留原生图片快捷键。
 //
 //   explorer-image-files / finder-image-files
 //     = 资源管理器/Finder 复制的图片文件（CF_HDROP / public.file-url 文件路径列表）。
@@ -1258,7 +1265,9 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
   //
   // Code Sandbox 是例外：它提供 xclip bridge，可让 Claude Code 的图片快捷键产生
   // 原生图片块。bridge 不存在时回退到上面的路径文本。
-  const usesImagePathPaste = transport !== 'local' || (_isMacOS && isAiPane);
+  // 只恢复本机 Codex 的图片附件入口。Claude/Gemini 的本机路径策略，以及
+  // SSH 沙箱的 PNG 规范化、xclip bridge 和路径回退保持原有流程。
+  const usesImagePathPaste = transport !== 'local' || (_isMacOS && isAiPane && provider !== 'codex');
 
   // 诊断：AI pane 身份判定（文档 §5.2）
   if (TERM_DEBUG) {
@@ -1292,7 +1301,7 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
       let failure = '无法读取剪贴板图片，未向终端粘贴内容';
 
       if (transport === 'ssh') {
-        const bridges = useAppStore.getState().config.sshImageBridges ?? [];
+        const bridges = selectedSshImageBridges(useAppStore.getState().config);
 
         // 1. 单张图片优先走 Code Sandbox xclip bridge：只探测不上传，bridge helper
         //    会当场从宿主机剪贴板取图，发图片快捷键后 Claude Code 显示原生 [Image #N]。

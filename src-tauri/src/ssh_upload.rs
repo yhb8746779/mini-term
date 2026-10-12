@@ -443,21 +443,31 @@ pub fn upload_image_over_ssh(
     Ok(remote_path)
 }
 
-fn probe_cached(destination: &str) -> bool {
+fn bridge_probe_cache_key(
+    pty_id: u32,
+    argv: &[String],
+    bridge: &crate::config::SshImageBridgeConfig,
+) -> String {
+    // 同一 SSH 别名可能切换沙箱；不同终端、端口或配置不能复用旧的探测成功结果。
+    serde_json::to_string(&(pty_id, argv, bridge)).expect("bridge config contains only strings")
+}
+
+fn probe_cached(key: &str) -> bool {
     let guard = PROBE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     guard
         .as_ref()
-        .and_then(|cache| cache.get(destination))
+        .and_then(|cache| cache.get(key))
         .is_some_and(|at| at.elapsed() < PROBE_CACHE_TTL)
 }
 
-fn set_probe_cache(destination: &str, ok: bool) {
+fn set_probe_cache(key: &str, ok: bool) {
     let mut guard = PROBE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let cache = guard.get_or_insert_with(HashMap::new);
+    cache.retain(|_, at| at.elapsed() < PROBE_CACHE_TTL);
     if ok {
-        cache.insert(destination.to_string(), Instant::now());
+        cache.insert(key.to_string(), Instant::now());
     } else {
-        cache.remove(destination);
+        cache.remove(key);
     }
 }
 
@@ -472,14 +482,15 @@ pub fn probe_ssh_clipboard_bridge(
     bridges: Vec<crate::config::SshImageBridgeConfig>,
 ) -> Result<(), String> {
     let argv = pane_ssh_argv(state.inner(), pty_id)?;
-    let (destination, bridge) = matched_bridge(&argv, &bridges)?;
-    if probe_cached(&destination) {
+    let (_, bridge) = matched_bridge(&argv, &bridges)?;
+    let (_, probe_command) = validate_bridge_config(bridge)?;
+    let cache_key = bridge_probe_cache_key(pty_id, &argv, bridge);
+    if probe_cached(&cache_key) {
         return Ok(());
     }
-    let (_, probe_command) = validate_bridge_config(bridge)?;
     // probe_command 是用户在设置页主动配置的远端命令；只有它返回成功才认为桥接可用。
     let result = run_remote_command(&argv, &probe_command, None);
-    set_probe_cache(&destination, result.is_ok());
+    set_probe_cache(&cache_key, result.is_ok());
     result
 }
 
@@ -647,6 +658,30 @@ mod tests {
 
         assert_eq!(directory, "/bridge/images");
         assert_eq!(probe, "test -x /bridge/images/bin/xclip");
+    }
+
+    #[test]
+    fn switching_bridge_or_connection_does_not_reuse_probe_success() {
+        let connection = argv(&["ssh", "-p", "2222", "sandbox"]);
+        let first = bridge("sandbox");
+        let original_key = bridge_probe_cache_key(98765, &connection, &first);
+        set_probe_cache(&original_key, true);
+        assert!(probe_cached(&original_key));
+
+        let mut second = first.clone();
+        second.id = "other-sandbox".into();
+        assert!(!probe_cached(&bridge_probe_cache_key(98765, &connection, &second)));
+        second = first.clone();
+        second.remote_directory = "/another/clipboard".into();
+        assert!(!probe_cached(&bridge_probe_cache_key(98765, &connection, &second)));
+        second = first.clone();
+        second.probe_command = "false".into();
+        assert!(!probe_cached(&bridge_probe_cache_key(98765, &connection, &second)));
+        assert!(!probe_cached(&bridge_probe_cache_key(98766, &connection, &first)));
+        let other_port = argv(&["ssh", "-p", "3333", "sandbox"]);
+        assert!(!probe_cached(&bridge_probe_cache_key(98765, &other_port, &first)));
+        set_probe_cache(&original_key, false);
+        assert!(!probe_cached(&original_key));
     }
 
     /// Windows 上沙箱别名是 `4`，macOS 上是 `claude`，一条规则要能同时匹配。

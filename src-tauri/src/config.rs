@@ -72,6 +72,11 @@ pub struct AppConfig {
     /// SSH 图片桥接：把宿主机图片投递到具备剪贴板桥接能力的沙箱，再触发 AI CLI 原生粘贴。
     #[serde(default = "default_ssh_image_bridges")]
     pub ssh_image_bridges: Vec<SshImageBridgeConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_ssh_image_bridge_id: Option<String>,
+    /// 预设仅补充一次；用户删除后不在每次启动时恢复。
+    #[serde(default)]
+    pub ssh_image_bridge_presets_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,7 +214,25 @@ fn default_ssh_image_bridges() -> Vec<SshImageBridgeConfig> {
         host_shared_directory: default_host_shared_directory(),
         remote_shared_directory: default_remote_shared_directory(),
         shared_image_subdirectory: default_shared_image_subdirectory(),
-    }]
+    }, default_devbox_image_bridge()]
+}
+
+fn default_devbox_image_bridge() -> SshImageBridgeConfig {
+    SshImageBridgeConfig {
+        id: "devbox-ssh".into(),
+        name: "Devbox 本机沙箱".into(),
+        ssh_host: "devbox".into(),
+        remote_directory: "/usr/local".into(),
+        probe_command: "test -x {directory}/bin/xclip".into(),
+        file_prefix: "clipboard-".into(),
+        host_shared_directory: if cfg!(target_os = "macos") {
+            "/Volumes/samsmobile/workspace".into()
+        } else {
+            String::new()
+        },
+        remote_shared_directory: default_remote_shared_directory(),
+        shared_image_subdirectory: default_shared_image_subdirectory(),
+    }
 }
 
 /// 旧版默认规则只匹配 `4`（Windows 别名），macOS 上 `ssh claude` 永远匹配不到。
@@ -245,6 +268,8 @@ impl Default for AppConfig {
             terminal_custom_font_family: None,
             hook_enabled: None,
             ssh_image_bridges: default_ssh_image_bridges(),
+            active_ssh_image_bridge_id: None,
+            ssh_image_bridge_presets_version: 1,
         }
     }
 }
@@ -365,6 +390,21 @@ fn normalize_split_node(node: &mut SavedSplitNode) {
 
 fn migrate_config(mut config: AppConfig) -> AppConfig {
     migrate_ssh_image_bridges(&mut config.ssh_image_bridges);
+    if config.ssh_image_bridge_presets_version < 1 {
+        // 测试版或用户自建的 devbox 配置保留原值及 ID，不重复添加。
+        let has_devbox = config.ssh_image_bridges.iter().any(|bridge| {
+            bridge.id == "devbox-ssh" || bridge.ssh_host.split(',').any(|host| host.trim() == "devbox")
+        });
+        if !has_devbox {
+            config.ssh_image_bridges.push(default_devbox_image_bridge());
+        }
+        config.ssh_image_bridge_presets_version = 1;
+    }
+    if let Some(id) = &config.active_ssh_image_bridge_id {
+        if !config.ssh_image_bridges.iter().any(|bridge| &bridge.id == id) {
+            config.active_ssh_image_bridge_id = None;
+        }
+    }
 
     // 迁移 SavedSplitNode: pane → panes
     for project in config.projects.iter_mut() {
@@ -521,6 +561,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn upgrade_adds_devbox_once_and_preserves_existing_selection() {
+        let mut config = AppConfig::default();
+        config.ssh_image_bridges.retain(|b| b.id != "devbox-ssh");
+        config.ssh_image_bridge_presets_version = 0;
+        config.active_ssh_image_bridge_id = Some("codesandbox-ssh-4".into());
+        let mut upgraded = migrate_config(config);
+        assert_eq!(upgraded.ssh_image_bridges.len(), 2);
+        assert_eq!(upgraded.active_ssh_image_bridge_id.as_deref(), Some("codesandbox-ssh-4"));
+        let devbox = &upgraded.ssh_image_bridges[1];
+        assert_eq!(devbox.ssh_host, "devbox");
+        assert_eq!(devbox.remote_directory, "/usr/local");
+        assert_eq!(devbox.probe_command, "test -x {directory}/bin/xclip");
+        // Deleting a preset and reloading must not resurrect it.
+        upgraded.ssh_image_bridges.pop();
+        let json = serde_json::to_string(&upgraded).unwrap();
+        assert_eq!(migrate_config(serde_json::from_str(&json).unwrap()).ssh_image_bridges.len(), 1);
+    }
+
+    #[test]
+    fn upgrade_keeps_custom_devbox_profile_and_active_id() {
+        let mut config = AppConfig::default();
+        config.ssh_image_bridge_presets_version = 0;
+        let devbox = &mut config.ssh_image_bridges[1];
+        devbox.id = "manual-devbox".into();
+        devbox.ssh_host = "another, devbox".into();
+        devbox.remote_directory = "/custom/bridge".into();
+        config.active_ssh_image_bridge_id = Some("manual-devbox".into());
+        let upgraded = migrate_config(config);
+        assert_eq!(upgraded.ssh_image_bridges.len(), 2);
+        assert_eq!(upgraded.ssh_image_bridges[1].remote_directory, "/custom/bridge");
+        assert_eq!(upgraded.active_ssh_image_bridge_id.as_deref(), Some("manual-devbox"));
+    }
+
+    #[test]
+    fn preset_shared_paths_are_platform_specific() {
+        let bridges = default_ssh_image_bridges();
+        if cfg!(windows) {
+            assert_eq!(bridges[0].host_shared_directory, r"H:\workspace");
+            assert!(bridges[1].host_shared_directory.is_empty());
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(bridges[1].host_shared_directory, "/Volumes/samsmobile/workspace");
+        }
+    }
+
+    #[test]
     fn default_config_has_shells() {
         let config = AppConfig::default();
         assert!(!config.available_shells.is_empty());
@@ -529,10 +614,19 @@ mod tests {
 
     #[test]
     fn config_round_trip() {
-        let config = AppConfig::default();
+        let mut config = AppConfig::default();
+        config.active_ssh_image_bridge_id = Some(config.ssh_image_bridges[0].id.clone());
         let json = serde_json::to_string(&config).unwrap();
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.available_shells.len(), config.available_shells.len());
+        assert_eq!(parsed.active_ssh_image_bridge_id, config.active_ssh_image_bridge_id);
+    }
+
+    #[test]
+    fn missing_active_bridge_migrates_back_to_automatic_matching() {
+        let mut config = AppConfig::default();
+        config.active_ssh_image_bridge_id = Some("deleted-profile".into());
+        assert!(migrate_config(config).active_ssh_image_bridge_id.is_none());
     }
 
     #[test]
@@ -547,6 +641,7 @@ mod tests {
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.projects.len(), 1);
         assert!(config.projects[0].saved_layout.is_none());
+        assert!(config.active_ssh_image_bridge_id.is_none());
     }
 
     #[test]

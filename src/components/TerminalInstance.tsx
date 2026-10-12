@@ -18,7 +18,7 @@ export function TerminalInstance({ ptyId }: Props) {
   const [fileDrag, setFileDrag] = useState(false);
   // 右键选区快照：xterm 鼠标模式下，mousedown 会在 contextmenu 之前清除选区，
   // 需要在 mousedown 时提前捕获，否则 handleContextMenu 时已读不到选中文本。
-  const selectionSnapshot = useRef('');
+  const selectionSnapshot = useRef<string | null>(null);
   const terminalFontSize = useAppStore((s) => s.config.terminalFontSize);
   const terminalFollowTheme = useAppStore((s) => s.config.terminalFollowTheme);
 
@@ -121,18 +121,25 @@ export function TerminalInstance({ ptyId }: Props) {
     }
   };
 
+  const isContextClick = (e: React.MouseEvent<HTMLDivElement>) =>
+    e.button === 2 || (_isMacOS && e.button === 0 && e.ctrlKey);
+
   const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    // 右键 mousedown：在 xterm 清除选区之前捕获快照
-    if (e.button === 2) {
+    // 必须在捕获阶段读取：xterm 的鼠标报告会作为用户输入清空选区。
+    // 右键归 mini-term 处理，不再把同一个按键交给 TUI。
+    selectionSnapshot.current = null;
+    if (isContextClick(e)) {
       selectionSnapshot.current = getAnySelectedText(ptyId);
+      e.stopPropagation();
     }
   };
 
   const handleContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
-    // 使用快照而非实时读取：xterm 鼠标模式下 mousedown 已清除选区
-    const selectedText = selectionSnapshot.current;
-    selectionSnapshot.current = '';
+    e.stopPropagation();
+    // 键盘/辅助设备可能直接发 contextmenu，没有前置 mousedown。
+    const selectedText = selectionSnapshot.current ?? getAnySelectedText(ptyId);
+    selectionSnapshot.current = null;
 
     // 诊断日志（文档 §5.1）—— localStorage.setItem('mini-term-debug','1') 开启
     if (localStorage.getItem('mini-term-debug') === '1') {
@@ -146,8 +153,11 @@ export function TerminalInstance({ ptyId }: Props) {
     // macOS / Windows：与原生终端一致，右键直接复制或粘贴，不弹菜单
     if (_isMacOS || _isWindows) {
       if (selectedText) {
-        void copyTextToClipboard(selectedText);
-        getCachedTerminal(ptyId)?.term.clearSelection();
+        void copyTextToClipboard(selectedText).then((copied) => {
+          const term = getCachedTerminal(ptyId)?.term;
+          if (copied) term?.clearSelection();
+          term?.focus();
+        });
       } else {
         void pasteToTerminal(ptyId).finally(() => {
           getCachedTerminal(ptyId)?.term.focus();
@@ -180,11 +190,14 @@ export function TerminalInstance({ ptyId }: Props) {
       <div
         className="flex-1 relative bg-[var(--bg-terminal)]"
         style={panelBg ? { backgroundColor: panelBg } : undefined}
-        onMouseDown={handleMouseDown}
+        onMouseDownCapture={handleMouseDown}
+        onMouseUpCapture={(e) => {
+          if (isContextClick(e)) e.stopPropagation();
+        }}
         onDragOverCapture={handleDragOver}
         onDragLeaveCapture={handleDragLeave}
         onDropCapture={handleDrop}
-        onContextMenu={handleContextMenu}
+        onContextMenuCapture={handleContextMenu}
       >
         <div ref={containerRef} className="absolute top-1.5 bottom-0 left-2.5 right-0 cursor-none" />
 

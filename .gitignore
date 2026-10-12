@@ -33,3 +33,7 @@ src-tauri/miniterm-hook/target/
 
 # Claude local settings
 .claude/settings.local.json
+
+# Browser regression artifacts
+/test-results/
+/playwright-report/

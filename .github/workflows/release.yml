@@ -86,6 +86,18 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Verify Windows right-click regression
+        if: matrix.platform == 'windows-latest'
+        run: |
+          npx playwright install chromium
+          npm run test:terminal -- --project=chromium --grep Windows
+
+      - name: Verify config migration and SSH bridge routing
+        run: |
+          node src-tauri/scripts/prepare-sidecar.mjs debug
+          cargo test --manifest-path src-tauri/Cargo.toml --lib config::tests
+          cargo test --manifest-path src-tauri/Cargo.toml --lib ssh_upload::tests
+
       # macOS 签名：证书固定后每次出包的签名身份一致，系统授权（完全磁盘访问等）
       # 不会因重新打包而失效。自签名证书也可以，只是不能公证。
       # 公证相关变量只在 secret 非空时导出：Tauri 读到空字符串也会尝试公证然后失败。

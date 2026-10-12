@@ -11,6 +11,7 @@ import { ProjectList } from './components/ProjectList';
 import { FileTree } from './components/FileTree';
 import { GitHistory } from './components/GitHistory';
 import { SettingsModal } from './components/SettingsModal';
+import { SshImageBridgeSelect } from './components/SshImageBridgeSelect';
 import { SearchModal } from './components/SearchModal';
 import { ToastContainer } from './components/ToastContainer';
 import { useTauriEvent } from './hooks/useTauriEvent';
@@ -256,6 +257,11 @@ export function App() {
           <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => setConfigOpen(true)}>设置</span>
         </div>
         <div className="flex-1" />
+        {configLoaded && (config.sshImageBridges?.length ?? 0) > 0 && (
+          <div style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+            <SshImageBridgeSelect compact />
+          </div>
+        )}
       </div>
 
       <div className="flex-1 overflow-hidden">

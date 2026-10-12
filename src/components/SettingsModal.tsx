@@ -9,6 +9,8 @@ import { checkForUpdate, compareVersions, type ReleaseInfo } from '../utils/upda
 import { applyTheme } from '../utils/themeManager';
 import { updateAllTerminalThemes, updateAllTerminalFonts, updateAllTerminalWebgl, FONT_PRESET_OPTIONS } from '../utils/terminalCache';
 import type { ShellConfig, SshImageBridgeConfig } from '../types';
+import { SshImageBridgeSelect } from './SshImageBridgeSelect';
+import { updateSshImageBridges } from '../utils/sshImageBridges';
 
 interface Props {
   open: boolean;
@@ -291,10 +293,16 @@ function SshImageBridgeRow({
   bridge,
   onUpdate,
   onDelete,
+  onDuplicate,
+  onSelect,
+  active,
 }: {
   bridge: SshImageBridgeConfig;
   onUpdate: (bridge: SshImageBridgeConfig) => void;
   onDelete: () => void;
+  onDuplicate: () => void;
+  onSelect: () => void;
+  active: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(bridge);
@@ -325,13 +333,15 @@ function SshImageBridgeRow({
     return (
       <div className="flex items-center gap-3 px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] group hover:border-[var(--border-default)] transition-colors">
         <div className="flex-1 min-w-0">
-          <div className="text-base font-medium text-[var(--text-primary)]">{bridge.name}</div>
+          <div className="text-base font-medium text-[var(--text-primary)]">{bridge.name}{active && <span className="ml-2 text-sm text-[var(--accent)]">当前使用</span>}</div>
           <div className="text-sm text-[var(--text-muted)] font-mono truncate">ssh {bridge.sshHost || '(未配置)'}</div>
           <div className="text-sm text-[var(--text-muted)] font-mono truncate">
             共享目录 {bridge.hostSharedDirectory ? `${bridge.hostSharedDirectory} → ${bridge.remoteSharedDirectory}/${bridge.sharedImageSubdirectory}` : '(未配置，回退 ssh 上传)'}
           </div>
         </div>
-        <div className="hidden group-hover:flex items-center gap-1">
+        <div className="flex flex-wrap items-center gap-1">
+          <button className="px-2 py-0.5 text-sm text-[var(--accent)] disabled:opacity-50" onClick={onSelect} disabled={active}>使用</button>
+          <button className="px-2 py-0.5 text-sm text-[var(--text-muted)] hover:text-[var(--text-primary)]" onClick={onDuplicate}>复制配置</button>
           <button className="px-2 py-0.5 text-sm text-[var(--text-muted)] hover:text-[var(--text-primary)]" onClick={() => setEditing(true)}>编辑</button>
           <button className="px-2 py-0.5 text-sm text-[var(--text-muted)] hover:text-[var(--color-error)]" onClick={onDelete}>删除</button>
         </div>
@@ -357,15 +367,17 @@ function SshImageBridgeRow({
   );
 }
 
-function SshImageBridgeSettings() {
+export function SshImageBridgeSettings() {
   const config = useAppStore((s) => s.config);
-  const setConfig = useAppStore((s) => s.setConfig);
   const bridges = config.sshImageBridges ?? [];
 
-  const persist = async (updated: SshImageBridgeConfig[]) => {
-    const newConfig = { ...useAppStore.getState().config, sshImageBridges: updated };
-    setConfig(newConfig);
-    await invoke('save_config', { config: newConfig });
+  const duplicate = (bridge: SshImageBridgeConfig) => {
+    let name = `${bridge.name} 副本`;
+    for (let index = 2; bridges.some((item) => item.name === name); index++) {
+      name = `${bridge.name} 副本 ${index}`;
+    }
+    const copy = { ...bridge, id: newSshImageBridge().id, name };
+    void updateSshImageBridges([...bridges, copy]);
   };
 
   return (
@@ -374,17 +386,22 @@ function SshImageBridgeSettings() {
         <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">SSH 图片桥接</div>
         <p className="text-sm text-[var(--text-muted)] leading-5">匹配的 SSH 终端粘贴单张图片时，先执行就绪探测（不上传），成功则发送图片快捷键，由沙箱的 xclip 桥接直接读取宿主机剪贴板，生成原生 [Image #N]。探测失败时，若配置了共享目录且宿主机目录存在，就把图片写入共享目录并粘贴沙箱内路径；否则回退到 ssh 上传到远端 /tmp。</p>
       </div>
+      <SshImageBridgeSelect />
+      <p className="text-sm text-[var(--text-muted)] leading-5">切换后从下一次图片粘贴生效，也可在主窗口顶部快速切换。选择具体配置时只使用该配置，SSH 目标仍需匹配；自动模式按目标匹配已有配置。</p>
       <div className="space-y-2">
         {bridges.map((bridge) => (
           <SshImageBridgeRow
             key={bridge.id}
             bridge={bridge}
-            onUpdate={(next) => void persist(bridges.map((item) => item.id === next.id ? next : item))}
-            onDelete={() => void persist(bridges.filter((item) => item.id !== bridge.id))}
+            active={config.activeSshImageBridgeId === bridge.id}
+            onSelect={() => void updateSshImageBridges(bridges, bridge.id)}
+            onDuplicate={() => duplicate(bridge)}
+            onUpdate={(next) => void updateSshImageBridges(bridges.map((item) => item.id === next.id ? next : item))}
+            onDelete={() => void updateSshImageBridges(bridges.filter((item) => item.id !== bridge.id))}
           />
         ))}
       </div>
-      <button className="w-full py-2.5 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-base text-[var(--text-muted)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all" onClick={() => void persist([...bridges, newSshImageBridge()])}>+ 添加桥接规则</button>
+      <button className="w-full py-2.5 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-base text-[var(--text-muted)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all" onClick={() => void updateSshImageBridges([...bridges, newSshImageBridge()])}>+ 添加桥接配置</button>
       <div className="text-sm text-[var(--text-muted)] leading-5">“就绪探测命令”会在匹配的远端 SSH 主机执行，必须只在图片桥接可用时返回成功。<code>{'{directory}'}</code> 会替换成上面的远端目录。</div>
     </div>
   );

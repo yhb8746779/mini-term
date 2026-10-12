@@ -33,6 +33,10 @@ export interface AppConfig {
   hookEnabled?: boolean;
   /** SSH 沙箱的原生图片粘贴桥接规则。 */
   sshImageBridges: SshImageBridgeConfig[];
+  /** 当前选用的 SSH 图片桥接配置；未设置时按 SSH 目标自动匹配全部配置。 */
+  activeSshImageBridgeId?: string;
+  /** 后端预设迁移标记，保留用户删除预设的选择。 */
+  sshImageBridgePresetsVersion?: number;
 }
 
 /** Hook server 运行状态（前端通过 get_hook_status 命令查询） */
