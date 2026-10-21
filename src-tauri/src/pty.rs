@@ -209,6 +209,18 @@ const PREDICTION_ECHO_GRACE: Duration = Duration::from_millis(300);
 /// 在此冷却窗口内的 PTY 输出不刷新 last_output，避免误判为 AI 活跃。
 const RESIZE_COOLDOWN: Duration = Duration::from_millis(800);
 
+/// xterm 的 FitAddon 在容器尚未完成布局时会将极窄的可用宽度收敛为 2 列。
+/// 这种临时尺寸不应传入 ConPTY：PowerShell 7 的启动更新通知会按窗口宽度排版，
+/// 宽度过小时可能在 `PadRight` 中计算出负数并直接终止进程。
+///
+/// PTY 以 200 列启动，等前端布局稳定后会收到正常的 resize；忽略这类过渡尺寸
+/// 比把 shell 缩到不可用宽度更安全。该阈值也与前端启动期的最小列数保持一致。
+const MIN_SAFE_PTY_COLS: u16 = 40;
+
+fn is_safe_pty_size(cols: u16, rows: u16) -> bool {
+    cols >= MIN_SAFE_PTY_COLS && rows > 0
+}
+
 /// 去除 ANSI 转义序列，返回纯文本。
 ///
 /// 特殊处理 CSI G（Cursor Horizontal Absolute，光标横向绝对定位）：
@@ -1189,6 +1201,12 @@ pub fn write_pty(state: tauri::State<'_, PtyManager>, pty_id: u32, data: String)
 
 #[tauri::command]
 pub fn resize_pty(state: tauri::State<'_, PtyManager>, pty_id: u32, cols: u16, rows: u16) -> Result<(), String> {
+    // 前端的启动期防抖无法覆盖 xterm 的 onResize 回调，因此在 PTY 边界再次
+    // 校验，确保任何调用方都不能把布局过渡期的 2 列等异常值传给子进程。
+    if !is_safe_pty_size(cols, rows) {
+        return Ok(());
+    }
+
     {
         let instances = state.instances.lock().unwrap();
         let instance = instances.get(&pty_id).ok_or("PTY not found")?;
@@ -1257,6 +1275,14 @@ pub fn kill_pty(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_resize_rejects_transient_narrow_sizes() {
+        assert!(!is_safe_pty_size(2, 24));
+        assert!(!is_safe_pty_size(MIN_SAFE_PTY_COLS - 1, 24));
+        assert!(!is_safe_pty_size(80, 0));
+        assert!(is_safe_pty_size(MIN_SAFE_PTY_COLS, 1));
+    }
 
     // ── output_contains_ai_command ───────────────────────────────────────
 
