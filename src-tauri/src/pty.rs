@@ -2,6 +2,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize, MasterPty, Child}
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::thread;
@@ -219,6 +220,18 @@ const MIN_SAFE_PTY_COLS: u16 = 40;
 
 fn is_safe_pty_size(cols: u16, rows: u16) -> bool {
     cols >= MIN_SAFE_PTY_COLS && rows > 0
+}
+
+/// PowerShell 7.6.6 的简体中文更新提示会计算出负的 PadRight 宽度，随后在启动时
+/// FailFast（PowerShell/PowerShell#28131）。该问题与 PTY 尺寸无关，因此仅对
+/// Mini-Term 启动的 pwsh 禁用更新提示，避免 shell 在出现 prompt 前崩溃。
+///
+/// 只识别 pwsh / pwsh.exe，Windows PowerShell 5.1 不受此上游问题影响。
+fn is_pwsh_command(shell: &str) -> bool {
+    Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("pwsh") || name.eq_ignore_ascii_case("pwsh.exe"))
 }
 
 /// 去除 ANSI 转义序列，返回纯文本。
@@ -948,6 +961,9 @@ pub fn create_pty(
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    if is_pwsh_command(&shell) {
+        cmd.env("POWERSHELL_UPDATECHECK", "Off");
+    }
 
     // ── UTF-8 locale 注入 ──────────────────────────────────────────────────
     // GUI 应用启动时环境里可能没有完整 LANG/LC_CTYPE，导致子进程回退到 C/ASCII。
@@ -1282,6 +1298,16 @@ mod tests {
         assert!(!is_safe_pty_size(MIN_SAFE_PTY_COLS - 1, 24));
         assert!(!is_safe_pty_size(80, 0));
         assert!(is_safe_pty_size(MIN_SAFE_PTY_COLS, 1));
+    }
+
+    #[test]
+    fn pwsh_update_check_workaround_only_targets_pwsh() {
+        assert!(is_pwsh_command("pwsh"));
+        assert!(is_pwsh_command("pwsh.exe"));
+        assert!(is_pwsh_command(r"C:\Program Files\PowerShell\7\pwsh.exe"));
+        assert!(!is_pwsh_command("powershell"));
+        assert!(!is_pwsh_command("cmd.exe"));
+        assert!(!is_pwsh_command("/bin/bash"));
     }
 
     // ── output_contains_ai_command ───────────────────────────────────────
