@@ -1265,9 +1265,9 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
   //
   // Code Sandbox 是例外：它提供 xclip bridge，可让 Claude Code 的图片快捷键产生
   // 原生图片块。bridge 不存在时回退到上面的路径文本。
-  // 只恢复本机 Codex 的图片附件入口。Claude/Gemini 的本机路径策略，以及
-  // SSH 沙箱的 PNG 规范化、xclip bridge 和路径回退保持原有流程。
-  const usesImagePathPaste = transport !== 'local' || (_isMacOS && isAiPane && provider !== 'codex');
+  // 本机 Claude/Codex 直接读取宿主机剪贴板，使用原生图片附件入口。
+  // Gemini 保留路径策略；SSH 沙箱保留 PNG 规范化、xclip bridge 和远端路径回退。
+  const usesImagePathPaste = transport !== 'local' || (_isMacOS && isAiPane && provider !== 'codex' && provider !== 'claude');
 
   // 诊断：AI pane 身份判定（文档 §5.2）
   if (TERM_DEBUG) {

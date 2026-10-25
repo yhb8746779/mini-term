@@ -94,10 +94,11 @@ test('WeChat image hidden by WebKit is detected through the native clipboard fal
   expect(await commands(page)).toContain('plugin:clipboard-manager|read_image');
 });
 
-test('local Claude keeps its existing image-path strategy', async ({ page }) => {
+test('local Claude pastes screenshot as a native image shortcut', async ({ page }) => {
   await boot(page);
   await paste(page, 'claude');
-  await expect.poll(() => writes(page)).toEqual(['\x1b[200~请读取图片 @/cache/image.png\x1b[201~']);
+  await expect.poll(() => writes(page)).toEqual(['\x16']);
+  expect(await commands(page)).not.toContain('save_clipboard_rgba_image_for_path_paste');
 });
 
 for (const kind of ['image', 'file']) {
@@ -338,4 +339,24 @@ test.describe('Windows regression', () => {
     await expect.poll(async () => (await writes(page)).join('')).toMatch(/\x1b\[<16;\d+;\d+M/);
     expect(await page.evaluate(() => (window as any).native.copies)).toEqual([]);
   });
+});
+
+for (const kind of ['file', 'wechat']) {
+  test(`local Claude ${kind} uses native image paste without a path prompt`, async ({ page }) => {
+    await boot(page, { kind, paths: kind === 'file' ? ['/pictures/test.png'] : [] });
+    await paste(page, 'claude');
+    await expect.poll(() => writes(page)).toEqual(['\x16']);
+    const calls = await commands(page);
+    expect(calls).not.toContain('save_clipboard_rgba_image_for_path_paste');
+    expect(calls).not.toContain('probe_ssh_clipboard_bridge');
+    if (kind === 'file') {
+      expect(calls.indexOf('load_image_to_clipboard')).toBeLessThan(calls.indexOf('write_pty'));
+    }
+  });
+}
+
+test('local Gemini retains its image-path strategy', async ({ page }) => {
+  await boot(page);
+  await paste(page, 'gemini');
+  await expect.poll(() => writes(page)).toEqual(['\x1b[200~请读取图片 @/cache/image.png\x1b[201~']);
 });

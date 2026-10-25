@@ -86,20 +86,20 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Verify Windows right-click regression
-        if: matrix.platform == 'windows-latest'
+      # 发布必须沿用已安装正式版的签名证书和 bundle identifier，避免更新改变 TCC 身份。
+      - name: Require stable macOS release identity
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          ENABLE_APPLE_SIGNING: ${{ vars.ENABLE_APPLE_SIGNING }}
         run: |
-          npx playwright install chromium
-          npm run test:terminal -- --project=chromium --grep Windows
+          if [ "$ENABLE_APPLE_SIGNING" != "true" ]; then
+            echo "::error::macOS release requires the existing signing certificate"
+            exit 1
+          fi
+          node -e 'const c = require("./src-tauri/tauri.conf.json"); if (c.identifier !== "com.tauri-app.tauri-app" || c.productName !== "Mini-Term") process.exit(1)'
 
-      - name: Verify config migration and SSH bridge routing
-        run: |
-          node src-tauri/scripts/prepare-sidecar.mjs debug
-          cargo test --manifest-path src-tauri/Cargo.toml --lib config::tests
-          cargo test --manifest-path src-tauri/Cargo.toml --lib ssh_upload::tests
-
-      # macOS 签名：证书固定后每次出包的签名身份一致，系统授权（完全磁盘访问等）
-      # 不会因重新打包而失效。自签名证书也可以，只是不能公证。
+      # 自签名证书也可以保持签名身份，只是不能公证。
       # 公证相关变量只在 secret 非空时导出：Tauri 读到空字符串也会尝试公证然后失败。
       - name: Enable Apple signing
         if: matrix.platform == 'macos-latest' && vars.ENABLE_APPLE_SIGNING == 'true'
@@ -128,6 +128,15 @@ jobs:
           echo "$APPLE_CERTIFICATE" | base64 --decode > "$work/cert.p12"
           /usr/bin/openssl pkcs12 -in "$work/cert.p12" -nokeys -clcerts \
             -passin env:APPLE_CERTIFICATE_PASSWORD -out "$work/cert.pem"
+          # Pin the certificate used by the installed v0.2.53 release. A matching name
+          # alone is insufficient: regenerating a self-signed certificate changes TCC identity.
+          expected_sha1="2F6CF121F28D50681C47A64A23012E1DB7EC0327"
+          actual_sha1="$(/usr/bin/openssl x509 -in "$work/cert.pem" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':' | tr '[:lower:]' '[:upper:]')"
+          if [ "$actual_sha1" != "$expected_sha1" ]; then
+            echo "::error::Signing certificate differs from the existing macOS release; refusing to change app identity"
+            exit 1
+          fi
+          echo "Existing release certificate fingerprint verified: $actual_sha1"
           # 只给自签名证书（issuer == subject）加信任；Apple 签发的证书本来就受信任。
           cert_subject="$(/usr/bin/openssl x509 -in "$work/cert.pem" -noout -subject | sed 's/^subject= *//')"
           cert_issuer="$(/usr/bin/openssl x509 -in "$work/cert.pem" -noout -issuer | sed 's/^issuer= *//')"
@@ -177,6 +186,24 @@ jobs:
           else
             echo "Notarization: skipped (signing only)"
           fi
+
+      - name: Verify macOS local and sandbox image paste
+        if: matrix.platform == 'macos-latest'
+        run: |
+          npx playwright install chromium webkit
+          npm run test:terminal
+
+      - name: Verify Windows right-click regression
+        if: matrix.platform == 'windows-latest'
+        run: |
+          npx playwright install chromium
+          npm run test:terminal -- --project=chromium --grep Windows
+
+      - name: Verify config migration and SSH bridge routing
+        run: |
+          node src-tauri/scripts/prepare-sidecar.mjs debug
+          cargo test --manifest-path src-tauri/Cargo.toml --lib config::tests
+          cargo test --manifest-path src-tauri/Cargo.toml --lib ssh_upload::tests
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
