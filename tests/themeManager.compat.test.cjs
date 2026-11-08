@@ -36,7 +36,7 @@ global.window = {
   },
 };
 
-const { applyTheme, getResolvedTheme } = require('../.tmp-tests/themeManager.js');
+const { applyTheme, getResolvedTheme } = require('../.tmp-tests/utils/themeManager.js');
 
 assert.doesNotThrow(() => applyTheme('auto'));
 assert.equal(getResolvedTheme(), 'dark');

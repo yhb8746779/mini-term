@@ -1,9 +1,13 @@
-import { useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import { Allotment } from 'allotment';
 import { PaneGroup } from './PaneGroup';
 import type { SplitNode } from '../types';
 
+import type { MoveTarget } from '../utils/splitTree';
+
 interface Props {
+  tabId: string;
+  onMovePane: (paneId: string, target: MoveTarget) => void;
   node: SplitNode;
   projectPath: string;
   onSplit?: (paneId: string, direction: 'horizontal' | 'vertical') => void;
@@ -19,14 +23,17 @@ function getNodeKey(node: SplitNode): string {
   return node.children.map(getNodeKey).join('-');
 }
 
-export function SplitLayout({ node, projectPath, onSplit, onCloseLeaf, onUpdateNode, onLayoutChange }: Props) {
+export function SplitLayout({ node, tabId, onMovePane, projectPath, onSplit, onCloseLeaf, onUpdateNode, onLayoutChange }: Props) {
   const rafRef = useRef<number>(0);
   const nodeRef = useRef(node);
   nodeRef.current = node;
+  useEffect(() => () => cancelAnimationFrame(rafRef.current), []);
 
   if (node.type === 'leaf') {
     return (
       <PaneGroup
+        tabId={tabId}
+        onMovePane={onMovePane}
         node={node}
         projectPath={projectPath}
         onSplit={onSplit ?? (() => {})}
@@ -91,6 +98,8 @@ export function SplitLayout({ node, projectPath, onSplit, onCloseLeaf, onUpdateN
       {node.children.map((child, index) => (
         <Allotment.Pane key={getNodeKey(child)}>
           <SplitLayout
+            tabId={tabId}
+            onMovePane={onMovePane}
             node={child}
             projectPath={projectPath}
             onSplit={onSplit}

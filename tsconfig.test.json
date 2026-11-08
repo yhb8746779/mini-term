@@ -11,6 +11,7 @@
   },
   "include": [
     "src/utils/themeManager.ts",
-    "src/utils/ptyWriteQueue.ts"
+    "src/utils/ptyWriteQueue.ts",
+    "src/utils/splitTree.ts"
   ]
 }

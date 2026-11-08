@@ -4,6 +4,7 @@ import { useAppStore } from '../store';
 import { getOrCreateTerminal, getCachedTerminal, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTextToClipboard, pasteToTerminal, getAnySelectedText, _isWindows, _isMacOS } from '../utils/terminalCache';
 import { getResolvedTheme } from '../utils/themeManager';
 import { showContextMenu } from '../utils/contextMenu';
+import { getDragPayload } from '../utils/dragState';
 import '@xterm/xterm/css/xterm.css';
 
 interface Props {
@@ -101,17 +102,20 @@ export function TerminalInstance({ ptyId }: Props) {
   }, [ptyId]);
 
   const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    if (getDragPayload()?.type === 'pane') return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'copy';
     setFileDrag(true);
   };
   const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+    if (getDragPayload()?.type === 'pane') return;
     const nextTarget = e.relatedTarget as Node | null;
     if (!nextTarget || !e.currentTarget.contains(nextTarget)) {
       setFileDrag(false);
     }
   };
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    if (getDragPayload()?.type === 'pane') return;
     e.preventDefault();
     setFileDrag(false);
     const filePath = e.dataTransfer.getData('text/plain').trim();

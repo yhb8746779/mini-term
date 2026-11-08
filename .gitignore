@@ -29,7 +29,7 @@ src-tauri/miniterm-hook/target/
 
 # Brainstorm / temp files
 .superpowers
-.tmp-tests/*.js
+.tmp-tests/**/*.js
 
 # Claude local settings
 .claude/settings.local.json

@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 
-const { createPtyWriteQueue } = require('../.tmp-tests/ptyWriteQueue.js');
+const { createPtyWriteQueue } = require('../.tmp-tests/utils/ptyWriteQueue.js');
 
 function nextTick() {
   return new Promise((resolve) => setImmediate(resolve));

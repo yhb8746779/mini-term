@@ -5,15 +5,19 @@ import { showContextMenu } from '../utils/contextMenu';
 import { createPtySafe } from '../utils/createPty';
 import type { TerminalTab, PaneState, SplitNode, ShellConfig } from '../types';
 
+import { movePane } from '../utils/splitTree';
+import type { MoveTarget } from '../utils/splitTree';
+import { getDragPayload } from '../utils/dragState';
+
 interface Props {
   projectId: string;
   projectPath: string;
 }
 
-// 收集 SplitNode 树中所有 pane ID
-function collectPaneIds(node: SplitNode): string[] {
-  if (node.type === 'leaf') return node.panes.map((p) => p.id);
-  return node.children.flatMap(collectPaneIds);
+// Include grouping and order so a pending resize cannot undo a pane move.
+function layoutStructure(node: SplitNode): string {
+  if (node.type === 'leaf') return JSON.stringify([node.activePaneId, node.panes.map(p => p.id)]);
+  return JSON.stringify([node.direction, node.children.map(layoutStructure)]);
 }
 
 function insertSplit(
@@ -150,9 +154,9 @@ export function TerminalArea({ projectId, projectPath }: Props) {
     const currentActiveTab = currentPs?.tabs.find((t) => t.id === currentPs.activeTabId);
     if (!currentActiveTab) return;
 
-    // Validate layout structure: if pane ID sets differ, discard stale RAF callback
-    const currentIds = collectPaneIds(currentActiveTab.splitLayout).sort().join(',');
-    const updatedIds = collectPaneIds(updatedNode).sort().join(',');
+    // Discard resize callbacks captured before structural changes.
+    const currentIds = layoutStructure(currentActiveTab.splitLayout);
+    const updatedIds = layoutStructure(updatedNode);
     if (currentIds !== updatedIds) return;
 
     updateTabLayout(projectId, currentActiveTab.id, updatedNode);
@@ -170,6 +174,19 @@ export function TerminalArea({ projectId, projectPath }: Props) {
     saveLayoutToConfig(projectId);
   }, [projectId, updateTabLayout]);
 
+  const handleMovePane = useCallback((paneId: string, target: MoveTarget) => {
+    const state = useAppStore.getState();
+    const currentPs = state.projectStates.get(projectId);
+    const currentTab = currentPs?.tabs.find(t => t.id === currentPs.activeTabId);
+    const payload = getDragPayload();
+    if (state.activeProjectId !== projectId || !currentTab || payload?.type !== 'pane'
+      || payload.sourceTabId !== currentTab.id || payload.paneId !== paneId) return;
+    const layout = movePane(currentTab.splitLayout, paneId, target);
+    if (layout === currentTab.splitLayout) return;
+    updateTabLayout(projectId, currentTab.id, layout);
+    saveLayoutToConfig(projectId);
+  }, [projectId, updateTabLayout]);
+
   return (
     <div className="flex flex-col h-full bg-[var(--bg-terminal)]">
       <div className="flex-1 overflow-hidden relative">
@@ -180,6 +197,8 @@ export function TerminalArea({ projectId, projectPath }: Props) {
             style={{ display: tab.id === ps.activeTabId ? 'block' : 'none' }}
           >
             <SplitLayout
+              tabId={tab.id}
+              onMovePane={handleMovePane}
               node={tab.splitLayout}
               projectPath={projectPath}
               onSplit={handleSplitPane}

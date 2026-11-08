@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore, genId } from '../store';
 import { TerminalInstance } from './TerminalInstance';
@@ -9,7 +9,12 @@ import { disposeTerminal } from '../utils/terminalCache';
 import { createPtySafe } from '../utils/createPty';
 import type { SplitNode, PaneState, ShellConfig } from '../types';
 
+import { getDragPayload, setDragPayload } from '../utils/dragState';
+import type { MoveTarget, Edge } from '../utils/splitTree';
+
 interface Props {
+  tabId: string;
+  onMovePane: (paneId: string, target: MoveTarget) => void;
   node: SplitNode & { type: 'leaf' };
   projectPath: string;
   onSplit: (paneId: string, direction: 'horizontal' | 'vertical') => void;
@@ -17,9 +22,58 @@ interface Props {
   onUpdateNode: (updated: SplitNode) => void;
 }
 
-export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNode }: Props) {
+export function PaneGroup({ node, tabId, onMovePane, projectPath, onSplit, onClosePane, onUpdateNode }: Props) {
   const config = useAppStore((s) => s.config);
   const [headerHover, setHeaderHover] = useState(false);
+
+  const [draggedPane, setDraggedPane] = useState<string | null>(null);
+  const [insertion, setInsertion] = useState<{ index: number; x: number } | null>(null);
+  const [dropZone, setDropZone] = useState<Edge | 'center' | null>(null);
+  const clearIndicators = () => {
+    setInsertion(null);
+    setDropZone(null);
+    setDraggedPane(null);
+  };
+  useEffect(() => {
+    // The source may unmount after a successful move; clear every group's feedback.
+    const end = () => { setDragPayload(null); clearIndicators(); };
+    window.addEventListener('dragend', end);
+    window.addEventListener('drop', end);
+    return () => {
+      window.removeEventListener('dragend', end);
+      window.removeEventListener('drop', end);
+    };
+  }, []);
+  const panePayload = () => {
+    const payload = getDragPayload();
+    return payload?.type === 'pane' && payload.sourceTabId === tabId ? payload : null;
+  };
+  const getInsertion = (e: React.DragEvent<HTMLDivElement>) => {
+    const bar = e.currentTarget;
+    const tabs = Array.from(bar.querySelectorAll<HTMLElement>('[data-pane-tab]'));
+    const index = tabs.findIndex(tab => e.clientX < tab.getBoundingClientRect().left + tab.offsetWidth / 2);
+    const at = index < 0 ? tabs.length : index;
+    const rect = bar.getBoundingClientRect();
+    const x = at < tabs.length ? tabs[at].getBoundingClientRect().left
+      : tabs[tabs.length - 1]?.getBoundingClientRect().right ?? rect.left;
+    return { index: at, x: x - rect.left + bar.scrollLeft };
+  };
+  const getDropZone = (e: React.DragEvent<HTMLDivElement>): Edge | 'center' => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width;
+    const y = (e.clientY - rect.top) / rect.height;
+    const nearest = Math.min(x, 1 - x, y, 1 - y);
+    if (nearest >= 0.25) return 'center';
+    if (nearest === x) return 'left';
+    if (nearest === 1 - x) return 'right';
+    return nearest === y ? 'top' : 'bottom';
+  };
+  const leave = (e: React.DragEvent<HTMLDivElement>) => {
+    if (!e.relatedTarget || !e.currentTarget.contains(e.relatedTarget as Node)) {
+      setInsertion(null);
+      setDropZone(null);
+    }
+  };
 
   const activePane = node.panes.find((p) => p.id === node.activePaneId) ?? node.panes[0];
 
@@ -144,8 +198,27 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
     <div className="w-full h-full flex flex-col">
       {/* Tab bar */}
       <div
-        className="flex bg-[var(--bg-elevated)] border-b border-[var(--border-subtle)] text-[11px] overflow-x-auto select-none shrink-0"
+        className="relative flex bg-[var(--bg-elevated)] border-b border-[var(--border-subtle)] text-[11px] overflow-x-auto select-none shrink-0"
         style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+        onDragOver={(e) => {
+          if (!panePayload()) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'move';
+          setDropZone(null);
+          setInsertion(getInsertion(e));
+        }}
+        onDragLeave={leave}
+        onDrop={(e) => {
+          const payload = panePayload();
+          if (!payload) return;
+          e.preventDefault();
+          const { index } = getInsertion(e);
+          onMovePane(payload.paneId, {
+            kind: node.panes.some(p => p.id === payload.paneId) ? 'reorder' : 'into',
+            leafKey: node.panes[0].id, index,
+          });
+          clearIndicators();
+        }}
         onMouseEnter={() => setHeaderHover(true)}
         onMouseLeave={() => setHeaderHover(false)}
       >
@@ -154,6 +227,16 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
           return (
             <div
               key={pane.id}
+              data-pane-tab={pane.id}
+              draggable
+              style={{ opacity: draggedPane === pane.id ? 0.4 : 1 }}
+              onDragStart={(e) => {
+                setDragPayload({ type: 'pane', paneId: pane.id, sourceTabId: tabId });
+                e.dataTransfer.effectAllowed = 'move';
+                e.dataTransfer.setData('application/x-mini-term-pane', pane.id);
+                setDraggedPane(pane.id);
+              }}
+              onDragEnd={() => { setDragPayload(null); clearIndicators(); }}
               className={`flex items-center gap-1.5 px-3 py-[3px] cursor-pointer whitespace-nowrap transition-all duration-100 relative ${
                 isActive
                   ? 'bg-[var(--bg-terminal)] text-[var(--text-primary)]'
@@ -186,6 +269,10 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
           );
         })}
 
+        {insertion && (
+          <div className="absolute top-0 bottom-0 w-[2px] bg-[var(--accent)] pointer-events-none z-20"
+            style={{ left: insertion.x }} />
+        )}
         {/* "+" button */}
         <div
           className="px-2 py-[3px] text-[var(--text-muted)] cursor-pointer hover:text-[var(--accent)] transition-colors text-[12px]"
@@ -228,7 +315,26 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
       </div>
 
       {/* Active terminal */}
-      <div className="flex-1 overflow-hidden relative">
+      <div className="flex-1 overflow-hidden relative"
+        onDragOver={(e) => {
+          if (!panePayload()) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'move';
+          setInsertion(null);
+          setDropZone(getDropZone(e));
+        }}
+        onDragLeave={leave}
+        onDrop={(e) => {
+          const payload = panePayload();
+          if (!payload) return;
+          e.preventDefault();
+          const zone = getDropZone(e);
+          onMovePane(payload.paneId, zone === 'center'
+            ? { kind: 'into', leafKey: node.panes[0].id }
+            : { kind: 'edge', leafKey: node.panes[0].id, edge: zone });
+          clearIndicators();
+        }}
+      >
         {node.panes.map((pane) => (
           <div
             key={pane.ptyId}
@@ -240,6 +346,20 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
             />
           </div>
         ))}
+        {dropZone && (
+          <div className="absolute z-20 pointer-events-none flex items-center justify-center"
+            style={{
+              background: 'var(--accent-subtle)', border: '2px solid var(--accent)',
+              left: dropZone === 'right' ? '50%' : dropZone === 'center' ? '25%' : 0,
+              right: dropZone === 'left' ? '50%' : dropZone === 'center' ? '25%' : 0,
+              top: dropZone === 'bottom' ? '50%' : dropZone === 'center' ? '25%' : 0,
+              bottom: dropZone === 'top' ? '50%' : dropZone === 'center' ? '25%' : 0,
+            }}>
+            <span className="text-xs text-[var(--accent)]">
+              {dropZone === 'center' ? '移入此组' : '释放以分屏'}
+            </span>
+          </div>
+        )}
       </div>
     </div>
   );
