@@ -29,6 +29,7 @@ export interface AppConfig {
   vscodePath?: string;
   terminalFontPreset?: string;
   terminalCustomFontFamily?: string;
+  codexPermissionMode: CodexPermissionMode;
   /** Hook server 开关：开启后启动时绑定 127.0.0.1:23456 接收 Claude/Codex/Gemini hook 事件。默认 undefined（关闭）。 */
   hookEnabled?: boolean;
   /** SSH 沙箱的原生图片粘贴桥接规则。 */
@@ -43,6 +44,15 @@ export interface AppConfig {
 export interface HookStatusInfo {
   port: number;
   running: boolean;
+}
+
+export interface HookSetupStatus {
+  hookBinaryReady: boolean;
+  serverRunning: boolean;
+  claudeRegistered: boolean;
+  codexRegistered: boolean;
+  codexFeatureEnabled: boolean;
+  geminiRegistered: boolean;
 }
 
 /** Hook 配置片段（前端通过 get_hook_config_snippet 查询，展示在设置页供用户手动粘贴） */
@@ -87,6 +97,8 @@ export interface SshImageBridgeConfig {
   /** 共享目录下存放图片的子目录，例如 `temp`。 */
   sharedImageSubdirectory: string;
 }
+
+export type CodexPermissionMode = 'inherit' | 'approve-for-me' | 'full-access';
 
 // === 布局持久化 ===
 

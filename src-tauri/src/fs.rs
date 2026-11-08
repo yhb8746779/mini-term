@@ -28,6 +28,12 @@ fn build_gitignore(project_root: &Path) -> Option<Gitignore> {
 
 pub const ALWAYS_IGNORE: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "__pycache__", ".superpowers"];
 
+/// macOS 在 exFAT/FAT/网络卷上为每个文件生成的 AppleDouble 元数据（`._xxx`），
+/// 内容是二进制，与真实文件同名易误点，文件树和搜索中一律隐藏。
+pub fn is_apple_double(name: &str, is_dir: bool) -> bool {
+    !is_dir && name.starts_with("._")
+}
+
 /// 同一路径的文件变更事件，150ms 内只向前端 emit 一次，防止驱动器根目录等高频场景卡死
 const FS_EVENT_DEBOUNCE: Duration = Duration::from_millis(150);
 
@@ -60,6 +66,9 @@ pub fn list_directory(app: AppHandle, project_root: String, path: String) -> Res
             let full_path = entry.path();
             // ALWAYS_IGNORE 目录仍然完全隐藏
             if is_dir && ALWAYS_IGNORE.contains(&name.as_str()) {
+                return None;
+            }
+            if is_apple_double(&name, is_dir) {
                 return None;
             }
             let ignored = if let Some(gi) = &gitignore {

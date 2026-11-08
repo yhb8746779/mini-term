@@ -109,6 +109,7 @@ pub fn run() {
             hook_registry::unregister_ai_hooks,
             hook_registry::get_hook_config_snippet,
             hook_registry::get_hook_status,
+            hook_registry::get_hook_setup_status,
             hook_server::toggle_hook_server,
             hook_server::report_remote_ai_status,
         ])

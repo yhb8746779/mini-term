@@ -18,7 +18,7 @@ import { useTauriEvent } from './hooks/useTauriEvent';
 import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
 import { markAiPty } from './utils/terminalCache';
-import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, AiProvider } from './types';
+import type { AppConfig, HookSetupStatus, PtyStatusChangePayload, PtyExitPayload, PaneStatus, AiProvider } from './types';
 
 // ─── Debug experiment switches ─────────────────────────────────
 // 将其中一个改为 true 做 A/B 对比，找到主卡点后恢复 false
@@ -29,9 +29,13 @@ const DEBUG_ONLY_RENDER_ACTIVE_TERMINAL = false;
 export function App() {
   const [configLoaded, setConfigLoaded] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
+  const [configInitialPage, setConfigInitialPage] = useState<'terminal' | 'system' | 'hook' | 'shortcuts' | 'diagnostics' | 'about'>('terminal');
   const [currentVersion, setCurrentVersion] = useState('');
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
   const [accessReadyProjectId, setAccessReadyProjectId] = useState<string | null>(null);
+  const [hookSetupStatus, setHookSetupStatus] = useState<HookSetupStatus | null>(null);
+  const [hookFixBusy, setHookFixBusy] = useState(false);
+  const [hookNoticeDismissed, setHookNoticeDismissed] = useState(false);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
@@ -69,6 +73,15 @@ export function App() {
       applyTheme(cfg.theme ?? 'auto');
       setConfigLoaded(true);
     });
+  }, []);
+
+  const refreshHookSetupStatus = useCallback(async () => {
+    try {
+      const status = await invoke<HookSetupStatus>('get_hook_setup_status');
+      setHookSetupStatus(status);
+    } catch {
+      setHookSetupStatus(null);
+    }
   }, []);
 
   useEffect(() => {
@@ -144,6 +157,56 @@ export function App() {
       }).catch(() => {});
     });
   }, []);
+
+  useEffect(() => {
+    if (!configLoaded) return;
+    void refreshHookSetupStatus();
+  }, [configLoaded, refreshHookSetupStatus]);
+
+  const openHookSettings = useCallback(() => {
+    setConfigInitialPage('hook');
+    setConfigOpen(true);
+  }, []);
+
+  const handleRepairHooks = useCallback(async () => {
+    setHookFixBusy(true);
+    try {
+      if (!(config.hookEnabled ?? false)) {
+        await invoke('toggle_hook_server', { enabled: true });
+        const newConfig = { ...useAppStore.getState().config, hookEnabled: true };
+        setConfig(newConfig);
+        await invoke('save_config', { config: newConfig });
+      }
+      await invoke('register_ai_hooks');
+      await refreshHookSetupStatus();
+      setHookNoticeDismissed(false);
+    } catch (err) {
+      console.error('repair hooks failed:', err);
+      openHookSettings();
+    } finally {
+      setHookFixBusy(false);
+    }
+  }, [config.hookEnabled, openHookSettings, refreshHookSetupStatus, setConfig]);
+
+  const hookMonitoringReady = (config.hookEnabled ?? false)
+    && !!hookSetupStatus?.hookBinaryReady
+    && !!hookSetupStatus?.serverRunning
+    && !!hookSetupStatus?.claudeRegistered
+    && !!hookSetupStatus?.codexRegistered
+    && !!hookSetupStatus?.codexFeatureEnabled;
+  const showHookBanner = configLoaded
+    && !hookNoticeDismissed
+    && !hookMonitoringReady;
+
+  const hookBannerMessage = !hookSetupStatus?.hookBinaryReady
+    ? 'AI Hook helper 未就绪，Claude / Codex 状态会退回到启发式监控。'
+    : !(config.hookEnabled ?? false) || !hookSetupStatus?.serverRunning
+    ? 'AI Hook server 未启动，Claude / Codex 状态会退回到启发式监控。'
+    : !hookSetupStatus?.claudeRegistered
+    ? 'Claude Code 尚未注册到 Mini-Term Hook，当前状态监控不够准。'
+    : !hookSetupStatus?.codexRegistered || !hookSetupStatus?.codexFeatureEnabled
+    ? 'Codex Hook 尚未完全接通，当前状态监控不够准。'
+    : 'AI Hook 未完全接通，当前状态监控不够准。';
 
   useTauriEvent<PtyStatusChangePayload>('pty-status-change', useCallback((payload) => {
     console.log('[fe-status]', payload.ptyId, payload.status, payload.provider ?? '(no provider)');
@@ -254,7 +317,10 @@ export function App() {
         )}
         <div className="w-px h-3.5 bg-[var(--border-default)]" />
         <div className="flex items-center gap-3 text-[var(--text-muted)]" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
-          <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => setConfigOpen(true)}>设置</span>
+          <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => {
+            setConfigInitialPage('terminal');
+            setConfigOpen(true);
+          }}>设置</span>
         </div>
         <div className="flex-1" />
         {configLoaded && (config.sshImageBridges?.length ?? 0) > 0 && (
@@ -263,6 +329,40 @@ export function App() {
           </div>
         )}
       </div>
+
+      {showHookBanner && (
+        <div className="hook-banner">
+          <div className="hook-banner__text">
+            <div className="hook-banner__title">AI 状态监控未接通 Hook</div>
+            <div className="hook-banner__desc">{hookBannerMessage}</div>
+          </div>
+          <div className="hook-banner__actions">
+            <button
+              type="button"
+              className="hook-banner__primary"
+              onClick={() => void handleRepairHooks()}
+              disabled={hookFixBusy}
+            >
+              {hookFixBusy ? '修复中…' : '一键修复'}
+            </button>
+            <button
+              type="button"
+              className="hook-banner__secondary"
+              onClick={openHookSettings}
+            >
+              打开 Hook 设置
+            </button>
+            <button
+              type="button"
+              className="hook-banner__close"
+              onClick={() => setHookNoticeDismissed(true)}
+              title="稍后再说"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="flex-1 overflow-hidden">
         {configLoaded ? <Allotment
@@ -330,7 +430,7 @@ export function App() {
           </Allotment.Pane>
         </Allotment> : null}
       </div>
-      <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} />
+      <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} initialPage={configInitialPage} />
       <SearchModal open={searchModalOpen} onClose={() => setSearchModalOpen(false)} />
       <ToastContainer />
     </div>

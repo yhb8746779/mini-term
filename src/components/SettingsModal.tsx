@@ -8,13 +8,14 @@ import { useAppStore } from '../store';
 import { checkForUpdate, compareVersions, type ReleaseInfo } from '../utils/updateChecker';
 import { applyTheme } from '../utils/themeManager';
 import { updateAllTerminalThemes, updateAllTerminalFonts, updateAllTerminalWebgl, FONT_PRESET_OPTIONS } from '../utils/terminalCache';
-import type { ShellConfig, SshImageBridgeConfig } from '../types';
+import type { CodexPermissionMode, ShellConfig, SshImageBridgeConfig } from '../types';
 import { SshImageBridgeSelect } from './SshImageBridgeSelect';
 import { updateSshImageBridges } from '../utils/sshImageBridges';
 
 interface Props {
   open: boolean;
   onClose: () => void;
+  initialPage?: SettingsPage;
 }
 
 type SettingsPage = 'terminal' | 'ssh-bridge' | 'system' | 'hook' | 'shortcuts' | 'diagnostics' | 'about';
@@ -564,6 +565,12 @@ function SystemSettings() {
     invoke('save_config', { config: newConfig });
   }, [setConfig]);
 
+  const handleCodexPermissionModeChange = useCallback((mode: CodexPermissionMode) => {
+    const newConfig = { ...useAppStore.getState().config, codexPermissionMode: mode };
+    setConfig(newConfig);
+    invoke('save_config', { config: newConfig });
+  }, [setConfig]);
+
   const handleTerminalFontPresetChange = useCallback((preset: string) => {
     const cur = useAppStore.getState().config;
     const newConfig = { ...cur, terminalFontPreset: preset };
@@ -723,6 +730,25 @@ function SystemSettings() {
             }`}
           />
         </button>
+      </div>
+
+      <div className="px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] mb-6 space-y-2">
+        <div className="text-base text-[var(--text-primary)]">Mini-Term 内 Codex 启动模式</div>
+        <div className="text-sm text-[var(--text-muted)] leading-relaxed">
+          只影响你在 Mini-Term 终端里输入的 <span className="font-mono">codex</span> 命令，不改系统 Terminal。用于减少会话里反复的文件/命令审批。
+        </div>
+        <select
+          className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1.5 text-base outline-none focus:border-[var(--accent)]"
+          value={config.codexPermissionMode ?? 'inherit'}
+          onChange={(e) => handleCodexPermissionModeChange(e.target.value as CodexPermissionMode)}
+        >
+          <option value="inherit">沿用 Codex 默认审批</option>
+          <option value="approve-for-me">自动审批（approve-for-me）</option>
+          <option value="full-access">一次性全放开（never + danger-full-access）</option>
+        </select>
+        <div className="text-xs text-[var(--text-muted)] leading-relaxed">
+          切换后对新开的终端生效。已打开的 Codex 会话不会被强制修改。
+        </div>
       </div>
 
       {/* 外部编辑器 */}
@@ -1388,12 +1414,12 @@ const MENU_ITEMS: { key: SettingsPage; label: string }[] = [
   { key: 'about', label: '关于' },
 ];
 
-export function SettingsModal({ open, onClose }: Props) {
+export function SettingsModal({ open, onClose, initialPage = 'terminal' }: Props) {
   const [activePage, setActivePage] = useState<SettingsPage>('terminal');
 
   useEffect(() => {
-    if (open) setActivePage('terminal');
-  }, [open]);
+    if (open) setActivePage(initialPage);
+  }, [open, initialPage]);
 
   if (!open) return null;
 

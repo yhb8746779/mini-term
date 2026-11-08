@@ -1,8 +1,9 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize, MasterPty, Child};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::thread;
@@ -927,6 +928,160 @@ fn find_valid_utf8_prefix_len(bytes: &[u8]) -> usize {
     i
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexPermissionMode {
+    Inherit,
+    ApproveForMe,
+    FullAccess,
+}
+
+impl CodexPermissionMode {
+    fn from_config_value(value: &str) -> Self {
+        match value {
+            "approve-for-me" => Self::ApproveForMe,
+            "full-access" => Self::FullAccess,
+            _ => Self::Inherit,
+        }
+    }
+}
+
+fn configure_codex_wrapper(app: &AppHandle, cmd: &mut CommandBuilder) {
+    let mode = CodexPermissionMode::from_config_value(&crate::config::read_config(app).codex_permission_mode);
+    if mode == CodexPermissionMode::Inherit {
+        return;
+    }
+
+    let current_path = std::env::var_os("PATH").unwrap_or_default();
+    let Some(real_codex) = resolve_command_in_path("codex", &current_path) else {
+        return;
+    };
+    let Ok(wrapper_dir) = ensure_codex_wrapper(app, mode, &real_codex) else {
+        return;
+    };
+    let Ok(path_var) = prepend_path(&wrapper_dir, &current_path) else {
+        return;
+    };
+    cmd.env("PATH", path_var.to_string_lossy().to_string());
+}
+
+fn prepend_path(dir: &Path, existing_path: &std::ffi::OsStr) -> Result<std::ffi::OsString, String> {
+    let mut parts = Vec::new();
+    parts.push(dir.to_path_buf());
+    parts.extend(std::env::split_paths(existing_path));
+    std::env::join_paths(parts).map_err(|e| e.to_string())
+}
+
+fn ensure_codex_wrapper(
+    app: &AppHandle,
+    mode: CodexPermissionMode,
+    real_codex: &Path,
+) -> Result<PathBuf, String> {
+    let wrapper_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("cli-wrappers");
+    fs::create_dir_all(&wrapper_dir).map_err(|e| e.to_string())?;
+
+    #[cfg(windows)]
+    let wrapper_path = wrapper_dir.join("codex.cmd");
+    #[cfg(not(windows))]
+    let wrapper_path = wrapper_dir.join("codex");
+
+    let content = build_codex_wrapper_script(mode, real_codex);
+    let needs_write = match fs::read_to_string(&wrapper_path) {
+        Ok(existing) => existing != content,
+        Err(_) => true,
+    };
+    if needs_write {
+        fs::write(&wrapper_path, content).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(&wrapper_path, perms).map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(wrapper_dir)
+}
+
+#[cfg(windows)]
+fn build_codex_wrapper_script(mode: CodexPermissionMode, real_codex: &Path) -> String {
+    let extra = match mode {
+        CodexPermissionMode::ApproveForMe => "--approve-for-me",
+        CodexPermissionMode::FullAccess => "-a never -s danger-full-access",
+        CodexPermissionMode::Inherit => "",
+    };
+    if extra.is_empty() {
+        format!("@echo off\r\n\"{}\" %*\r\n", real_codex.display())
+    } else {
+        format!("@echo off\r\n\"{}\" {} %*\r\n", real_codex.display(), extra)
+    }
+}
+
+#[cfg(not(windows))]
+fn build_codex_wrapper_script(mode: CodexPermissionMode, real_codex: &Path) -> String {
+    let extra = match mode {
+        CodexPermissionMode::ApproveForMe => " --approve-for-me",
+        CodexPermissionMode::FullAccess => " -a never -s danger-full-access",
+        CodexPermissionMode::Inherit => "",
+    };
+    format!(
+        "#!/bin/sh\nexec {}{} \"$@\"\n",
+        shell_single_quote(&real_codex.to_string_lossy()),
+        extra
+    )
+}
+
+#[cfg(not(windows))]
+fn shell_single_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\"'\"'"))
+}
+
+fn resolve_command_in_path(command: &str, path_var: &std::ffi::OsStr) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let command_path = Path::new(command);
+        let has_ext = command_path.extension().is_some();
+        let pathext = std::env::var_os("PATHEXT")
+            .and_then(|v| v.into_string().ok())
+            .map(|v| {
+                v.split(';')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![".exe".into(), ".cmd".into(), ".bat".into(), ".com".into()]);
+        for dir in std::env::split_paths(path_var) {
+            if has_ext {
+                let candidate = dir.join(command);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+                continue;
+            }
+            for ext in &pathext {
+                let candidate = dir.join(format!("{command}{ext}"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        for dir in std::env::split_paths(path_var) {
+            let candidate = dir.join(command);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
 #[tauri::command]
 pub fn create_pty(
     app: AppHandle,
@@ -999,6 +1154,9 @@ pub fn create_pty(
         // 不再把非 ASCII 字符转义成 <XX> 序列（git log 中文乱码常见原因）。
         cmd.env("LESSCHARSET", "utf-8");
     }
+
+    // 在 Mini-Term 内为 codex 注入可选包装器，让 `codex` 命令自动继承用户配置的审批模式。
+    configure_codex_wrapper(&app, &mut cmd);
 
     // 提前分配 pty_id 以便注入到子进程环境变量。spawn 失败时 id 浪费一个，
     // 但 next_id 只是单调计数器，不影响功能。

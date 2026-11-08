@@ -368,6 +368,7 @@ export const useAppStore = create<AppStore>((set) => ({
     terminalFontPreset: 'system',
     terminalCustomFontFamily: '',
     sshImageBridges: [],
+    codexPermissionMode: 'inherit',
   },
   setConfig: (config) => set({ config }),
 

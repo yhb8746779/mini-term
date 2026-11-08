@@ -11,6 +11,17 @@ use tauri::AppHandle;
 /// miniterm-hook 命令的标识符，用于检测和更新已存在的 hook 条目
 const HOOK_MARKER: &str = "miniterm-hook";
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookSetupStatus {
+    pub hook_binary_ready: bool,
+    pub server_running: bool,
+    pub claude_registered: bool,
+    pub codex_registered: bool,
+    pub codex_feature_enabled: bool,
+    pub gemini_registered: bool,
+}
+
 /// Claude Code 需要注册的 hook 事件列表
 const CLAUDE_HOOK_EVENTS: &[&str] = &[
     "SessionStart",
@@ -105,6 +116,46 @@ fn codex_hooks_path() -> Option<PathBuf> {
 /// 获取 Codex 配置文件路径: ~/.codex/config.toml
 fn codex_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".codex").join("config.toml"))
+}
+
+fn file_contains_hook_marker(path: &PathBuf) -> bool {
+    std::fs::read_to_string(path)
+        .map(|content| content.contains(HOOK_MARKER))
+        .unwrap_or(false)
+}
+
+fn claude_hook_registered() -> bool {
+    claude_settings_path()
+        .filter(|p| p.exists())
+        .is_some_and(|p| file_contains_hook_marker(&p))
+}
+
+fn codex_hook_registered() -> bool {
+    codex_hooks_path()
+        .filter(|p| p.exists())
+        .is_some_and(|p| file_contains_hook_marker(&p))
+}
+
+fn codex_hooks_feature_enabled() -> bool {
+    let Some(path) = codex_config_path().filter(|p| p.exists()) else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+    doc.get("features")
+        .and_then(|v| v.get("codex_hooks"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn gemini_hook_registered() -> bool {
+    gemini_settings_path()
+        .filter(|p| p.exists())
+        .is_some_and(|p| file_contains_hook_marker(&p))
 }
 
 // ─── Claude Code hook 注册/卸载 ───
@@ -823,5 +874,21 @@ pub fn get_hook_status(
     Ok(HookStatusInfo {
         port: hook_state.get_port(),
         running: hook_state.is_server_running(),
+    })
+}
+
+/// 获取 hook 整体接通状态，供首页自检和一键修复提示使用。
+#[tauri::command]
+pub fn get_hook_setup_status(
+    _app: AppHandle,
+    hook_state: tauri::State<'_, HookState>,
+) -> Result<HookSetupStatus, String> {
+    Ok(HookSetupStatus {
+        hook_binary_ready: get_hook_binary_path().is_ok(),
+        server_running: hook_state.is_server_running(),
+        claude_registered: claude_hook_registered(),
+        codex_registered: codex_hook_registered(),
+        codex_feature_enabled: codex_hooks_feature_enabled(),
+        gemini_registered: gemini_hook_registered(),
     })
 }
