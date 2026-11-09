@@ -15,8 +15,11 @@ async function start(page: Page, id: string) {
   await tab(page, id).dispatchEvent('dragstart', { dataTransfer: data });
   return data;
 }
-async function over(target: Locator, data: Awaited<ReturnType<typeof start>>, x = 0.5, y = 0.5) {
-  const rect = (await target.boundingBox())!;
+async function over(target: Locator, data: Awaited<ReturnType<typeof start>>, x = 0.5, y = 0.5, bounds: Locator = target) {
+  // Drop zones use the whole pane, while xterm-screen may still have its
+  // initial row/column dimensions before async fit/font loading completes.
+  // Keep dispatching inside xterm to exercise its capture handlers.
+  const rect = (await bounds.boundingBox())!;
   const point = { clientX: rect.x + rect.width * x, clientY: rect.y + rect.height * y, dataTransfer: data };
   await target.dispatchEvent('dragover', point);
   return point;
@@ -27,9 +30,9 @@ async function finish(page: Page, target: Locator, point: Awaited<ReturnType<typ
   await page.evaluate(() => window.dispatchEvent(new DragEvent('dragend', { bubbles: true })));
   await point.dataTransfer.dispose();
 }
-async function drag(page: Page, id: string, target: Locator, x = 0.5, y = 0.5) {
+async function drag(page: Page, id: string, target: Locator, x = 0.5, y = 0.5, bounds: Locator = target) {
   const data = await start(page, id);
-  await finish(page, target, await over(target, data, x, y));
+  await finish(page, target, await over(target, data, x, y, bounds));
 }
 
 test.beforeEach(async ({ page }) => {
@@ -74,7 +77,7 @@ test('b: moving the only right pane into the left bar collapses the root', async
 
 test('c: dropping A at the bottom of the right terminal creates a vertical split', async ({ page }) => {
   const target = content(page, 'D').locator('.xterm-screen');
-  await drag(page, 'A', target, 0.5, 0.98);
+  await drag(page, 'A', target, 0.5, 0.98, content(page, 'D'));
   await expect.poll(async () => ids(await layout(page))).toEqual([['B', 'C'], [['D'], ['A']]]);
   const root = await layout(page);
   expect(root.type).toBe('split');
@@ -87,7 +90,7 @@ test('d: center overlay accepts panes without file overlay or PTY writes', async
   const data = await start(page, 'A');
   expect(await data.evaluate(dt => Array.from(dt.types))).toEqual(['application/x-mini-term-pane']);
   const target = content(page, 'D').locator('.xterm-screen');
-  const point = await over(target, data);
+  const point = await over(target, data, 0.5, 0.5, content(page, 'D'));
   await expect(page.getByText('移入此组', { exact: true })).toBeVisible();
   await expect(page.getByText('释放以分屏', { exact: true })).toHaveCount(0);
   await expect(page.getByText('释放以插入路径', { exact: true })).toHaveCount(0);
@@ -100,6 +103,6 @@ test('d: center overlay accepts panes without file overlay or PTY writes', async
 
 test('e: dropping a single pane at its own edge leaves the layout unchanged', async ({ page }) => {
   const before = await layout(page);
-  await drag(page, 'D', content(page, 'D').locator('.xterm-screen'), 0.5, 0.98);
+  await drag(page, 'D', content(page, 'D').locator('.xterm-screen'), 0.5, 0.98, content(page, 'D'));
   expect(await layout(page)).toEqual(before);
 });
