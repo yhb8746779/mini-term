@@ -330,6 +330,7 @@ fn inspect_process_subtree(snapshot: &[ProcEntry], root_pid: u32) -> SubtreeObse
     let mut observation = SubtreeObservation::default();
     // 记录已选中 ssh 进程的深度，用于always保留"离 root 最近"的那个。
     let mut ssh_depth = usize::MAX;
+    let mut ai_depth = usize::MAX;
     // 深度保护：终端进程树一般很浅（shell → AI CLI → maybe node/python helper）
     let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
     while let Some((pid, depth)) = queue.pop() {
@@ -354,8 +355,8 @@ fn inspect_process_subtree(snapshot: &[ProcEntry], root_pid: u32) -> SubtreeObse
             if stem == "wsl" {
                 observation.has_wsl = true;
             }
-            if observation.ai_provider.is_none() {
-                observation.ai_provider = AI_SUBPROCESS_NAMES
+            if depth < ai_depth {
+                let candidate = AI_SUBPROCESS_NAMES
                     .iter()
                     .find(|&&ai| stem == ai)
                     .map(|&ai| ai_to_static(ai))
@@ -368,6 +369,10 @@ fn inspect_process_subtree(snapshot: &[ProcEntry], root_pid: u32) -> SubtreeObse
                             cmdline.as_deref().and_then(detect_ai_from_cmdline)
                         }
                     });
+                if candidate.is_some() {
+                    observation.ai_provider = candidate;
+                    ai_depth = depth;
+                }
             }
         }
         if let Some(child_idxs) = by_ppid.get(&pid) {
@@ -456,6 +461,14 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
                         let observation = inspect_process_subtree(snapshot, shell_pid);
                         layer3_saw_ssh = observation.has_ssh;
                         if let Some(provider) = observation.ai_provider {
+                            // 本地进程身份优先于继承同一 PTY ID 的嵌套工具 Hook。
+                            if !hook_matches_local_provider(
+                                Some(provider),
+                                hook_status.as_ref().and_then(|(_, p)| p.as_deref()),
+                            ) {
+                                hook_state.remove(*pty_id);
+                                hook_status = None;
+                            }
                             pty_manager.force_ai_session(*pty_id, provider);
                             layer3_saw_ai = true;
                         }
@@ -640,6 +653,23 @@ pub fn get_pty_transport(state: tauri::State<'_, crate::pty::PtyManager>, pty_id
     transport_from_observation(&inspect_process_subtree(&snapshot, root_pid)).into()
 }
 
+/// 本机外层 AI CLI 是 provider 真相源；远端没有本地 AI 时仍接受 Hook。
+pub(crate) fn hook_matches_local_provider(local: Option<&str>, reported: Option<&str>) -> bool {
+    match (local, reported) {
+        (Some(local), Some(reported)) => local == reported,
+        _ => true,
+    }
+}
+
+pub(crate) fn local_ai_provider_for_pty(
+    pty_manager: &crate::pty::PtyManager,
+    pty_id: u32,
+) -> Option<&'static str> {
+    let root_pid = pty_manager.get_child_pid(pty_id)?;
+    let snapshot = snapshot_processes()?;
+    inspect_process_subtree(&snapshot, root_pid).ai_provider
+}
+
 /// 找出该 PTY 进程树里那条交互式 ssh 的 pid。
 /// 供 ssh_upload 复现同一条 ssh 命令，把图片推到同一台远端。
 pub fn find_ssh_pid_for_pty(pty_manager: &crate::pty::PtyManager, pty_id: u32) -> Option<u32> {
@@ -654,6 +684,39 @@ mod tests {
 
     fn proc_entry(pid: u32, ppid: u32, name: &str) -> ProcEntry {
         (pid, ppid, name.to_string(), None)
+    }
+
+    #[test]
+    fn outer_claude_wins_over_nested_codex_on_another_branch() {
+        // DFS visits helper/codex before the shallower Claude sibling.
+        let snapshot = vec![
+            proc_entry(1, 0, "zsh"),
+            proc_entry(2, 1, "claude"),
+            proc_entry(3, 1, "helper"),
+            proc_entry(4, 3, "codex"),
+        ];
+        assert_eq!(inspect_process_subtree(&snapshot, 1).ai_provider, Some("claude"));
+    }
+
+    #[test]
+    fn outer_ai_wins_over_nested_other_provider() {
+        for (outer, inner) in [("claude", "codex"), ("codex", "claude")] {
+            let snapshot = vec![
+                proc_entry(1, 0, "zsh"),
+                proc_entry(2, 1, outer),
+                proc_entry(3, 2, inner),
+            ];
+            assert_eq!(inspect_process_subtree(&snapshot, 1).ai_provider, Some(outer));
+        }
+    }
+
+    #[test]
+    fn hook_identity_cannot_override_local_ai_but_remote_hooks_are_allowed() {
+        assert!(!hook_matches_local_provider(Some("claude"), Some("codex")));
+        assert!(!hook_matches_local_provider(Some("codex"), Some("claude")));
+        assert!(hook_matches_local_provider(Some("claude"), Some("claude")));
+        assert!(hook_matches_local_provider(None, Some("codex")));
+        assert!(hook_matches_local_provider(Some("claude"), None));
     }
 
     #[test]

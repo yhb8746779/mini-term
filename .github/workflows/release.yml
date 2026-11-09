@@ -202,6 +202,8 @@ jobs:
       - name: Verify config migration and SSH bridge routing
         run: |
           node src-tauri/scripts/prepare-sidecar.mjs debug
+          cargo test --manifest-path src-tauri/Cargo.toml --lib process_monitor::tests
+          cargo test --manifest-path src-tauri/Cargo.toml --lib hook_server::tests
           cargo test --manifest-path src-tauri/Cargo.toml --lib config::tests
           cargo test --manifest-path src-tauri/Cargo.toml --lib ssh_upload::tests
 

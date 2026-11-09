@@ -277,6 +277,10 @@ pub fn report_remote_ai_status(
     payload: RemoteStatusPayload,
 ) -> Result<bool, String> {
     payload.validate().map_err(ToString::to_string)?;
+    let local = crate::process_monitor::local_ai_provider_for_pty(&pty_manager, pty_id);
+    if !crate::process_monitor::hook_matches_local_provider(local, Some(&payload.provider)) {
+        return Ok(false);
+    }
     // 仅记录协议元数据，用于排查远端 Hook 与本地状态仲裁的时序；不记录原始
     // Hook payload、终端正文、cwd 或任何命令内容。
     let event = payload.event.clone();
@@ -410,6 +414,19 @@ pub fn start_hook_server(app: AppHandle, hook_state: HookState) -> Result<(), St
 
             // 处理事件
             if let (Some(pty_id), Some(ref event)) = (payload.pty_id, &payload.event) {
+                // 嵌套 Codex/Claude 会继承 MINITERM_PTY_ID，不能让它的
+                // Hook（包括 SessionEnd）改写外层交互会话的身份和状态。
+                if let Some(pty_manager) = app.try_state::<crate::pty::PtyManager>() {
+                    let local =
+                        crate::process_monitor::local_ai_provider_for_pty(&pty_manager, pty_id);
+                    let reported = normalize_provider(payload.agent.as_deref());
+                    if !crate::process_monitor::hook_matches_local_provider(
+                        local,
+                        reported.as_deref(),
+                    ) {
+                        continue;
+                    }
+                }
                 if event == "SessionEnd" {
                     // 会话结束保留 idle 终态，下一轮轮询不能重新覆盖。
                     hook_state.apply_event(
