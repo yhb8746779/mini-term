@@ -326,6 +326,91 @@ html, body, #root {
   to { opacity: 1; transform: translateX(0); }
 }
 
+/* ===== Hook setup banner ===== */
+.hook-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--accent) 14%, transparent), transparent 70%),
+    var(--bg-base);
+}
+
+.hook-banner__text {
+  min-width: 0;
+}
+
+.hook-banner__title {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.hook-banner__desc {
+  color: var(--text-secondary);
+  font-size: 11px;
+  margin-top: 2px;
+  line-height: 1.4;
+}
+
+.hook-banner__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.hook-banner__primary,
+.hook-banner__secondary,
+.hook-banner__close {
+  border-radius: var(--radius-sm);
+  transition: opacity 0.15s ease, border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
+}
+
+.hook-banner__primary {
+  padding: 6px 10px;
+  border: none;
+  background: var(--accent);
+  color: var(--bg-base);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.hook-banner__primary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.hook-banner__secondary {
+  padding: 6px 10px;
+  border: 1px solid var(--border-default);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.hook-banner__secondary:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+.hook-banner__close {
+  padding: 4px 6px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.hook-banner__close:hover {
+  color: var(--text-primary);
+}
+
 /* ===== Context menu ===== */
 .ctx-menu {
   background: var(--bg-overlay);

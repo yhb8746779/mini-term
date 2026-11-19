@@ -12,6 +12,7 @@
   "include": [
     "src/utils/themeManager.ts",
     "src/utils/ptyWriteQueue.ts",
-    "src/utils/splitTree.ts"
+    "src/utils/splitTree.ts",
+    "src/utils/terminalCleanup.ts"
   ]
 }

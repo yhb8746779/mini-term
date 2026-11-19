@@ -4782,6 +4782,7 @@ dependencies = [
  "git2",
  "ignore",
  "image",
+ "libc",
  "notify",
  "objc2",
  "pathdiff",

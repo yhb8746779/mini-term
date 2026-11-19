@@ -105,10 +105,42 @@ const cache = new Map<number, CachedEntry>();
 
 // AI PTY 标记：FileTree/GitHistory 等高频订阅者据此跳过 AI 会话的输出，避免无意义的正则匹配
 const aiPtyIds = new Set<number>();
+const aiPtyProviders = new Map<number, AiProvider>();
+const aiPtyClearTimers = new Map<number, ReturnType<typeof setTimeout>>();
+const AI_PTY_CLEAR_GRACE_MS = 15000;
 
-export function markAiPty(ptyId: number, isAi: boolean) {
-  if (isAi) aiPtyIds.add(ptyId);
-  else aiPtyIds.delete(ptyId);
+export function markAiPty(ptyId: number, isAi: boolean, provider?: AiProvider): void {
+  const clearTimer = aiPtyClearTimers.get(ptyId);
+  if (clearTimer) {
+    clearTimeout(clearTimer);
+    aiPtyClearTimers.delete(ptyId);
+  }
+
+  if (isAi) {
+    aiPtyIds.add(ptyId);
+    if (provider) {
+      aiPtyProviders.set(ptyId, provider);
+    }
+    return;
+  }
+
+  // macOS 上 hook / monitor 偶发抖动会把 Claude/Codex pane 短暂打回 idle。
+  // 对图片/截图粘贴保留一小段缓冲，避免能力在会话仍存活时瞬间失效。
+  aiPtyClearTimers.set(ptyId, setTimeout(() => {
+    aiPtyIds.delete(ptyId);
+    aiPtyProviders.delete(ptyId);
+    aiPtyClearTimers.delete(ptyId);
+  }, AI_PTY_CLEAR_GRACE_MS));
+}
+
+export function clearAiPty(ptyId: number): void {
+  const clearTimer = aiPtyClearTimers.get(ptyId);
+  if (clearTimer) {
+    clearTimeout(clearTimer);
+    aiPtyClearTimers.delete(ptyId);
+  }
+  aiPtyIds.delete(ptyId);
+  aiPtyProviders.delete(ptyId);
 }
 
 export function isAiPty(ptyId: number): boolean {
@@ -839,8 +871,10 @@ async function tryCopyImageFileForPathPaste(path: string): Promise<ClipboardPath
 }
 
 /**
- * 返回 ptyId 对应 pane 的 AI provider（仅在 AI 活跃状态时）。
- * 非 AI pane 或状态为 idle/error 时返回 null。
+ * 返回 ptyId 对应 pane 的 AI provider。
+ *
+ * 优先使用当前 pane 的实时 AI 状态；若 monitor / hook 短暂抖回 idle，
+ * 则在短时间内回退到最近一次已确认的 provider，避免图片/截图粘贴能力瞬间失效。
  */
 function getAiProviderForPty(ptyId: number): AiProvider | null {
   const { projectStates } = useAppStore.getState();
@@ -853,11 +887,18 @@ function getAiProviderForPty(ptyId: number): AiProvider | null {
           pane.status === 'ai-thinking' ||
           pane.status === 'ai-complete' ||
           pane.status === 'ai-awaiting-input';
-        return isAi ? (pane.aiProvider ?? null) : null;
+        if (isAi) {
+          if (pane.aiProvider) {
+            aiPtyProviders.set(ptyId, pane.aiProvider);
+            return pane.aiProvider;
+          }
+          return aiPtyProviders.get(ptyId) ?? null;
+        }
+        return aiPtyIds.has(ptyId) ? (aiPtyProviders.get(ptyId) ?? null) : null;
       }
     }
   }
-  return null;
+  return aiPtyIds.has(ptyId) ? (aiPtyProviders.get(ptyId) ?? null) : null;
 }
 
 // ── AI pane 剪贴板来源分类与粘贴路径 ──────────────────────────────────────────

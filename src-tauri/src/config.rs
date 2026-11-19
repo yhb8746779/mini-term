@@ -65,6 +65,8 @@ pub struct AppConfig {
     pub terminal_font_preset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_custom_font_family: Option<String>,
+    #[serde(default = "default_codex_permission_mode")]
+    pub codex_permission_mode: String,
     /// Hook server 开关：true 时启动时绑定 127.0.0.1:23456 接收 Claude/Codex/Gemini hook 事件。
     /// 默认关闭（避免 Windows 防火墙无条件弹窗），用户在设置页主动开启。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,6 +203,9 @@ fn default_ai_completion_popup() -> bool {
 fn default_ai_completion_taskbar_flash() -> bool {
     true
 }
+fn default_codex_permission_mode() -> String {
+    "inherit".into()
+}
 
 fn default_ssh_image_bridges() -> Vec<SshImageBridgeConfig> {
     vec![SshImageBridgeConfig {
@@ -266,6 +271,7 @@ impl Default for AppConfig {
             vscode_path: None,
             terminal_font_preset: None,
             terminal_custom_font_family: None,
+            codex_permission_mode: default_codex_permission_mode(),
             hook_enabled: None,
             ssh_image_bridges: default_ssh_image_bridges(),
             active_ssh_image_bridge_id: None,

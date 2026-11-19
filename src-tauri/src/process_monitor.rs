@@ -156,7 +156,7 @@ fn detect_awaiting_input(raw_output: &str) -> bool {
 /// - 命令行：Windows 用 sysinfo 填充（小写化，argv 以空格 join），用于识别
 ///   node.exe 这类启动器进程里跑的具体 AI CLI（gemini-cli / codex.js 等）；
 ///   Unix 上保持 None，进程名本身就足够精确（gemini / codex 都是原生二进制）。
-type ProcEntry = (u32, u32, String, Option<String>);
+pub(crate) type ProcEntry = (u32, u32, String, Option<String>);
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SubtreeObservation {
@@ -169,7 +169,7 @@ struct SubtreeObservation {
 
 /// 抓一次系统进程列表。Unix 调 `ps -A`，Windows 用 sysinfo（含命令行）。
 #[cfg(unix)]
-fn snapshot_processes() -> Option<Vec<ProcEntry>> {
+pub(crate) fn snapshot_processes() -> Option<Vec<ProcEntry>> {
     use std::process::Command;
     let output = Command::new("ps")
         .args(["-A", "-o", "pid=,ppid=,comm="])
@@ -220,7 +220,7 @@ fn snapshot_processes() -> Option<Vec<ProcEntry>> {
 /// 代价：sysinfo 内部对每个进程读 PEB + ReadProcessMemory 取命令行，
 /// 大约 10-30ms 一次全量扫描；每 500ms 一次，对 CPU 压力很小。
 #[cfg(windows)]
-fn snapshot_processes() -> Option<Vec<ProcEntry>> {
+pub(crate) fn snapshot_processes() -> Option<Vec<ProcEntry>> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
     let mut sys = System::new();
@@ -267,7 +267,7 @@ fn snapshot_processes() -> Option<Vec<ProcEntry>> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn snapshot_processes() -> Option<Vec<ProcEntry>> {
+pub(crate) fn snapshot_processes() -> Option<Vec<ProcEntry>> {
     None
 }
 

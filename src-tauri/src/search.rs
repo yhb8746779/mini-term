@@ -98,11 +98,11 @@ fn build_walker(root: &str) -> ignore::Walk {
     let mut builder = ignore::WalkBuilder::new(root);
     builder.hidden(false);
     builder.filter_entry(|entry| {
+        let name = entry.file_name().to_str().unwrap_or("");
         if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-            let name = entry.file_name().to_str().unwrap_or("");
             !crate::fs::ALWAYS_IGNORE.contains(&name)
         } else {
-            true
+            !crate::fs::is_apple_double(name, false)
         }
     });
     builder.build()

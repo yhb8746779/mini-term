@@ -1,0 +1,14 @@
+const assert = require('node:assert/strict');
+const { collectTerminalPanes, pruneTerminals } = require('../.tmp-tests/utils/terminalCleanup.js');
+const leaf = (...ids) => ({type: 'leaf', panes: ids.map((id) => ({id: String(id), ptyId: id})), activePaneId: String(ids[0])});
+const nested = {type: 'split', direction: 'horizontal', children: [leaf(1, 2), {type: 'split', direction: 'vertical', children: [leaf(3), leaf(4)], sizes: [30, 70]}], sizes: [40, 60]};
+assert.deepEqual(collectTerminalPanes(nested).map((p) => p.ptyId), [1, 2, 3, 4]);
+const pruned = pruneTerminals(nested, new Set([1, 3]));
+assert.deepEqual(collectTerminalPanes(pruned).map((p) => p.ptyId), [2, 4]);
+assert.equal(pruned.children[0].activePaneId, '2');
+assert.equal(pruned.children[1].type, 'leaf');
+assert.deepEqual(pruned.sizes, [40, 60]);
+assert.equal(pruneTerminals(nested, new Set([1, 2, 3, 4])), null);
+assert.equal(pruneTerminals(nested, new Set([1, 2, 3])).type, 'leaf');
+assert.equal(collectTerminalPanes(nested).length, 4);
+console.log('terminal cleanup layout tests passed');

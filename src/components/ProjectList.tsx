@@ -1,15 +1,17 @@
+import { collectTerminalPanes } from '../utils/terminalCleanup';
+import { disposeTerminal } from '../utils/terminalCache';
 import { useCallback, useState, useRef, useEffect } from 'react';
 import { Allotment } from 'allotment';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
-import { useAppStore, genId } from '../store';
+import { useAppStore, genId, removeClosedTerminals } from '../store';
 import { StatusDot } from './StatusDot';
 import { DoneTag } from './DoneTag';
 import { SessionList } from './SessionList';
 import { showContextMenu } from '../utils/contextMenu';
-import { showPrompt } from '../utils/prompt';
+import { showConfirm, showPrompt } from '../utils/prompt';
 import { setDragPayload, getDragPayload } from '../utils/dragState';
 import {
   getOrderedTree,
@@ -57,6 +59,43 @@ export function ProjectList() {
   const [editingName, setEditingName] = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [terminalFilter, setTerminalFilter] = useState('all');
+  const [cleaning, setCleaning] = useState(false);
+  const [cleanupMessage, setCleanupMessage] = useState('');
+
+  const projectPanes = (id: string) => projectStates.get(id)?.tabs.flatMap((tab) => collectTerminalPanes(tab.splitLayout)) ?? [];
+  const handleCleanup = async () => {
+    if (cleaning) return;
+    setCleaning(true);
+    setCleanupMessage('正在检查终端任务…');
+    try {
+      // Scope is explicit: only currently displayed projects, regardless of collapsed groups.
+      const projects = filteredProjects ?? config.projects;
+      const candidates = projects.flatMap((project) => projectPanes(project.id))
+        .filter((pane) => pane.status === 'idle' && !pane.aiProvider);
+      const ids = await invoke<number[]>('find_idle_ptys', { ptyIds: candidates.map((pane) => pane.ptyId) });
+      if (!ids.length) { setCleanupMessage('没有可清理的空闲终端。'); return; }
+      const names = projects.filter((project) => projectPanes(project.id).some((pane) => ids.includes(pane.ptyId))).map((project) => project.name);
+      const confirmed = await showConfirm('清理空闲终端',
+        `将关闭 ${names.length} 个项目中的 ${ids.length} 个空闲终端：${names.slice(0, 8).join('、')}${names.length > 8 ? '…' : ''}。终端内容将被清除。保留 AI 对话和有前台或后台任务的终端；关闭前会再次检查。`);
+      if (!confirmed) { setCleanupMessage(''); return; }
+      const closed: number[] = [];
+      let failed = 0;
+      for (const ptyId of ids) {
+        try {
+          const current = [...useAppStore.getState().projectStates.values()].flatMap((ps) => ps.tabs.flatMap((tab) => collectTerminalPanes(tab.splitLayout))).find((pane) => pane.ptyId === ptyId);
+          if (!current || current.status !== 'idle' || current.aiProvider) continue;
+          if (await invoke<boolean>('close_idle_pty', { ptyId })) {
+            closed.push(ptyId);
+            disposeTerminal(ptyId);
+          }
+        } catch { failed++; }
+      }
+      removeClosedTerminals(closed);
+      setCleanupMessage(`已关闭 ${closed.length} 个，保留 ${ids.length - closed.length - failed} 个${failed ? `，失败 ${failed} 个` : ''}。`);
+    } catch (error) { setCleanupMessage(`检查失败：${String(error)}`); }
+    finally { setCleaning(false); }
+  };
   const editInputRef = useRef<HTMLInputElement>(null);
   const editProjectInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -70,10 +109,15 @@ export function ProjectList() {
     setSearchQuery('');
   }, []);
 
-  const filteredProjects = searchQuery.trim()
+  const filteredProjects = searchQuery.trim() || terminalFilter !== 'all'
     ? config.projects.filter((p) => {
-        const q = searchQuery.toLowerCase();
-        return p.name.toLowerCase().includes(q) || p.path.toLowerCase().includes(q);
+        const q = searchQuery.trim().toLowerCase();
+        if (q && !p.name.toLowerCase().includes(q) && !p.path.toLowerCase().includes(q)) return false;
+        const panes = projectPanes(p.id);
+        if (terminalFilter === 'open') return panes.some((pane) => pane.status !== 'error');
+        if (terminalFilter === 'zsh') return panes.some((pane) => pane.status !== 'error' && (/(^|[\\/])zsh$/.test(config.availableShells.find((shell) => shell.name === pane.shellName)?.command ?? '') || /^zsh$/i.test(pane.shellName)));
+        if (terminalFilter === 'none') return !panes.some((pane) => pane.status !== 'error');
+        return true;
       })
     : null;
 
@@ -397,6 +441,7 @@ export function ProjectList() {
         ) : (
           <span className="truncate flex-1">{project.name}</span>
         )}
+        <span title="已打开的终端数量" className="text-[10px] text-[var(--text-muted)]">{projectPanes(project.id).filter((pane) => pane.status !== 'error').length || ''}</span>
         {/* AI 完成提醒优先显示；否则 provider 状态汇总（每个 provider 一个点，固定顺序） */}
         {showDoneTag ? <DoneTag /> : (
           <div className="flex items-center gap-0.5 flex-shrink-0">
@@ -535,6 +580,22 @@ export function ProjectList() {
                 </svg>
               </button>
             </div>
+
+            <div className="px-2 pb-2 flex items-center gap-1.5">
+              <select aria-label="按终端筛选项目" value={terminalFilter} onChange={(e) => setTerminalFilter(e.target.value)}
+                className="min-w-0 flex-1 text-xs bg-[var(--bg-elevated)] text-[var(--text-secondary)] border border-[var(--border-default)] rounded px-1 py-1">
+                <option value="all">全部项目</option>
+                <option value="open">有终端</option>
+                <option value="zsh">有 zsh 终端</option>
+                <option value="none">无终端</option>
+              </select>
+              <button disabled={cleaning} onClick={handleCleanup}
+                title="清理当前筛选项目中的空闲终端；保留 AI 对话和正在执行任务的终端"
+                className="text-xs text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-50 whitespace-nowrap">
+                {cleaning ? '检查中…' : '清理空闲'}
+              </button>
+            </div>
+            {cleanupMessage && <div role="status" className="px-3 pb-2 text-xs text-[var(--text-muted)]">{cleanupMessage}</div>}
 
             {searchOpen && (
               <div className="px-2 pb-1.5">

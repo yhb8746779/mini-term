@@ -1,8 +1,9 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize, MasterPty, Child};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::thread;
@@ -228,10 +229,9 @@ fn is_safe_pty_size(cols: u16, rows: u16) -> bool {
 ///
 /// 只识别 pwsh / pwsh.exe，Windows PowerShell 5.1 不受此上游问题影响。
 fn is_pwsh_command(shell: &str) -> bool {
-    Path::new(shell)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("pwsh") || name.eq_ignore_ascii_case("pwsh.exe"))
+    // Recognize Windows paths when testing or loading config on Unix too.
+    let name = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
+    name.eq_ignore_ascii_case("pwsh") || name.eq_ignore_ascii_case("pwsh.exe")
 }
 
 /// 去除 ANSI 转义序列，返回纯文本。
@@ -927,6 +927,160 @@ fn find_valid_utf8_prefix_len(bytes: &[u8]) -> usize {
     i
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexPermissionMode {
+    Inherit,
+    ApproveForMe,
+    FullAccess,
+}
+
+impl CodexPermissionMode {
+    fn from_config_value(value: &str) -> Self {
+        match value {
+            "approve-for-me" => Self::ApproveForMe,
+            "full-access" => Self::FullAccess,
+            _ => Self::Inherit,
+        }
+    }
+}
+
+fn configure_codex_wrapper(app: &AppHandle, cmd: &mut CommandBuilder) {
+    let mode = CodexPermissionMode::from_config_value(&crate::config::read_config(app).codex_permission_mode);
+    if mode == CodexPermissionMode::Inherit {
+        return;
+    }
+
+    let current_path = std::env::var_os("PATH").unwrap_or_default();
+    let Some(real_codex) = resolve_command_in_path("codex", &current_path) else {
+        return;
+    };
+    let Ok(wrapper_dir) = ensure_codex_wrapper(app, mode, &real_codex) else {
+        return;
+    };
+    let Ok(path_var) = prepend_path(&wrapper_dir, &current_path) else {
+        return;
+    };
+    cmd.env("PATH", path_var.to_string_lossy().to_string());
+}
+
+fn prepend_path(dir: &Path, existing_path: &std::ffi::OsStr) -> Result<std::ffi::OsString, String> {
+    let mut parts = Vec::new();
+    parts.push(dir.to_path_buf());
+    parts.extend(std::env::split_paths(existing_path));
+    std::env::join_paths(parts).map_err(|e| e.to_string())
+}
+
+fn ensure_codex_wrapper(
+    app: &AppHandle,
+    mode: CodexPermissionMode,
+    real_codex: &Path,
+) -> Result<PathBuf, String> {
+    let wrapper_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("cli-wrappers");
+    fs::create_dir_all(&wrapper_dir).map_err(|e| e.to_string())?;
+
+    #[cfg(windows)]
+    let wrapper_path = wrapper_dir.join("codex.cmd");
+    #[cfg(not(windows))]
+    let wrapper_path = wrapper_dir.join("codex");
+
+    let content = build_codex_wrapper_script(mode, real_codex);
+    let needs_write = match fs::read_to_string(&wrapper_path) {
+        Ok(existing) => existing != content,
+        Err(_) => true,
+    };
+    if needs_write {
+        fs::write(&wrapper_path, content).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(&wrapper_path, perms).map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(wrapper_dir)
+}
+
+#[cfg(windows)]
+fn build_codex_wrapper_script(mode: CodexPermissionMode, real_codex: &Path) -> String {
+    let extra = match mode {
+        CodexPermissionMode::ApproveForMe => "--approve-for-me",
+        CodexPermissionMode::FullAccess => "-a never -s danger-full-access",
+        CodexPermissionMode::Inherit => "",
+    };
+    if extra.is_empty() {
+        format!("@echo off\r\n\"{}\" %*\r\n", real_codex.display())
+    } else {
+        format!("@echo off\r\n\"{}\" {} %*\r\n", real_codex.display(), extra)
+    }
+}
+
+#[cfg(not(windows))]
+fn build_codex_wrapper_script(mode: CodexPermissionMode, real_codex: &Path) -> String {
+    let extra = match mode {
+        CodexPermissionMode::ApproveForMe => " --approve-for-me",
+        CodexPermissionMode::FullAccess => " -a never -s danger-full-access",
+        CodexPermissionMode::Inherit => "",
+    };
+    format!(
+        "#!/bin/sh\nexec {}{} \"$@\"\n",
+        shell_single_quote(&real_codex.to_string_lossy()),
+        extra
+    )
+}
+
+#[cfg(not(windows))]
+fn shell_single_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\"'\"'"))
+}
+
+fn resolve_command_in_path(command: &str, path_var: &std::ffi::OsStr) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let command_path = Path::new(command);
+        let has_ext = command_path.extension().is_some();
+        let pathext = std::env::var_os("PATHEXT")
+            .and_then(|v| v.into_string().ok())
+            .map(|v| {
+                v.split(';')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![".exe".into(), ".cmd".into(), ".bat".into(), ".com".into()]);
+        for dir in std::env::split_paths(path_var) {
+            if has_ext {
+                let candidate = dir.join(command);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+                continue;
+            }
+            for ext in &pathext {
+                let candidate = dir.join(format!("{command}{ext}"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        for dir in std::env::split_paths(path_var) {
+            let candidate = dir.join(command);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
 #[tauri::command]
 pub fn create_pty(
     app: AppHandle,
@@ -999,6 +1153,9 @@ pub fn create_pty(
         // 不再把非 ASCII 字符转义成 <XX> 序列（git log 中文乱码常见原因）。
         cmd.env("LESSCHARSET", "utf-8");
     }
+
+    // 在 Mini-Term 内为 codex 注入可选包装器，让 `codex` 命令自动继承用户配置的审批模式。
+    configure_codex_wrapper(&app, &mut cmd);
 
     // 提前分配 pty_id 以便注入到子进程环境变量。spawn 失败时 id 浪费一个，
     // 但 next_id 只是单调计数器，不影响功能。
@@ -1239,6 +1396,41 @@ pub fn resize_pty(state: tauri::State<'_, PtyManager>, pty_id: u32, cols: u16, r
     Ok(())
 }
 
+// A gray frontend dot only means "no AI"; ordinary commands may still be running.
+// Require a known live shell, no children (including background jobs), and quiet
+// output. Snapshot failures always protect the terminal.
+fn idle_in_snapshot(state: &PtyManager, pty_id: u32, snapshot: &[crate::process_monitor::ProcEntry]) -> bool {
+    if state.is_ai_session(pty_id) || state.has_recent_output(pty_id, Duration::from_secs(5)) {
+        return false;
+    }
+    let Some(pid) = state.get_child_pid(pty_id) else { return false; };
+    snapshot.iter().any(|(p, _, name, _)| {
+        *p == pid && matches!(name.rsplit('/').next().unwrap_or(name).trim_start_matches('-'),
+            "zsh" | "bash" | "sh" | "fish" | "dash" | "ksh")
+    }) && !snapshot.iter().any(|(_, parent, _, _)| *parent == pid)
+}
+
+#[tauri::command]
+pub async fn find_idle_ptys(state: tauri::State<'_, PtyManager>, pty_ids: Vec<u32>) -> Result<Vec<u32>, String> {
+    let manager = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let snapshot = crate::process_monitor::snapshot_processes().ok_or("无法检查终端任务，请稍后重试")?;
+        Ok(pty_ids.into_iter().filter(|id| idle_in_snapshot(&manager, *id, &snapshot)).collect())
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn close_idle_pty(app: AppHandle, state: tauri::State<'_, PtyManager>, pty_id: u32) -> Result<bool, String> {
+    let manager = state.inner().clone();
+    let idle = tauri::async_runtime::spawn_blocking(move || {
+        crate::process_monitor::snapshot_processes()
+            .map(|snapshot| idle_in_snapshot(&manager, pty_id, &snapshot)).unwrap_or(false)
+    }).await.map_err(|e| e.to_string())?;
+    if !idle { return Ok(false); }
+    kill_pty(app, state, pty_id)?;
+    Ok(true)
+}
+
 #[tauri::command]
 pub fn kill_pty(
     app: AppHandle,
@@ -1280,6 +1472,7 @@ pub fn kill_pty(
             // the primary process is gone, allowing ClosePseudoConsole to return
             // once in-flight output is drained.
             let _ = inst.child.kill();
+            let _ = inst.child.wait();
             // Now drop writer → master → child in background.
             drop(inst);
         });
@@ -1308,6 +1501,32 @@ mod tests {
         assert!(!is_pwsh_command("powershell"));
         assert!(!is_pwsh_command("cmd.exe"));
         assert!(!is_pwsh_command("/bin/bash"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_protects_jobs_ai_and_unknown_shells() {
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let child = pair.slave.spawn_command(CommandBuilder::new("/bin/sh")).unwrap();
+        let pid = child.process_id().unwrap();
+        let manager = PtyManager::new();
+        manager.instances.lock().unwrap().insert(1, PtyInstance {
+            writer: pair.master.take_writer().unwrap(), master: pair.master, child,
+        });
+        let shell = (pid, 1, "/bin/sh".to_string(), None);
+        assert!(idle_in_snapshot(&manager, 1, &[shell.clone()]));
+        assert!(!idle_in_snapshot(&manager, 1, &[]));
+        assert!(!idle_in_snapshot(&manager, 1, &[(pid, 1, "sleep".to_string(), None)]));
+        // Includes background jobs, even if no output has been produced.
+        assert!(!idle_in_snapshot(&manager, 1, &[shell.clone(), (pid + 1, pid, "sleep".to_string(), None)]));
+        manager.ai_sessions.lock().unwrap().insert(1);
+        assert!(!idle_in_snapshot(&manager, 1, &[shell.clone()]));
+        manager.ai_sessions.lock().unwrap().clear();
+        manager.last_output.lock().unwrap().insert(1, Instant::now());
+        assert!(!idle_in_snapshot(&manager, 1, &[shell]));
+        let mut inst = manager.instances.lock().unwrap().remove(&1).unwrap();
+        let _ = inst.child.kill();
+        let _ = inst.child.wait();
     }
 
     // ── output_contains_ai_command ───────────────────────────────────────

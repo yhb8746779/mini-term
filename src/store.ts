@@ -1,3 +1,4 @@
+import { collectTerminalPanes, pruneTerminals } from './utils/terminalCleanup';
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window';
@@ -368,6 +369,7 @@ export const useAppStore = create<AppStore>((set) => ({
     terminalFontPreset: 'system',
     terminalCustomFontFamily: '',
     sshImageBridges: [],
+    codexPermissionMode: 'inherit',
   },
   setConfig: (config) => set({ config }),
 
@@ -654,3 +656,24 @@ export const useAppStore = create<AppStore>((set) => ({
     }),
 
 }));
+
+/** Apply backend-confirmed closures against the latest state, including hidden projects. */
+export function removeClosedTerminals(ptyIds: number[]) {
+  const removed = new Set(ptyIds);
+  const changed: string[] = [];
+  useAppStore.setState((state) => {
+    const projectStates = new Map(state.projectStates);
+    for (const [id, ps] of projectStates) {
+      if (!ps.tabs.some((tab) => collectTerminalPanes(tab.splitLayout).some((pane) => removed.has(pane.ptyId)))) continue;
+      const tabs = ps.tabs.flatMap((tab) => {
+        const splitLayout = pruneTerminals(tab.splitLayout, removed);
+        return splitLayout ? [{ ...tab, splitLayout, status: getHighestStatus(splitLayout) }] : [];
+      });
+      projectStates.set(id, { ...ps, tabs, layoutHydrated: true,
+        activeTabId: tabs.some((tab) => tab.id === ps.activeTabId) ? ps.activeTabId : (tabs[0]?.id ?? '') });
+      changed.push(id);
+    }
+    return { projectStates };
+  });
+  for (const id of changed) saveLayoutToConfig(id);
+}
