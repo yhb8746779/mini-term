@@ -18,13 +18,14 @@
 // - tauri-build 在 lib build.rs 阶段对每个 cargo target 做的资源校验都能通过
 
 import { execSync, spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, chmodSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, chmodSync, writeFileSync, lstatSync, renameSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const SRC_TAURI = resolve(__dirname, "..");
+const SIDECAR_TARGET = resolve(SRC_TAURI, "target", "sidecar");
 
 function getHostTriple() {
   if (process.env.TAURI_TARGET_TRIPLE) return process.env.TAURI_TARGET_TRIPLE;
@@ -69,8 +70,8 @@ function resolveSingleArchTargets(hostTriple) {
 function buildHookForTarget(profile, target, isHostTriple) {
   const exe = process.platform === "win32" ? "miniterm-hook.exe" : "miniterm-hook";
   // 优先 target 子目录路径（CI 风格），fallback 到 flat（host triple 默认）
-  const tripleDir = resolve(SRC_TAURI, "target", target, profile, exe);
-  const flatDir = resolve(SRC_TAURI, "target", profile, exe);
+  const tripleDir = resolve(SIDECAR_TARGET, target, profile, exe);
+  const flatDir = resolve(SIDECAR_TARGET, profile, exe);
 
   const pickExistingSrc = () => {
     if (existsSync(tripleDir)) return tripleDir;
@@ -83,7 +84,7 @@ function buildHookForTarget(profile, target, isHostTriple) {
   console.log(`[prepare-sidecar] cargo build --bin miniterm-hook --target ${target} (${profile})`);
   // The standalone helper crate avoids compiling the GUI and backend twice.
   const args = ["build", "--manifest-path", resolve(SRC_TAURI, "miniterm-hook", "Cargo.toml"),
-    "--target-dir", resolve(SRC_TAURI, "target"), "--bin", "miniterm-hook", "--target", target];
+    "--target-dir", SIDECAR_TARGET, "--bin", "miniterm-hook", "--target", target];
   if (profile === "release") args.push("--release");
   const r = spawnSync("cargo", args, { cwd: SRC_TAURI, stdio: "inherit" });
   if (r.status !== 0) throw new Error(`cargo build miniterm-hook (${target}) 失败`);
@@ -94,6 +95,19 @@ function buildHookForTarget(profile, target, isHostTriple) {
 }
 
 function prepareSingleArchSidecar(profile, target, hostTriple) {
+  // Older standalone builds shared the GUI target directory. New Cargo layouts
+  // put build-script metadata under build/<package>, colliding with Tauri's
+  // legacy sidecar copy destination. Preserve that generated cache elsewhere.
+  for (const legacy of [
+    resolve(SRC_TAURI, "target", target, profile, "build", "miniterm-hook"),
+    resolve(SRC_TAURI, "target", profile, "build", "miniterm-hook"),
+  ]) {
+    if (existsSync(legacy) && lstatSync(legacy).isDirectory()) {
+      renameSync(legacy, `${legacy}.standalone-legacy-${Date.now()}`);
+      console.log(`[prepare-sidecar] relocated legacy helper metadata: ${legacy}`);
+    }
+  }
+
   const exeSuffix = target.includes("windows") ? ".exe" : "";
   const dstDir = resolve(SRC_TAURI, "binaries");
   mkdirSync(dstDir, { recursive: true });

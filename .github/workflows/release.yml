@@ -10,6 +10,15 @@ on:
         description: 'Tag name (e.g. v0.2.9)'
         required: true
         default: 'v0.2.61'
+      platform:
+        description: 'Platform to build'
+        type: choice
+        default: all
+        options:
+          - all
+          - macos
+          - linux
+          - windows
       artifacts_only:
         description: 'Save packages as workflow artifacts without creating a Release'
         type: boolean
@@ -32,7 +41,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(inputs.macos_only && '[{"platform":"macos-latest","target":"universal-apple-darwin"}]' || '[{"platform":"windows-latest","target":"x86_64-pc-windows-msvc"},{"platform":"macos-latest","target":"universal-apple-darwin"},{"platform":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"}]') }}
+        include: >-
+          ${{ fromJSON(
+            inputs.platform == 'linux' && '[{"platform":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"}]' ||
+            inputs.platform == 'windows' && '[{"platform":"windows-latest","target":"x86_64-pc-windows-msvc"}]' ||
+            (inputs.macos_only || inputs.platform == 'macos') && '[{"platform":"macos-latest","target":"universal-apple-darwin"}]' ||
+            '[{"platform":"windows-latest","target":"x86_64-pc-windows-msvc"},{"platform":"macos-latest","target":"universal-apple-darwin"},{"platform":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"}]'
+          ) }}
 
     runs-on: ${{ matrix.platform == 'macos-latest' && (inputs.macos_runner || 'macos-15-intel') || matrix.platform }}
     permissions:
@@ -43,6 +58,16 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      # Release sources remain pinned to the requested tag; build tooling follows
+      # this immutable workflow revision so packaging fixes can retry old tags.
+      - name: Use workflow release build tooling
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          RELEASE_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: git show "${RELEASE_WORKFLOW_SHA}:src-tauri/scripts/prepare-sidecar.mjs" > src-tauri/scripts/prepare-sidecar.mjs
+
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
