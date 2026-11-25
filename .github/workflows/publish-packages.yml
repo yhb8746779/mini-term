@@ -1,0 +1,44 @@
+name: Publish built packages
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        required: true
+        default: v0.2.61
+      run_id:
+        description: Successful build run ID
+        required: true
+      artifact:
+        type: choice
+        required: true
+        options:
+          - packages-x86_64-unknown-linux-gnu
+          - packages-universal-apple-darwin
+          - packages-x86_64-pc-windows-msvc
+      certificate_sha256:
+        description: Expected macOS public signing certificate SHA-256
+        required: false
+jobs:
+  publish:
+    runs-on: ${{ inputs.artifact == 'packages-universal-apple-darwin' && 'macos-15-intel' || 'ubuntu-22.04' }}
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      SOURCE_RUN: ${{ inputs.run_id }}
+      PACKAGE_ARTIFACT: ${{ inputs.artifact }}
+      EXPECTED_CERTIFICATE_SHA256: ${{ inputs.certificate_sha256 }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check existing draft upload access
+        run: python3 src-tauri/scripts/publish-packages.py check
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.run_id }}
+          name: ${{ inputs.artifact }}
+          path: packages
+      - name: Verify and attach packages to the existing draft
+        run: python3 src-tauri/scripts/publish-packages.py upload
