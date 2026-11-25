@@ -81,7 +81,9 @@ function buildHookForTarget(profile, target, isHostTriple) {
   // 即使已有产物也必须执行 cargo build。Cargo 会使用增量缓存，成本很低；
   // 直接复用文件会在 helper 源码变化后把旧二进制继续带入 dev/安装包。
   console.log(`[prepare-sidecar] cargo build --bin miniterm-hook --target ${target} (${profile})`);
-  const args = ["build", "--bin", "miniterm-hook", "--target", target];
+  // The standalone helper crate avoids compiling the GUI and backend twice.
+  const args = ["build", "--manifest-path", resolve(SRC_TAURI, "miniterm-hook", "Cargo.toml"),
+    "--target-dir", resolve(SRC_TAURI, "target"), "--bin", "miniterm-hook", "--target", target];
   if (profile === "release") args.push("--release");
   const r = spawnSync("cargo", args, { cwd: SRC_TAURI, stdio: "inherit" });
   if (r.status !== 0) throw new Error(`cargo build miniterm-hook (${target}) 失败`);

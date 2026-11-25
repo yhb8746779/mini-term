@@ -9,7 +9,11 @@ on:
       tag:
         description: 'Tag name (e.g. v0.2.9)'
         required: true
-        default: 'v0.2.60'
+        default: 'v0.2.61'
+      artifacts_only:
+        description: 'Save packages as workflow artifacts without creating a Release'
+        type: boolean
+        default: true
       macos_only:
         description: 'Build only the macOS package (retry without duplicating other platforms)'
         type: boolean
@@ -17,7 +21,7 @@ on:
       macos_runner:
         description: 'GitHub-hosted macOS runner'
         type: choice
-        default: macos-latest
+        default: macos-15-intel
         options:
           - macos-latest
           - macos-15
@@ -30,7 +34,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(inputs.macos_only && '[{"platform":"macos-latest","target":"universal-apple-darwin"}]' || '[{"platform":"windows-latest","target":"x86_64-pc-windows-msvc"},{"platform":"macos-latest","target":"universal-apple-darwin"},{"platform":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"}]') }}
 
-    runs-on: ${{ matrix.platform == 'macos-latest' && (inputs.macos_runner || 'macos-latest') || matrix.platform }}
+    runs-on: ${{ matrix.platform == 'macos-latest' && (inputs.macos_runner || 'macos-15-intel') || matrix.platform }}
     permissions:
       contents: write
 
@@ -67,6 +71,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
+          cache-on-failure: true
 
       - name: Generate changelog
         id: changelog
@@ -219,9 +224,24 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-          releaseName: Mini-Term ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          tagName: ${{ github.event_name == 'workflow_dispatch' && !inputs.artifacts_only && inputs.tag || '' }}
+          releaseName: ${{ github.event_name == 'workflow_dispatch' && !inputs.artifacts_only && format('Mini-Term {0}', inputs.tag) || '' }}
           releaseBody: ${{ steps.changelog.outputs.body }}
           releaseDraft: false
           prerelease: false
           args: --target ${{ matrix.target }}
+
+      - name: Save installer packages
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            src-tauri/target/**/release/bundle/**/*.dmg
+            src-tauri/target/**/release/bundle/**/*.app.tar.gz
+            src-tauri/target/**/release/bundle/**/*.exe
+            src-tauri/target/**/release/bundle/**/*.deb
+            src-tauri/target/**/release/bundle/**/*.rpm
+            src-tauri/target/**/release/bundle/**/*.AppImage

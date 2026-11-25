@@ -17,7 +17,7 @@ window.terminalTest = {
   }),
   showBridgeSettings: () => root.render(<><SshImageBridgeSelect compact /><SshImageBridgeSettings /></>),
   paste: () => pasteToTerminal(1),
-  term: () => getCachedTerminal(1)!.term,
+  term: () => getCachedTerminal(1)?.term,
   selected: () => getAnySelectedText(1),
   provider: (provider: string) => useAppStore.setState({
     projectStates: new Map([['test', { tabs: [{ splitLayout: {
