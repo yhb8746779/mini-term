@@ -43,7 +43,11 @@ def main():
 
     packages = [p for p in Path('packages').rglob('*') if p.is_file()
                 and p.name.endswith(('.dmg', '.app.tar.gz', '.exe', '.deb', '.rpm', '.AppImage'))]
-    assert packages and all(tag[1:] in p.name for p in packages)
+    # Tauri names its updater archive Mini-Term.app.tar.gz; its version is
+    # checked from the enclosed Info.plist below, rather than the filename.
+    assert packages and all(tag[1:] in p.name or
+                            (artifact == 'packages-universal-apple-darwin' and p.name == 'Mini-Term.app.tar.gz')
+                            for p in packages)
     if artifact == 'packages-universal-apple-darwin':
         expected = os.environ['EXPECTED_CERTIFICATE_SHA256'].lower()
         assert re.fullmatch(r'[0-9a-f]{64}', expected), 'Expected signing certificate fingerprint is required'
