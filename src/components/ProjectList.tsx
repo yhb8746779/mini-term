@@ -634,9 +634,11 @@ export function ProjectList() {
                     <div key={project.id}>
                       {renderProjectItem(project, 0)}
                       {searchQuery.trim() && (
-                        <div className="px-2.5 pb-0.5 text-[10px] text-[var(--text-muted)] truncate leading-tight -mt-0.5">
+                        <button type="button" onClick={() => setActiveProject(project.id)}
+                          title={project.path}
+                          className="block w-full text-left px-2.5 pb-0.5 text-[10px] text-[var(--text-muted)] hover:text-[var(--text-primary)] truncate leading-tight -mt-0.5">
                           {project.path}
-                        </div>
+                        </button>
                       )}
                     </div>
                   ))

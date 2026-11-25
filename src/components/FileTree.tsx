@@ -12,6 +12,15 @@ import { DiffModal } from './DiffModal';
 import { FileViewerModal } from './FileViewerModal';
 import type { FileEntry, FsChangePayload, GitFileStatus, PtyOutputPayload } from '../types';
 
+// Survive FileTree remounts when switching/reselecting projects. Always revalidate
+// on mount; cached entries only avoid blank flashes and are never authoritative.
+const rootEntriesCache = new Map<string, FileEntry[]>();
+function rememberRootEntries(path: string, entries: FileEntry[]) {
+  rootEntriesCache.delete(path);
+  rootEntriesCache.set(path, entries);
+  if (rootEntriesCache.size > 32) rootEntriesCache.delete(rootEntriesCache.keys().next().value!);
+}
+
 // ─── Debug experiment switches ─────────────────────────────────
 /** true = 切换项目时跳过 get_git_status 首次加载，测试 git status 是否是主卡点 */
 const DEBUG_SKIP_GIT_STATUS_ON_SWITCH = false;
@@ -296,11 +305,13 @@ export function FileTree() {
     }
   }, [project, config.vscodePath]);
 
-  const [rootEntries, setRootEntries] = useState<FileEntry[]>([]);
+  const [rootEntries, setRootEntries] = useState<FileEntry[]>(() => project ? rootEntriesCache.get(project.path) ?? [] : []);
+  const [directoryError, setDirectoryError] = useState<string | null>(null);
+  const [directoryLoading, setDirectoryLoading] = useState(false);
+  const rootRequest = useRef(0);
   const [gitStatusMap, setGitStatusMap] = useState<Map<string, GitFileStatus>>(new Map());
   const [diffTarget, setDiffTarget] = useState<GitFileStatus | null>(null);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const rootEntriesCache = useRef<Map<string, FileEntry[]>>(new Map());
 
   const loadGitStatus = useCallback((force = false) => {
     if (!project) return;
@@ -328,14 +339,22 @@ export function FileTree() {
   const loadRootEntries = useCallback(() => {
     if (!project) return;
     // 先从缓存立即渲染，消除切换时的白闪
-    const cached = rootEntriesCache.current.get(project.path);
+    const request = ++rootRequest.current;
+    const cached = rootEntriesCache.get(project.path);
     if (cached) setRootEntries(cached);
+    setDirectoryError(null);
+    setDirectoryLoading(true);
     invoke<FileEntry[]>('list_directory', {
       projectRoot: project.path,
       path: project.path,
     }).then((entries) => {
-      rootEntriesCache.current.set(project.path, entries);
+      if (request !== rootRequest.current) return;
+      rememberRootEntries(project.path, entries);
       setRootEntries(entries);
+    }).catch((error: unknown) => {
+      if (request === rootRequest.current) setDirectoryError(String(error));
+    }).finally(() => {
+      if (request === rootRequest.current) setDirectoryLoading(false);
     });
   }, [project?.path]);
 
@@ -345,8 +364,12 @@ export function FileTree() {
       return;
     }
     loadRootEntries();
-    invoke('watch_directory', { path: project.path, projectPath: project.path });
-    return () => { invoke('unwatch_directory', { path: project.path }); };
+    invoke('watch_directory', { path: project.path, projectPath: project.path }).catch((error) => console.warn('文件监听失败:', error));
+    return () => {
+      ++rootRequest.current; // Ignore responses belonging to an unmounted tree.
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      invoke('unwatch_directory', { path: project.path }).catch(() => {});
+    };
   }, [project?.path, loadRootEntries]);
 
   useTauriEvent<FsChangePayload>('fs-change', useCallback((payload: FsChangePayload) => {
@@ -464,6 +487,11 @@ export function FileTree() {
         </div>
       </div>
       <div className="flex-1 px-1" onContextMenu={handleRootContextMenu}>
+        {directoryLoading && rootEntries.length === 0 && <div role="status" className="px-2 py-3 text-xs text-[var(--text-muted)]">正在读取目录…</div>}
+        {directoryError && <div role="alert" className="px-2 py-2 text-xs text-[var(--text-muted)]">
+          <div>目录读取失败：{directoryError}</div>
+          <button type="button" onClick={loadRootEntries} className="mt-1 text-[var(--accent)]">重新读取</button>
+        </div>}
         {rootEntries.map((entry) => (
           <TreeNode
             key={entry.path}

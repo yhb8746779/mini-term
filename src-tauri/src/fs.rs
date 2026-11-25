@@ -51,48 +51,61 @@ fn should_ignore(name: &str, full_path: &Path, is_dir: bool, gitignore: &Option<
 #[tauri::command]
 pub fn list_directory(app: AppHandle, project_root: String, path: String) -> Result<Vec<FileEntry>, String> {
     let t0 = Instant::now();
-    crate::path_access::ensure_path_access(&app, &project_root)?;
+    let result = crate::path_access::ensure_path_access(&app, &project_root)
+        .and_then(|_| read_directory_entries(&project_root, &path));
+    let outcome = match &result {
+        Ok(entries) => format!("entry_count={}", entries.len()),
+        Err(error) => format!("result=error | error={error}"),
+    };
+    crate::perf_log::log_perf(&app, "list_directory", &format!(
+        "path={} | {} | cost_ms={}", path, outcome, t0.elapsed().as_millis()
+    ));
+    result
+}
+
+fn read_directory_entries(project_root: &str, path: &str) -> Result<Vec<FileEntry>, String> {
     let dir = Path::new(&path);
-    if !dir.is_dir() {
+    let metadata = fs::metadata(dir).map_err(|e| format!("检查目录失败: {path}: {e}"))?;
+    if !metadata.is_dir() {
         return Err(format!("Not a directory: {}", path));
     }
     let gitignore = build_gitignore(Path::new(&project_root));
-    let mut entries: Vec<FileEntry> = fs::read_dir(dir)
-        .map_err(|e| e.to_string())?
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            let is_dir = entry.file_type().ok()?.is_dir();
-            let full_path = entry.path();
-            // ALWAYS_IGNORE 目录仍然完全隐藏
-            if is_dir && ALWAYS_IGNORE.contains(&name.as_str()) {
-                return None;
-            }
-            if is_apple_double(&name, is_dir) {
-                return None;
-            }
-            let ignored = if let Some(gi) = &gitignore {
-                gi.matched(&full_path, is_dir).is_ignore()
-            } else {
-                false
-            };
-            Some(FileEntry {
-                name,
-                path: full_path.to_string_lossy().to_string(),
-                is_dir,
-                ignored,
-            })
-        })
-        .collect();
+    // Close the directory iterator before inspecting entries. Do not silently
+    // turn IO/resource errors into an empty or incomplete file list.
+    let directory_entries = fs::read_dir(dir)
+        .map_err(|e| format!("读取目录失败: {path}: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("枚举目录失败: {path}: {e}"))?;
+    let mut entries = Vec::new();
+    for entry in directory_entries {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_dir = entry.file_type()
+            .map_err(|e| format!("读取文件类型失败: {}: {e}", entry.path().display()))?.is_dir();
+        let full_path = entry.path();
+        // ALWAYS_IGNORE 目录仍然完全隐藏
+        if is_dir && ALWAYS_IGNORE.contains(&name.as_str()) {
+            continue;
+        }
+        if is_apple_double(&name, is_dir) {
+            continue;
+        }
+        let ignored = if let Some(gi) = &gitignore {
+            gi.matched(&full_path, is_dir).is_ignore()
+        } else {
+            false
+        };
+        entries.push(FileEntry {
+            name,
+            path: full_path.to_string_lossy().to_string(),
+            is_dir,
+            ignored,
+        });
+    }
     entries.sort_by(|a, b| {
         b.is_dir.cmp(&a.is_dir)
             .then_with(|| a.ignored.cmp(&b.ignored))
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    crate::perf_log::log_perf(&app, "list_directory", &format!(
-        "path={} | entry_count={} | cost_ms={}",
-        path, entries.len(), t0.elapsed().as_millis()
-    ));
     Ok(entries)
 }
 
@@ -230,6 +243,36 @@ pub fn rename_entry(app: AppHandle, old_path: String, new_name: String) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_resource_error_is_not_reported_as_empty() {
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c").arg("ulimit -Sn 64; exec \"$1\" --exact fs::tests::directory_pressure_child --nocapture")
+            .arg("directory-test").arg(std::env::current_exe().unwrap())
+            .env("MINITERM_DIRECTORY_PRESSURE_TEST", "1").output().unwrap();
+        assert!(output.status.success(), "{} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_pressure_child() {
+        if std::env::var_os("MINITERM_DIRECTORY_PRESSURE_TEST").is_none() { return; }
+        let directory = std::env::temp_dir().join(format!("mini-term-fs-pressure-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("present.txt"), "test").unwrap();
+        let path = directory.to_str().unwrap();
+        let mut held = Vec::new();
+        while let Ok(file) = fs::File::open("/dev/null") { held.push(file); }
+        let error = read_directory_entries(path, path).unwrap_err();
+        assert!(error.contains("os error 24"), "{error}");
+        drop(held);
+        let entries = read_directory_entries(path, path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "present.txt");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
 
     #[test]
     fn should_ignore_node_modules() {

@@ -37,6 +37,7 @@ export function App() {
   const [hookFixBusy, setHookFixBusy] = useState(false);
   const [hookNoticeDismissed, setHookNoticeDismissed] = useState(false);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
+  const projectSelectionRevision = useAppStore((s) => s.projectSelectionRevision);
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
   const updatePaneStatusByPty = useAppStore((s) => s.updatePaneStatusByPty);
@@ -390,7 +391,7 @@ export function App() {
                 onChange={saveMiddleColumnSizes}
               >
                 <Allotment.Pane minSize={150}>
-                  <FileTree key={activeProjectId} />
+                  <FileTree key={`${activeProjectId}:${projectSelectionRevision}`} />
                 </Allotment.Pane>
                 <Allotment.Pane minSize={36}>
                   <GitHistory key={activeProjectId} />

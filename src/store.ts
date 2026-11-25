@@ -322,6 +322,8 @@ interface AppStore {
 
   // 项目
   activeProjectId: string | null;
+  /** Every explicit project click refreshes Files, even when the ID stays the same. */
+  projectSelectionRevision: number;
   projectStates: Map<string, ProjectState>;
   setActiveProject: (id: string) => void;
   addProject: (project: ProjectConfig) => void;
@@ -374,6 +376,7 @@ export const useAppStore = create<AppStore>((set) => ({
   setConfig: (config) => set({ config }),
 
   activeProjectId: null,
+  projectSelectionRevision: 0,
   projectStates: new Map(),
   notifications: [],
   searchModalOpen: false,
@@ -386,7 +389,7 @@ export const useAppStore = create<AppStore>((set) => ({
       if (ps?.needsAttention) {
         newStates.set(id, { ...ps, needsAttention: false });
       }
-      return { activeProjectId: id, projectStates: newStates };
+      return { activeProjectId: id, projectSelectionRevision: state.projectSelectionRevision + 1, projectStates: newStates };
     }),
 
   addProject: (project) =>
