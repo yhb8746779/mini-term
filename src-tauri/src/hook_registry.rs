@@ -143,13 +143,32 @@ fn codex_hooks_feature_enabled() -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
         return false;
     };
+    codex_hooks_enabled_in_config(&content)
+}
+
+fn codex_hooks_enabled_in_config(content: &str) -> bool {
     let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
         return false;
     };
     doc.get("features")
-        .and_then(|v| v.get("codex_hooks"))
+        .and_then(|v| v.get("hooks"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod hook_setup_tests {
+    use super::codex_hooks_enabled_in_config;
+
+    #[test]
+    fn setup_check_recognizes_the_feature_written_by_registration() {
+        assert!(codex_hooks_enabled_in_config("[features]\nhooks = true\n"));
+        assert!(codex_hooks_enabled_in_config("[features]\nhooks = true\ncodex_hooks = false\n"));
+        assert!(!codex_hooks_enabled_in_config("[features]\nhooks = false\ncodex_hooks = true\n"));
+        assert!(!codex_hooks_enabled_in_config("[features]\ncodex_hooks = true\n"));
+        assert!(!codex_hooks_enabled_in_config(""));
+        assert!(!codex_hooks_enabled_in_config("[features"));
+    }
 }
 
 fn gemini_hook_registered() -> bool {
