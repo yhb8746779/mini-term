@@ -21,7 +21,6 @@ on:
         options:
           - macos-latest
           - macos-15
-          - macos-14
 
 jobs:
   build:
