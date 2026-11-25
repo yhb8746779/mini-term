@@ -21,6 +21,7 @@ on:
         options:
           - macos-latest
           - macos-15
+          - macos-15-intel
 
 jobs:
   build:
